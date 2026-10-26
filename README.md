@@ -24,7 +24,7 @@ types are supported.
 ## Building
 
 You need the Rust version pinned in `rust-toolchain.toml`, plus CMake, a C/C++
-compiler, and libclang (for BoringSSL).
+compiler, libclang, and Git (to patch and build BoringSSL).
 
 ```sh
 cargo build --release --bin challenge
@@ -59,7 +59,7 @@ site's real URL.
 | --- | --- |
 | `--fingerprint <file>` | Browser profile file to use. Required. |
 | `--page <url>` | The page with the widget, or the challenge page. |
-| `--solve` | Solve the widget or challenge. Without this, cfsolve stops after the first request. |
+| `--solve` | Solve the widget or challenge. Without this, cfsolve stops after sending the widget's first payload. |
 | `--sitekey <key>` | Select a widget by sitekey. |
 | `--action <value>`, `--cdata <value>` | Override the widget's action and cData. This needs `--sitekey`. |
 | `--blank-page` | Skip loading the page. Render the widget on a blank page at the page URL. This needs `--solve` and `--sitekey`. |
@@ -199,7 +199,7 @@ implement `Sink` and set `options.sink` to `Some(Arc::new(your_sink))`.
 | `Error::Challenged` | You asked for a Turnstile token but got a challenge page. | Yes, after clearing it |
 | `Error::NotChallenged` | You asked for a challenge clearance but there was no challenge. | No |
 | `Error::Config` | Invalid profile or options. | No |
-| `Error::Unsupported` | This challenge type isn't supported. | No |
+| `Error::Unsupported` | Any other failure, such as a new challenge build or a page with no widget. | No |
 
 ## License
 
