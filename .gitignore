@@ -1,0 +1,6 @@
+/target
+.env
+*.log
+# capture-proxy's default CA (with its private key) and capture directories.
+/proxy-ca/
+/captures/

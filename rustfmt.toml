@@ -1,0 +1,12 @@
+# Google Rust style guide: https://google.github.io/styleguide/rustguide.html
+max_width = 100
+
+# Nightly-only options from the guide; stable rustfmt ignores them, so apply
+# them with `cargo +nightly fmt`.
+imports_granularity = "Module"
+hex_literal_case = "Lower"
+format_macro_matchers = true
+
+# The guide leaves import group order open; the nightly-only grouping keeps it
+# automatic: std, then external crates, then `crate`/`super`/`self`.
+group_imports = "StdExternalCrate"

@@ -1,0 +1,151 @@
+name: CI
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+env:
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  style:
+    name: Check Style
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --all --check
+
+  test:
+    name: Test
+    needs: [style]
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Dwarnings
+    strategy:
+      matrix:
+        rust:
+          - nightly
+          - beta
+          - stable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust (${{ matrix.rust }})
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Install libssl-dev
+        run: sudo apt-get update && sudo apt-get install libssl-dev
+      - name: Build without unstable flag
+        run: cargo build
+
+      - name: Check with unstable flag
+        run: cargo check --features unstable
+
+      - name: Check with tracing flag
+        run: cargo check --features tracing
+
+      - name: Check with parking_lot flag
+        run: cargo check --features parking_lot
+
+      - name: Run lib tests and doc tests
+        run: cargo test
+
+      - name: Run integration tests
+        run: cargo test -p h2-tests
+
+      - name: Run h2spec
+        run: ./ci/h2spec.sh
+        if: matrix.rust == 'stable'
+
+  #clippy_check:
+  #  runs-on: ubuntu-latest
+  #  steps:
+  #    - uses: actions/checkout@v7
+  #    - name: Run Clippy
+  #      run: cargo clippy --all-targets --all-features
+
+  msrv:
+    name: Check MSRV
+    needs: [style]
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Get MSRV from package metadata
+        id: msrv
+        run: grep rust-version Cargo.toml | cut -d '"' -f2 | sed 's/^/version=/' >> $GITHUB_OUTPUT
+
+      - name: Install Rust (${{ steps.metadata.outputs.msrv }})
+        id: msrv-toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Pin some dependencies for MSRV
+        run: |
+          cargo update --package tokio-util --precise 0.7.11
+          cargo update --package tokio --precise 1.38.1
+          cargo update --package indexmap --precise 2.11.3
+          cargo update --package hashbrown --precise 0.15.0
+          cargo update --package once_cell --precise 1.20.3
+          cargo update --package tracing --precise 0.1.41
+          cargo update --package tracing-subscriber --precise 0.3.19
+          cargo update --package tracing-core --precise 0.1.33
+          cargo update --package itoa --precise 1.0.15
+
+      - run: cargo check -p http2
+
+  crates:
+    name: Release
+    runs-on: ubuntu-latest
+    environment: Linux
+    needs: [style, msrv, test]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Get tag
+        if: startsWith(github.ref, 'refs/tags/')
+        id: tag
+        uses: dawidd6/action-get-tag@v1
+        with:
+          strip_v: true
+
+      - name: Tag Check
+        run: |
+          echo "tag=${{ steps.tag.outputs.tag }}" >> $GITHUB_ENV
+          echo "tag=${{ steps.tag.outputs.tag }}" >> $GITHUB_OUTPUT
+          if [ -z "${{ steps.tag.outputs.tag }}" ]; then
+            echo "tag=latest" >> $GITHUB_OUTPUT
+            echo "tag=latest" >> $GITHUB_ENV
+          fi
+
+      - uses: katyo/publish-crates@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          ignore-unpublished-changes: true
+
+      - name: Upload binaries to GitHub Release
+        uses: softprops/action-gh-release@v3
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
+          generate_release_notes: true
