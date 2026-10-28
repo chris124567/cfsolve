@@ -9,7 +9,8 @@
 //!
 //! The helper must be assigned once and forward parameters in order, except for swapping the
 //! method and receiver. The method must be read from the receiver's local binding. This keeps
-//! the same `this` value as a regular method call.
+//! the same `this` value as a regular method call. Calls must supply exactly one argument per
+//! parameter, without spreads, so the method receives the same arguments.
 
 use swc_core::common::util::take::Take;
 use swc_core::ecma::ast::{
@@ -18,7 +19,7 @@ use swc_core::ecma::ast::{
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
-use super::HashSet;
+use super::HashMap;
 use super::analysis::{Analysis, Bindings, Globals, names};
 use crate::js::ast;
 
@@ -27,7 +28,7 @@ pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
     let bindings = analysis.bindings(program);
     let mut helpers = Helpers::default();
     program.visit_with(&mut helpers);
-    helpers.0.retain(|id| bindings.is_written_once(id));
+    helpers.0.retain(|id, _| bindings.is_written_once(id));
     if helpers.0.is_empty() {
         return false;
     }
@@ -72,23 +73,24 @@ fn is_helper(function: &Function) -> bool {
     }
 }
 
-/// Helpers by binding.
+/// Helpers by binding, with the number of parameters they forward.
 #[derive(Default)]
-struct Helpers(HashSet<Id>);
+struct Helpers(HashMap<Id, usize>);
 
 impl Visit for Helpers {
     fn visit_expr(&mut self, expression: &Expr) {
         if let Some((id, Expr::Fn(function))) = ast::assignment(expression)
             && is_helper(&function.function)
         {
-            self.0.insert(id);
+            self.0.insert(id, function.function.params.len());
         }
         expression.visit_children_with(self);
     }
 
     fn visit_fn_decl(&mut self, declaration: &FnDecl) {
         if is_helper(&declaration.function) {
-            self.0.insert(declaration.ident.to_id());
+            self.0
+                .insert(declaration.ident.to_id(), declaration.function.params.len());
         }
         declaration.visit_children_with(self);
     }
@@ -98,14 +100,14 @@ impl Visit for Helpers {
             && let Some(Expr::Fn(function)) = declarator.init.as_deref()
             && is_helper(&function.function)
         {
-            self.0.insert(name.to_id());
+            self.0.insert(name.to_id(), function.function.params.len());
         }
         declarator.visit_children_with(self);
     }
 }
 
 struct Restore<'a> {
-    helpers: &'a HashSet<Id>,
+    helpers: &'a HashMap<Id, usize>,
     bindings: &'a Bindings,
     globals: Globals,
     changed: bool,
@@ -113,13 +115,18 @@ struct Restore<'a> {
 
 impl Restore<'_> {
     /// Rewrites `helper(receiver, receiver.method, ...rest)` as a method call.
-    fn method_call(&self, arguments: &mut Vec<ExprOrSpread>) -> Option<Expr> {
+    fn method_call(&self, arguments: &mut Vec<ExprOrSpread>, parameters: usize) -> Option<Expr> {
+        // The helper forwards every parameter, including missing ones as undefined, and ignores
+        // extra arguments after evaluating them. Only a matching, spread-free call forwards the
+        // same arguments directly to the method.
+        if arguments.len() != parameters
+            || arguments.iter().any(|argument| argument.spread.is_some())
+        {
+            return None;
+        }
         let [receiver, method, ..] = &mut arguments[..] else {
             return None;
         };
-        if receiver.spread.is_some() || method.spread.is_some() {
-            return None;
-        }
         let Expr::Member(member) = &mut *method.expr else {
             return None;
         };
@@ -156,8 +163,8 @@ impl VisitMut for Restore<'_> {
         expression.visit_mut_children_with(self);
         if let Expr::Call(call) = expression
             && let Some(callee) = call.callee.as_expr().and_then(|callee| callee.as_ident())
-            && self.helpers.contains(&callee.to_id())
-            && let Some(replacement) = self.method_call(&mut call.args)
+            && let Some(&parameters) = self.helpers.get(&callee.to_id())
+            && let Some(replacement) = self.method_call(&mut call.args, parameters)
         {
             *expression = replacement;
             self.changed = true;
@@ -168,6 +175,35 @@ impl VisitMut for Restore<'_> {
 #[cfg(test)]
 mod tests {
     use crate::deobfuscate::testing;
+
+    #[test]
+    fn keeps_calls_whose_arguments_do_not_match_the_helpers_parameters() {
+        let output = testing::rewrite(
+            "function call(s, m, a) { return (function() {}).call.call(m, s, a); }
+             call(x, x.send);
+             call(x, x.send, 1, effect());
+             call(x, x.send, ...values);
+             call(x, x.send, 1, ...values);
+             call(...values, x.send, 1);
+             call(x, ...methods, 1);
+             call(x, x.send, 1);",
+            super::run,
+            /* fix= */ true,
+        );
+        testing::assert_contains(
+            &output,
+            &[],
+            &[
+                "call(x, x.send);",
+                "call(x, x.send, 1, effect());",
+                "call(x, x.send, ...values);",
+                "call(x, x.send, 1, ...values);",
+                "call(...values, x.send, 1);",
+                "call(x, ...methods, 1);",
+                "x.send(1);",
+            ],
+        );
+    }
 
     #[test]
     fn restores_method_calls_on_the_receiver_they_read() {

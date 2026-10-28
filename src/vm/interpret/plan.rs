@@ -341,7 +341,8 @@ impl PlanCompiler {
             // Declarations do not bind their names; the names resolve as globals.
             Stmt::Decl(Decl::Fn(_) | Decl::Class(_)) | Stmt::Empty(_) => Statement::Empty,
             Stmt::Decl(_) => Statement::Expression(self.unsupported("a declaration")),
-            Stmt::Block(block) => Statement::Block(self.statements(&block.stmts)),
+            // A block shares its function's scope, so its function declarations bind at its start.
+            Stmt::Block(block) => Statement::Block(self.body(&block.stmts)),
             Stmt::If(branch) => Statement::If(
                 self.expression(&branch.test),
                 Box::new(self.statement(&branch.cons, None)),

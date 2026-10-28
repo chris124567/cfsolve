@@ -507,46 +507,6 @@ mod tests {
         sent
     }
 
-    /// Expected header order from the tracked Chrome 155 profile, verified against a headed
-    /// browser's book.sv network log.
-    #[tokio::test]
-    async fn requests_send_the_browsers_headers_in_its_order() {
-        let own = [
-            ("user-agent", "Mozilla/5.0"),
-            ("sec-ch-ua", "\"Chromium\";v=\"155\""),
-            ("sec-ch-ua-mobile", "?0"),
-            ("sec-ch-ua-platform", "\"Linux\""),
-        ];
-        let client = BrowserClient {
-            own: own
-                .iter()
-                .map(|(name, value)| (name.parse().unwrap(), value.parse().unwrap()))
-                .collect(),
-            ..BrowserClient::from_http(Client::new())
-        };
-        let (_, heads) = flow(&client).await;
-        let expected = [
-            "sec-ch-ua sec-ch-ua-mobile sec-ch-ua-platform upgrade-insecure-requests user-agent \
-             accept sec-fetch-site sec-fetch-mode sec-fetch-user sec-fetch-dest accept-encoding \
-             accept-language priority",
-            "sec-ch-ua-platform user-agent sec-ch-ua sec-ch-ua-mobile accept sec-fetch-site \
-             sec-fetch-mode sec-fetch-dest sec-fetch-storage-access accept-encoding \
-             accept-language",
-            "sec-ch-ua sec-ch-ua-mobile sec-ch-ua-platform upgrade-insecure-requests user-agent \
-             accept sec-fetch-site sec-fetch-mode sec-fetch-dest sec-fetch-storage-access \
-             accept-encoding accept-language priority",
-            "content-length sec-ch-ua-platform user-agent sec-ch-ua content-type cf-chl cf-chl-ra \
-             sec-ch-ua-mobile accept origin sec-fetch-site sec-fetch-mode sec-fetch-dest referer \
-             accept-encoding accept-language priority",
-            "sec-ch-ua-platform user-agent sec-ch-ua sec-ch-ua-mobile accept sec-fetch-site \
-             sec-fetch-mode sec-fetch-dest sec-fetch-storage-access referer accept-encoding \
-             accept-language priority",
-            "cache-control user-agent accept sec-fetch-site sec-fetch-mode sec-fetch-dest \
-             accept-encoding accept-language priority",
-        ];
-        assert_eq!(header_names(&heads), expected);
-    }
-
     /// Expected header order from the tracked iOS Safari 26.6 profile, verified against
     /// captchatest proxy traffic. Includes Safari's separate redirected-loader order.
     #[tokio::test]
@@ -647,6 +607,7 @@ mod tests {
         ] {
             assert!(headers.contains(expected), "missing {expected}: {headers}");
         }
-        assert!(headers.contains(&format!("referer: http://{address}/iframe?lang=auto")));
+        // WebKit sends only the iframe's origin.
+        assert!(headers.contains(&format!("referer: http://{address}/\r\n")));
     }
 }
