@@ -3,8 +3,8 @@
 
 use std::borrow::Cow;
 use std::hash::Hash;
+use std::mem;
 use std::rc::Rc;
-use std::{mem, ptr};
 
 use swc_core::atoms::Atom;
 use swc_core::ecma::ast::{BinaryOp, UnaryOp};
@@ -12,7 +12,7 @@ use swc_core::ecma::ast::{BinaryOp, UnaryOp};
 use super::builtin;
 use super::copies::{self, Copies};
 use super::explore::Invocation;
-use crate::vm::output::{Effect, Exit, Path, Position, Term};
+use crate::vm::output::{Constant, Effect, Exit, Path, Position, Term};
 use crate::vm::session::Session;
 use crate::vm::value::{Callable, Env, Scope, Value};
 use crate::vm::{HashMap, convert};
@@ -52,6 +52,8 @@ pub(crate) struct Run<'ast, 'session> {
     /// Instance fields derived from program bytes by the constructor, once known.
     constructed: Option<&'session HashMap<String, Value<'ast>>>,
     pub(super) registers: HashMap<u8, Value<'ast>>,
+    /// Tags written before their register values; see [`crate::vm::registers`].
+    pub(super) tags: HashMap<u8, Value<'ast>>,
     /// Instance fields this run has read or written.
     pub(super) fields: HashMap<String, Value<'ast>>,
     /// Session bindings this run has read or written.
@@ -70,11 +72,10 @@ pub(crate) struct Run<'ast, 'session> {
     pub(super) effects: Vec<Effect>,
     temps: usize,
     pub(super) branches: Branches,
+    /// Register-dependent expressions known to equal constants on the current branch path.
+    facts: Vec<(Term, Value<'ast>)>,
     journal: Journal<'ast>,
     pub(super) spare: Spare<'ast>,
-    /// The running handler's address, which keys decoded-string cache entries. `None` outside
-    /// handler runs.
-    pub(super) handler: Option<usize>,
 }
 
 /// Cleared buffers from completed calls. Handler runs take them from the session and
@@ -185,6 +186,7 @@ pub(super) struct Checkpoint {
     decisions: usize,
     decided: usize,
     conditions: usize,
+    facts: usize,
 }
 
 /// The value held at a map key before a write.
@@ -221,6 +223,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
             program,
             constructed: None,
             registers: HashMap::default(),
+            tags: HashMap::default(),
             fields: HashMap::default(),
             globals: HashMap::default(),
             unavailable: Cow::Borrowed(&session.unavailable),
@@ -234,16 +237,15 @@ impl<'ast, 'session> Run<'ast, 'session> {
                 decisions,
                 ..Branches::default()
             },
+            facts: Vec::new(),
             journal: Journal::default(),
             spare: Spare::default(),
-            handler: None,
         }
     }
 
     /// A handler run that follows `decisions`, then takes any further symbolic branch as true.
     pub(super) fn handler(invocation: &Invocation<'session, 'ast>, decisions: Vec<bool>) -> Self {
         let session = invocation.session;
-        let layout = session.layout;
         let mut run = Self::new(
             session,
             invocation.program,
@@ -252,15 +254,24 @@ impl<'ast, 'session> Run<'ast, 'session> {
         );
         run.constructed = Some(invocation.fields);
         run.spare = session.spare.take();
-        run.handler = Some(ptr::from_ref(invocation.handler.function).addr());
-        run.registers.extend([
-            (layout.pc, Value::Number(f64::from(invocation.pc))),
-            (layout.key, Value::Number(f64::from(invocation.key))),
+        for (register, value) in &session.initial {
+            let value = run.isolate(value);
+            run.registers.insert(*register, value);
+        }
+        run.start_at(invocation.pc, invocation.key);
+        run.registers.extend(invocation.known.iter().cloned());
+        run
+    }
+
+    /// Sets the program counter to `pc` and the dispatch key to `key`.
+    pub(super) fn start_at(&mut self, pc: u32, key: u8) {
+        let layout = self.session.layout;
+        self.registers.extend([
+            (layout.pc, Value::Number(f64::from(pc))),
+            (layout.key, Value::Number(f64::from(key))),
             (layout.program, Value::Program),
             (layout.cells, Value::Cells),
         ]);
-        run.registers.extend(invocation.known.iter().cloned());
-        run
     }
 
     /// A run inside a method of the instance, while the session is built.
@@ -338,10 +349,52 @@ impl<'ast, 'session> Run<'ast, 'session> {
     }
 
     pub(super) fn decide(&mut self, condition: &Value<'ast>) -> bool {
-        condition.truthy().unwrap_or_else(|| match condition {
-            Value::Symbolic(term) => self.branches.decide(term),
-            condition => self.branches.decide(&condition.expr()),
-        })
+        if let Some(truth) = condition.truthy() {
+            return truth;
+        }
+        let term = match condition {
+            Value::Symbolic(term) => Cow::Borrowed(&**term),
+            condition => Cow::Owned(condition.expr()),
+        };
+        let decision = self.branches.decide(&term);
+        self.learn(&term, decision);
+        decision
+    }
+
+    /// Records that an expression equals a constant after a true strict equality test or a false
+    /// strict inequality test.
+    fn learn(&mut self, mut condition: &Term, mut holds: bool) {
+        while let Term::Unary(UnaryOp::Bang, inner) = condition {
+            condition = inner;
+            holds = !holds;
+        }
+        let Term::Binary(operator, left, right) = condition else {
+            return;
+        };
+        let equal = match operator {
+            BinaryOp::EqEqEq => holds,
+            BinaryOp::NotEqEq => !holds,
+            _ => return,
+        };
+        if equal
+            && let (Term::Const(constant), term) | (term, Term::Const(constant)) =
+                (&**left, &**right)
+            && !matches!(term, Term::Const(_))
+            && let Some(value) = constant_value(constant)
+        {
+            self.facts.push((term.clone(), value));
+        }
+    }
+
+    /// Returns the known constant for `value` on the current branch path, or `value` if none is
+    /// known.
+    pub(super) fn refined(&self, value: &Value<'ast>) -> Value<'ast> {
+        if let Value::Symbolic(term) = value
+            && let Some((_, known)) = self.facts.iter().find(|(fact, _)| fact == &**term)
+        {
+            return known.clone();
+        }
+        value.clone()
     }
 
     pub(super) fn temp(&mut self, expr: Term) -> Value<'ast> {
@@ -459,6 +512,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
             decisions: self.branches.decisions.len(),
             decided: self.branches.decided,
             conditions: self.branches.conditions.len(),
+            facts: self.facts.len(),
         }
     }
 
@@ -480,6 +534,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
         branches.decisions.truncate(checkpoint.decisions);
         branches.decided = checkpoint.decided;
         branches.conditions.truncate(checkpoint.conditions);
+        self.facts.truncate(checkpoint.facts);
         self.release(checkpoint);
     }
 
@@ -522,12 +577,24 @@ impl<'ast, 'session> Run<'ast, 'session> {
     }
 
     /// Copies a session value for use by this run, preserving run-local sharing.
-    fn isolate(&mut self, value: &Value<'ast>) -> Value<'ast> {
+    pub(super) fn isolate(&mut self, value: &Value<'ast>) -> Value<'ast> {
         let Some(copies) = &mut self.copies else {
             return value.clone();
         };
         copies::copy(value, copies)
     }
+}
+
+/// Converts a constant to a value. Excludes NaN because it is not equal to any value.
+fn constant_value<'a>(constant: &Constant) -> Option<Value<'a>> {
+    Some(match constant {
+        Constant::Undefined => Value::Undefined,
+        Constant::Null => Value::Null,
+        Constant::Bool(value) => Value::Bool(*value),
+        Constant::Number(number) if number.is_nan() => return None,
+        Constant::Number(number) => Value::Number(*number),
+        Constant::String(text) => Value::string(text),
+    })
 }
 
 /// Restores `old` at `key` in `map`, removing the key if it was previously absent.

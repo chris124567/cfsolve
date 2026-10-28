@@ -18,6 +18,7 @@ use cfsolve::challenge::program::PreparedSession;
 use cfsolve::js::Options;
 use cfsolve::script::Source;
 use cfsolve::stage2::analysis::{self, ProgramOutcome};
+use cfsolve::stage2::registry::{Kind, Operation};
 use cfsolve::stage2::{call_stack, interaction};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -41,16 +42,50 @@ fn main() -> Result<()> {
     // The click stack reads the dispatch cases off the original's own
     // deobfuscation, as the CLI does when it fetches the iframe.
     let (_, cases) = call_stack::deobfuscate_with_cases(original.clone())?;
+    let loops = call_stack::dispatch_summary(&original, &cases);
+    snapshot.insert("dispatch_loops".into(), record(loops));
     let analysis = program("response.decoded.txt")?
         .context("no first response")
-        .and_then(|program| {
-            let analysis = analysis::analyze(&prepared, &program)?;
-            Ok(serde_json::to_value(analysis.artifact())?)
-        });
+        .and_then(|program| analysis::analyze(&prepared, &program));
+    // The stack probe's frames, which the CLI rebuilds for Chromium.
+    if let Ok(analysis) = &analysis
+        && let Some((_, Operation::Stack { fields })) = analysis.plan().operation(Kind::Stack)
+    {
+        let frames = fields
+            .calls
+            .context("the stack probe's calls have an unrecognized shape")
+            .and_then(|calls| call_stack::recover_probe(&original, &cases, calls))
+            .map(|geometry| {
+                json!({
+                    "frames": geometry.frames,
+                    "jsc_frames": geometry.jsc_frames,
+                    "reflected": geometry.reflected,
+                })
+            });
+        snapshot.insert("probe_frames".into(), record(frames));
+    }
+    let analysis = analysis.and_then(|analysis| Ok(serde_json::to_value(analysis.artifact())?));
     snapshot.insert("analysis".into(), record(analysis));
     // The iframe's URL only places the POST, which this ignores.
     let base = Url::parse("https://challenges.cloudflare.com/")?;
-    let installed = PreparedSession::try_new(&prepared, &base).map(|session| {
+    let session = PreparedSession::try_new(&prepared, &base);
+    // The first payload's fields and the options the script marks with `Date.now()`, which
+    // its timestamp differences need.
+    let first_payload = match &session {
+        Ok(session) => session.state().map(|state| {
+            let marks: Vec<String> = state.marks.into_iter().map(|mark| mark.option).collect();
+            json!({
+                "marks": marks,
+                "fields": session.program().encoder_json().payload_fields,
+                "timing": state.timing.map(|timing| timing.option),
+                "post_log": state.post_log.map(|log| log.option),
+                "forwarded": state.forwarded,
+            })
+        }),
+        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+    };
+    snapshot.insert("first_payload".into(), record(first_payload));
+    let installed = session.map(|session| {
         let installed = session.into_program().installed;
         json!({"options": installed.options, "window": installed.window})
     });
@@ -77,10 +112,9 @@ fn main() -> Result<()> {
             );
             snapshot.insert("callback_frames".into(), record(frames));
             if let Ok(options) = read("options.json") {
-                let options: Result<Options> =
-                    serde_json::from_str(&options).map_err(anyhow::Error::from);
-                let queries =
-                    options.and_then(|options| interaction::checkbox::queries(&prepared, &options));
+                let queries = serde_json::from_str::<Options>(&options)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|options| interaction::checkbox::queries(&prepared, &options));
                 snapshot.insert("checkbox_queries".into(), record(queries));
             }
         }

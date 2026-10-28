@@ -2,10 +2,13 @@
 //! payload with record timestamps scheduled to finish just before it is sent.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use chrono::Local;
-use tokio::task;
+use tokio::{task, time};
+use url::Url;
+use wreq::ws::message::Message;
 
 use super::channel::Submission;
 use super::timing::{self, Schedule, Timer};
@@ -14,16 +17,22 @@ use crate::browser::{Profile, Solve};
 use crate::challenge::payload;
 use crate::engine::Engine;
 use crate::http::{self, FetchOptions};
-use crate::js::{JsObject, JsValue, Options, Payload, Window, json};
+use crate::js::{self, JsObject, JsValue, Options, Payload, Window, json};
 use crate::performance_clock::{self, PerformanceClock};
 use crate::resource_timing::LoadTiming;
 use crate::stage2::call_stack;
 use crate::stage2::payload::State;
-use crate::stage2::probes::{clock, ice, image, performance, private_token, worker_fetch};
+use crate::stage2::probes::{
+    clock, host_reachability, ice, image, performance, private_token, websocket_echo, worker_fetch,
+};
 use crate::stage2::records::{Probe, ProbePlan};
 use crate::stage2::registry::{Facts, Kind, Observed, Operation, Treatment};
-use crate::stage2::replay::{self, Answers, Replay};
+use crate::stage2::replay::{self, Replay};
 use crate::stage2::trace::Trace;
+
+/// Timeout for host reachability fetches. Browsers report these hosts as unreachable within
+/// milliseconds.
+const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A probe kind's duration when nothing else gives one.
 const DEFAULT_DURATION_MS: i64 = 2;
@@ -50,14 +59,19 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
     let engine = session.client.engine();
     let plan = session.analysis.plan();
     let mut options = session.request.options.clone();
-    let (mut observed, fetches) = observe(session, plan, &options, profile, answers).await?;
+    let (mut observed, fetches) = observe(session, plan, &options, profile).await?;
     observed.page_signals = Some(merged.page_signals.clone());
     // Resource timings now include the first POST and probe requests.
     if let Some(timing) = &merged.state.timing {
         let mut resources = merged.resources.clone();
-        resources.push(timing.entry(&session.first_post));
-        resources.extend(fetches.iter().map(|fetch| timing.entry(fetch)));
+        let origin = merged.time_origin_ms;
+        resources.push(timing.entry(&session.first_post, origin));
+        resources.extend(fetches.iter().map(|fetch| timing.entry(fetch, origin)));
         options.insert(timing.option.clone(), JsValue::Array(resources));
+    }
+    // The sender logged the first POST after sending it.
+    if let Some(log) = &merged.state.post_log {
+        log.record(&mut options, &session.first_post, merged.time_origin_ms)?;
     }
     // Build window values from installed globals, values read by the first payload, then
     // profile overrides.
@@ -69,13 +83,9 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
     window.extend(profile.window.clone());
 
     let replay = answers.map(|answers| Replay::new(answers, plan));
-    let benchmark_ms = observed
-        .benchmark
-        .as_ref()
-        .map(|measured| measured.elapsed_ms().ceil() as i64);
     let pending_ms = i64::from(profile.pending_ms);
     let schedule = timing::schedule(
-        &durations(plan, &profile.durations, benchmark_ms, replay.as_ref()),
+        &durations(plan, &profile.durations, &observed, replay.as_ref()),
         profile.startup_ms.into(),
         pending_ms,
         session.arrived_ms,
@@ -146,11 +156,10 @@ async fn observe(
     plan: &ProbePlan,
     options: &Options,
     profile: &Profile,
-    answers: Option<&Answers>,
 ) -> Result<(Observed, Vec<LoadTiming>)> {
     let mut observed = Observed::default();
     let requests = requests(session, plan, options, profile, &mut observed);
-    let stack = probe_stack(session, plan, answers);
+    let stack = probe_stack(session, plan);
     let (fetches, stack) = tokio::try_join!(requests, stack)?;
     observed.stack = stack;
     let facts = &profile.facts;
@@ -181,23 +190,79 @@ async fn observe(
     Ok((observed, fetches))
 }
 
-/// The stack probe's result. Chrome's is rebuilt from the session script; WebKit replays the
-/// recorded one (see [`Answers::stack`]).
-async fn probe_stack(
+/// Runs the WebSocket echo exchange. After opening, sends `String(performance.now())` and sends a
+/// new reading after each echo. Closes the socket when enough echoes return or the timeout expires.
+async fn echo_websocket(
     session: &WidgetSession<'_>,
-    plan: &ProbePlan,
-    answers: Option<&Answers>,
-) -> Result<Option<String>> {
+    fields: &websocket_echo::Fields,
+    options: &Options,
+) -> Result<websocket_echo::Measurement> {
+    use websocket_echo::{ECHOES, End, Measurement};
+
+    let (client, iframe) = (session.client, &session.fetched.iframe);
+    let url = fields.url(options, &iframe.url)?;
+    let clock = PerformanceClock::from_epoch_origin(
+        session.merged.time_origin_ms,
+        session.clock_resolution(),
+    );
+    let started_ms = performance_clock::epoch_ms();
+    let deadline = time::Instant::now() + Duration::from_millis(websocket_echo::TIMEOUT_MS);
+    let constructed = clock.now();
+    let mut measured = Measurement {
+        end: End::TimedOut,
+        sent: 0,
+        received: 0,
+        opened_ms: None,
+        round_trips: Vec::new(),
+        elapsed_ms: 0,
+    };
+    let mut socket = None;
+    let exchange = async {
+        let Ok(opened) = http::open_websocket(client, iframe, &url).await else {
+            return End::Failed;
+        };
+        measured.opened_ms = Some(clock.now() - constructed);
+        let socket = socket.insert(opened);
+        while measured.sent < ECHOES {
+            measured.sent += 1;
+            let reading = js::string(Some(&json!(clock.now())));
+            if socket.send(Message::text(reading)).await.is_err() {
+                return End::Failed;
+            }
+            // Ping and pong frames do not trigger `message` events. Binary data converts to `NaN`.
+            let echoed = loop {
+                match socket.recv().await {
+                    Some(Ok(Message::Text(text))) => break js::string_number(text.as_str()),
+                    Some(Ok(Message::Binary(_))) => break f64::NAN,
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(_))) | None => return End::Closed,
+                    Some(Err(_)) => return End::Failed,
+                }
+            };
+            measured.received += 1;
+            if echoed.is_finite() {
+                measured.round_trips.push(clock.now() - echoed);
+            }
+        }
+        End::Echoed
+    };
+    measured.end = time::timeout_at(deadline, exchange)
+        .await
+        .unwrap_or(End::TimedOut);
+    measured.elapsed_ms = performance_clock::epoch_ms() - started_ms;
+    if let Some(mut socket) = socket {
+        // Ignore close errors because the result has already been recorded.
+        let _ = socket.send(Message::Close(None)).await;
+    }
+    Ok(measured)
+}
+
+/// Rebuilds the stack probe result using the session script and engine's stack format. The VM
+/// executes closures within its dispatch loop, so neither engine shows additional VM call levels.
+async fn probe_stack(session: &WidgetSession<'_>, plan: &ProbePlan) -> Result<Option<String>> {
     let Some((probe, Operation::Stack { fields })) = plan.operation(Kind::Stack) else {
         return Ok(None);
     };
-    if session.client.engine() == Engine::WebKit {
-        let answers = answers.context("the fingerprint names no stored answers")?;
-        return answers
-            .stack(session.fetched.iframe.url.as_str())
-            .map(Some)
-            .with_context(|| format!("replaying probe {}'s stack", probe.index));
-    }
     let calls = fields.calls.with_context(|| {
         format!(
             "probe {}'s calls leading to `new Error()` have an unrecognized shape",
@@ -208,9 +273,10 @@ async fn probe_stack(
     let javascript = fetched.javascript.clone();
     let cases = fetched.cases.clone();
     let origin = fetched.script_position()?;
+    let engine = session.client.engine();
     let stack = task::spawn_blocking(move || {
         let geometry = call_stack::recover_probe(&javascript, &cases, calls)?;
-        anyhow::Ok(geometry.format(&origin, Engine::Chromium))
+        anyhow::Ok(geometry.format(&origin, engine))
     })
     .await
     .context("the stack recovery thread failed")?
@@ -218,24 +284,21 @@ async fn probe_stack(
     Ok(Some(stack))
 }
 
-/// Chooses probe durations from the profile's `configured` values, measured benchmark duration,
-/// stored answers, or the default.
+/// Chooses probe durations from completed work, `configured` profile values, stored answers, or
+/// defaults, in that order.
 fn durations(
     plan: &ProbePlan,
     configured: &BTreeMap<String, u32>,
-    benchmark_ms: Option<i64>,
+    observed: &Observed,
     replay: Option<&Replay<'_>>,
 ) -> Vec<i64> {
     let duration = |probe: &Probe| {
         if let Some(family) = probe.operation.as_ref().map(Operation::family) {
+            if let Some(measured) = observed.duration_ms(family) {
+                return measured;
+            }
             if let Some(&recorded) = configured.get(family.as_str()) {
                 return i64::from(recorded);
-            }
-            // Use the measured benchmark duration because that work has already run.
-            if family == Kind::Benchmark
-                && let Some(benchmark_ms) = benchmark_ms
-            {
-                return benchmark_ms;
             }
         }
         let stored = replay.and_then(|replay| replay.duration(probe));
@@ -283,6 +346,35 @@ async fn requests(
             }
             Some(Operation::WorkerFetch { .. }) if profile.facts.worker_fetch_rejected => {
                 observed.worker_fetch = Some(worker_fetch::Measurement::Rejected);
+            }
+            Some(Operation::HostReachability { fields }) => {
+                // CORS rejects a response that does not allow the iframe's origin.
+                let origin = iframe.url.origin().ascii_serialization();
+                let mut outcomes = Vec::new();
+                for url in &fields.urls {
+                    let url = Url::parse(url).context("parsing a host reachability URL")?;
+                    let timer = Timer::start();
+                    let options = FetchOptions::NoStoreWithoutCredentials;
+                    let fetched = http::fetch_from_worker(client, iframe, &url, options);
+                    outcomes.push(match time::timeout(REACHABILITY_TIMEOUT, fetched).await {
+                        Ok(Ok(response))
+                            if response
+                                .headers()
+                                .get("access-control-allow-origin")
+                                .and_then(|allowed| allowed.to_str().ok())
+                                .is_some_and(|allowed| allowed == "*" || allowed == origin) =>
+                        {
+                            host_reachability::Outcome::Answered {
+                                elapsed_ms: timer.elapsed_ms() as i64,
+                            }
+                        }
+                        _ => host_reachability::Outcome::Rejected,
+                    });
+                }
+                observed.host_reachability = Some(outcomes);
+            }
+            Some(Operation::WebSocketEcho { fields }) => {
+                observed.websocket_echo = Some(echo_websocket(session, fields, options).await?);
             }
             Some(Operation::WorkerFetch { fields }) => {
                 let url = fields.url(options)?;
@@ -398,7 +490,6 @@ fn window_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::js;
 
     #[test]
     fn a_profile_duration_overrides_the_default_for_its_family() {
@@ -413,9 +504,10 @@ mod tests {
             ],
         }))
         .unwrap();
+        let observed = Observed::default();
         let mut configured = BTreeMap::new();
-        assert_eq!(durations(&plan, &configured, Some(40), None), [2, 2]);
+        assert_eq!(durations(&plan, &configured, &observed, None), [2, 2]);
         configured.insert("empty".into(), 7);
-        assert_eq!(durations(&plan, &configured, Some(40), None), [7, 2]);
+        assert_eq!(durations(&plan, &configured, &observed, None), [7, 2]);
     }
 }

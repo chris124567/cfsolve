@@ -16,12 +16,14 @@ use anyhow::{Context, Result};
 use num_bigint::BigUint;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+use swc_core::ecma::ast::Script;
 use tokio::task::JoinSet;
 use url::Url;
 
 use super::rsa::{ProxyKey, Rewrapped};
 use crate::challenge::codec::{Codec, KEY_LENGTH};
 use crate::challenge::program::{self, PreparedSession};
+use crate::deobfuscate::Encoded;
 use crate::js::ast;
 use crate::script::Source;
 use crate::{challenge, deep_stack};
@@ -344,9 +346,11 @@ fn extract_codec(original: &str) -> Result<Codec> {
     Ok(session.into_program().codec)
 }
 
-/// Scans the raw script with the solver's alphabet rule, without restricting it to the IIFE.
-/// Background extraction checks the result before the session can become stored answers.
-pub(super) fn scan_alphabet(javascript: &str) -> Result<String> {
-    let parsed = ast::parse_javascript("iframe.js", javascript)?;
-    program::base64_alphabet(&parsed.script)
+/// Searches literals and inline decoded `strings` for a custom base64 alphabet using the solver's
+/// alphabet rule. Searches the entire raw script, including outside the immediately invoked
+/// function. Background extraction validates the result before saving session answers.
+pub(super) fn scan_alphabet(script: &Script, strings: &[Encoded]) -> Result<String> {
+    let mut candidates = ast::string_literals(script);
+    candidates.extend(strings.iter().map(|string| string.decoded.clone()));
+    program::base64_alphabet(candidates)
 }

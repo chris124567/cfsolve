@@ -138,6 +138,14 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
         }
     }
     let header: BTreeSet<String> = index.header().values().cloned().collect();
+    let mut wrapper: BTreeSet<String> = discovery
+        .probes
+        .first()
+        .map(|first| first.features.iter().cloned().collect())
+        .unwrap_or_default();
+    for probe in &discovery.probes {
+        wrapper.retain(|text| probe.features.contains(text));
+    }
     let mut probes = Vec::new();
     let mut evidence = Vec::new();
     for (position, raw) in discovery.probes.into_iter().enumerate() {
@@ -152,9 +160,11 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
             vocabulary: &vocabulary,
             position,
             header: &header,
+            wrapper: &wrapper,
             pool,
             entry: raw.function.pc,
             session_features: &raw.features,
+            writes: &raw.writes,
             strings: Strings::new(&features, &outputs),
         })
         .or(reference.map(|reference| Operation::Replay { reference }));

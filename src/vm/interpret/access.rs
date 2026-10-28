@@ -3,12 +3,15 @@
 use std::borrow::Cow;
 use std::rc::Rc;
 
+use swc_core::ecma::ast::BinaryOp;
+
 use super::builtin::{self, Builtin};
 use super::run::{Evaluation, Run, Stop};
 use super::semantics;
 use crate::js;
 use crate::vm::convert::{self, MAXIMUM_LENGTH};
 use crate::vm::output::{Constant, Effect, Term};
+use crate::vm::registers::{Member, Slots, Stored};
 use crate::vm::value::{Callable, JsString, Value};
 
 /// A property key with text retained for named-property lookup.
@@ -82,12 +85,18 @@ impl<'ast> Run<'ast, '_> {
             Key::Value(value) => value.number(),
         };
         Ok(match object {
-            Value::Registers => {
+            Value::Registers if let Some(member) = name.and_then(Member::of) => {
+                self.register_member(member)
+            }
+            Value::Registers | Value::RegisterSlots(Slots::Values) => {
+                self.register_value(self.register(key)?)
+            }
+            Value::RegisterSlots(Slots::Tags) => {
                 let register = self.register(key)?;
-                match self.registers.get(&register) {
-                    Some(value) => value.clone(),
-                    None => Value::symbolic(Term::Reg(register)),
-                }
+                self.tags
+                    .get(&register)
+                    .cloned()
+                    .ok_or_else(|| unsupported("tag of a register", key))?
             }
             Value::Program => match (index, name) {
                 (Some(index), _) => convert::index(index)
@@ -106,6 +115,15 @@ impl<'ast> Run<'ast, '_> {
                 {
                     Value::Program
                 }
+                (Key::Value(Value::Symbol(symbol)), _) => {
+                    let (_, field) = self
+                        .session
+                        .symbol_fields
+                        .iter()
+                        .find(|(key, _)| Rc::ptr_eq(key, symbol))
+                        .ok_or_else(|| unsupported("machine member", key))?;
+                    self.isolate(field)
+                }
                 (_, Some(name)) => match self.session.state.get(name) {
                     Some(value) => value.clone(),
                     None => self.field(name),
@@ -118,7 +136,6 @@ impl<'ast> Run<'ast, '_> {
                 Some(name) => builtin::member(path, name),
                 None => return Err(unsupported("global member", key)),
             },
-            Value::Cache => self.cached(index).unwrap_or(Value::Undefined),
             Value::Cells => match (index.and_then(convert::position), name) {
                 (Some(index), _) => Value::Cell(index),
                 (None, Some(_)) => {
@@ -152,6 +169,7 @@ impl<'ast> Run<'ast, '_> {
                 (None, Some("charCodeAt")) => {
                     Value::function(Callable::Builtin(Builtin::CharCodeAt))
                 }
+                (None, Some("repeat")) => Value::function(Callable::Builtin(Builtin::Repeat)),
                 (None, Some(method)) if STRING_MEMBERS.contains(&method) => {
                     return Err(Stop::unsupported(&format!("string method {method}")));
                 }
@@ -170,6 +188,10 @@ impl<'ast> Run<'ast, '_> {
                     .find(|(key, _)| **key == *name)
                     .map_or(Value::Undefined, |(_, value)| value.clone())
             }
+            Value::Map(_) => match name.and_then(|name| builtin::method("Map.prototype", name)) {
+                Some(method) => method,
+                None => return Err(unsupported("map member", key)),
+            },
             Value::Set(_) => match name.and_then(|name| builtin::method("Set.prototype", name)) {
                 Some(method) => method,
                 None => return Err(unsupported("set member", key)),
@@ -208,12 +230,31 @@ impl<'ast> Run<'ast, '_> {
     ) -> Evaluation<'ast, ()> {
         let layout = self.session.layout;
         match object {
-            Value::Registers => {
+            Value::Registers => match key.text().and_then(Member::of) {
+                Some(Member::Pc | Member::OtherPc) => self.set_register(layout.pc, value),
+                Some(Member::Key | Member::OtherKey) => self.set_register(layout.key, value),
+                // These fields have fixed values in the interpreter model.
+                Some(Member::Mask | Member::Integer | Member::PcIndex | Member::KeyIndex) => {}
+                Some(_) => return Err(unsupported("register file member", key)),
+                None => self.write_register(self.register(key)?, value),
+            },
+            Value::RegisterSlots(Slots::Tags) => {
                 let register = self.register(key)?;
-                if register != layout.pc && register != layout.key {
-                    self.effects.push(Effect::Set(register, value.expr()));
-                }
-                self.set_register(register, value);
+                self.tags.insert(register, value);
+            }
+            // Value storage helpers write the tag before writing the value.
+            Value::RegisterSlots(Slots::Values) => {
+                let register = self.register(key)?;
+                let tag = self.tags.remove(&register).and_then(|tag| tag.number());
+                let tag = tag.map_or(Stored::Plain, Stored::of);
+                let value = match (tag, &value) {
+                    // `read` decrypts on every access, but caching the decrypted value has the same
+                    // result. Values copied from another register were already decrypted when first
+                    // stored.
+                    (Stored::Record, Value::Array(_)) => self.decrypted(value)?,
+                    (tag, _) => stored(tag, value),
+                };
+                self.write_register(register, value);
             }
             Value::Cells => {
                 let cell = key
@@ -223,12 +264,25 @@ impl<'ast> Run<'ast, '_> {
                 self.effects.push(Effect::NewCell(cell));
             }
             Value::Cell(cell) => self.effects.push(Effect::SetCell(*cell, value.expr())),
-            Value::Cache => self.cache(key, &value),
             Value::Machine => {
                 let name = key
                     .text()
                     .ok_or_else(|| unsupported("machine member", key))?;
                 self.set_field(name.to_owned(), value);
+            }
+            Value::Array(elements) if key.text() == Some("length") => {
+                match value.number() {
+                    Some(length) => {
+                        let length = convert::length(length)
+                            .filter(|&length| length < MAXIMUM_LENGTH)
+                            .ok_or_else(|| unsupported("array length", key))?;
+                        elements.borrow_mut().resize(length, Value::Undefined);
+                    }
+                    // An earlier instruction restored the stack length. Keep the known elements
+                    // from this run; see `Builtin::Pop`.
+                    None if value.is_symbolic() => {}
+                    None => return Err(unsupported("array length", key)),
+                }
             }
             Value::Array(elements) => {
                 let index = match key {
@@ -275,40 +329,74 @@ impl<'ast> Run<'ast, '_> {
         Ok(())
     }
 
-    /// Returns a decoded-string cache entry as a new array.
-    fn cached(&self, index: Option<f64>) -> Option<Value<'ast>> {
-        let slot = (self.handler?, convert::position(index?)?);
-        let decoded = self.session.decoded.borrow();
-        Some(Value::array(decoded.get(&slot)?.clone()))
-    }
-
-    /// Caches `value` at `key` only during handler execution and only when the entry is fully
-    /// determined by program bytes.
-    fn cache(&self, key: &Key<'_, 'ast>, value: &Value<'ast>) {
-        let primitive = |value: &Value<'_>| {
-            matches!(
-                value,
-                Value::Undefined
-                    | Value::Null
-                    | Value::Bool(_)
-                    | Value::Number(_)
-                    | Value::String(_)
-            )
-        };
-        if let (Some(handler), Key::Value(index), Value::Array(entry)) = (self.handler, key, value)
-            && let Some(index) = index.number().and_then(convert::position)
-            && entry.borrow().iter().all(primitive)
-        {
-            let entry = entry.borrow().clone();
-            self.session
-                .decoded
-                .borrow_mut()
-                .insert((handler, index), entry);
+    /// Returns the register value, using a symbolic value unless this run has assigned it.
+    pub(super) fn register_value(&self, register: u8) -> Value<'ast> {
+        match self.registers.get(&register) {
+            Some(value) => self.refined(value),
+            None => self.refined(&Value::symbolic(Term::Reg(register))),
         }
     }
 
-    /// The register `key` names.
-    fn register(&self, key: &Key<'_, 'ast>) -> Evaluation<'ast, u8> {
+    /// Sets a register, recording the write unless it moves the program counter or key.
+    pub(super) fn write_register(&mut self, register: u8, value: Value<'ast>) {
+        let layout = self.session.layout;
+        if register != layout.pc && register != layout.key {
+            self.effects.push(Effect::Set(register, value.expr()));
+        }
+        self.set_register(register, value);
+    }
+
+    /// Decrypts a string record using the same logic as the register file's `read` method.
+    fn decrypted(&mut self, record: Value<'ast>) -> Evaluation<'ast, Value<'ast>> {
+        let Value::Array(elements) = &record else {
+            return Ok(record);
+        };
+        let field = |index: usize| elements.borrow().get(index).and_then(Value::number);
+        let key = match (field(1), field(2), field(3)) {
+            (Some(pc), Some(length), Some(key)) => Some((pc as u32, length as u32, key as u32)),
+            _ => None,
+        };
+        if let Some(key) = key
+            && let Some(text) = self.session.decrypted.borrow().get(&key)
+        {
+            return Ok(text.clone());
+        }
+        let decoder = self
+            .session
+            .record_decoder
+            .as_ref()
+            .ok_or_else(|| Stop::unsupported("an encrypted string with no decoder"))?;
+        let decoder = self.lookup(decoder)?;
+        let text = self.apply(decoder, Value::Undefined, vec![record])?;
+        if let (Some(key), Value::String(_)) = (key, &text) {
+            self.session
+                .decrypted
+                .borrow_mut()
+                .insert(key, text.clone());
+        }
+        Ok(text)
+    }
+
+    /// A member of the register file (see [`Member`]).
+    fn register_member(&self, member: Member) -> Value<'ast> {
+        let layout = self.session.layout;
+        match member {
+            Member::Read => Value::function(Callable::Builtin(Builtin::RegisterRead)),
+            Member::Write => Value::function(Callable::Builtin(Builtin::RegisterWrite)),
+            Member::Mask => Value::Number(0.0),
+            Member::Integer => Value::Number(1.0),
+            Member::Pc => self.register_value(layout.pc),
+            Member::Key => self.register_value(layout.key),
+            Member::OtherPc | Member::OtherKey => Value::Undefined,
+            Member::PcIndex => Value::Number(f64::from(layout.pc)),
+            Member::KeyIndex => Value::Number(f64::from(layout.key)),
+            Member::Values => Value::RegisterSlots(Slots::Values),
+            Member::Tags => Value::RegisterSlots(Slots::Tags),
+        }
+    }
+
+    /// Resolves the register index identified by `key`.
+    pub(super) fn register(&self, key: &Key<'_, 'ast>) -> Evaluation<'ast, u8> {
         match key {
             Key::Value(value) if !matches!(value, Value::String(_)) => {
                 value.number().and_then(convert::byte)
@@ -331,6 +419,21 @@ fn key_index(name: &str) -> Option<f64> {
     }
     let number = js::string_number(name);
     (number.to_js_string() == name).then_some(number)
+}
+
+/// Decodes `value` stored with `tag`, matching the value returned by the register reader.
+fn stored(tag: Stored, value: Value<'_>) -> Value<'_> {
+    match tag {
+        Stored::Integer(upper) => {
+            semantics::binary_value(BinaryOp::BitXor, Value::Number(f64::from(upper)), value)
+        }
+        Stored::Boolean(upper) => {
+            let bits =
+                semantics::binary_value(BinaryOp::BitXor, value, Value::Number(f64::from(upper)));
+            semantics::binary_value(BinaryOp::NotEqEq, bits, Value::Number(0.0))
+        }
+        Stored::Plain | Stored::Record => value,
+    }
 }
 
 pub(super) fn unsupported<'a>(what: &str, key: &Key<'_, '_>) -> Box<Stop<'a>> {
@@ -367,7 +470,6 @@ const STRING_MEMBERS: &[&str] = &[
     "padEnd",
     "padStart",
     "propertyIsEnumerable",
-    "repeat",
     "replace",
     "replaceAll",
     "search",

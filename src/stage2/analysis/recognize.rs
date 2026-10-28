@@ -5,6 +5,7 @@
 use std::collections::{BTreeSet, HashSet};
 
 use crate::listing::{self, Index};
+use crate::stage2::records::WriteOrder;
 use crate::stage2::vocabulary::Vocabulary;
 
 /// Collection strings and output names mapped to the reference build. Preserves string order
@@ -87,11 +88,15 @@ pub(crate) struct ProbeView<'probe> {
     pub position: usize,
     /// The names the program's header loads.
     pub header: &'probe BTreeSet<String>,
+    /// Wrapper strings shared by every probe in this program, using the session's names.
+    pub wrapper: &'probe BTreeSet<String>,
     pub pool: &'probe str,
     /// Where its collection function starts.
     pub entry: u32,
     /// Its strings in the session's names.
     pub session_features: &'probe [String],
+    /// Fields written by the probe, using the session's names.
+    pub writes: &'probe WriteOrder,
     /// Its strings and outputs in the reference build's names.
     pub strings: Strings<'probe>,
 }
@@ -122,9 +127,11 @@ mod tests {
             vocabulary: &vocabulary,
             position: 0,
             header: &header,
+            wrapper: &header,
             pool: "",
             entry: 0,
             session_features: features,
+            writes: &WriteOrder::default(),
             strings: Strings::new(features, outputs),
         })
     }
@@ -182,6 +189,7 @@ mod tests {
     }
 
     /// Checks that each recognizer accepts its reference outputs and rejects missing outputs.
+    /// `tests/stage2.rs` snapshots verify the recovered operation.
     #[test]
     fn recognizers_need_every_output_stored() {
         use crate::stage2::probes::{private_token, worker_fetch};

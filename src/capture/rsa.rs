@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use crate::candidates;
 use crate::challenge::codec::{self, Envelope, KEY_LENGTH, PUBLIC_EXPONENT, SEED_LENGTH};
+use crate::deobfuscate::{self, Encoded};
 
 /// Matches a `BigInt` call with a hexadecimal literal, capturing its quotes and digits. The
 /// regex engine has no backreferences, so code checks that the quotes match.
@@ -90,28 +91,59 @@ impl ProxyKey {
     }
 }
 
-/// Replaces the iframe's 128-byte `BigInt` hexadecimal literal (see `rsa_modulus` in
-/// `crate::challenge::program`) with `proxy`, zero-padded to the same width so the HTML length
-/// and stack-trace positions stay unchanged. Returns the rewritten HTML and the real modulus.
-pub(super) fn swap_modulus(html: &str, proxy: &BigUint) -> Result<(String, BigUint)> {
-    let literals = MODULUS.captures_iter(html).filter_map(|captures| {
-        let (_, [open, digits, close]) = captures.extract();
-        let modulus = BigUint::parse_bytes(digits.as_bytes(), 16).expect("hex digits");
-        let wide = open == close && modulus.bits().div_ceil(8) == SEED_LENGTH as u64;
-        wide.then(|| (captures.get(2).expect("the digits group").range(), modulus))
+/// Replaces the iframe's 128-byte RSA modulus with `proxy`. Returns the rewritten HTML and the
+/// original modulus. See `rsa_modulus` in `crate::challenge::program`.
+///
+/// Pads the replacement with zeros to preserve HTML length and stack trace positions. The modulus
+/// can be a hexadecimal `BigInt` literal or an inline encoded string from `strings`. Encoded
+/// replacements use the original key.
+pub(super) fn swap_modulus(
+    html: &str,
+    strings: &[Encoded],
+    proxy: &BigUint,
+) -> Result<(String, BigUint)> {
+    let wide = |modulus: &BigUint| modulus.bits().div_ceil(8) == SEED_LENGTH as u64;
+    let literals: Vec<_> = MODULUS
+        .captures_iter(html)
+        .filter_map(|captures| {
+            let (_, [open, digits, close]) = captures.extract();
+            let modulus = BigUint::parse_bytes(digits.as_bytes(), 16).expect("hex digits");
+            (open == close && wide(&modulus))
+                .then(|| (captures.get(2).expect("the digits group").range(), modulus))
+        })
+        .collect();
+    if !literals.is_empty() {
+        let what = format!("{SEED_LENGTH}-byte BigInt literal in the iframe");
+        let (digits, real) = candidates::exactly_one(literals, &what)?;
+        let mut rewritten = html.to_owned();
+        rewritten.replace_range(digits.clone(), &padded(proxy, digits.len())?);
+        return Ok((rewritten, real));
+    }
+    let encoded = strings.iter().filter_map(|string| {
+        let digits = string.decoded.strip_prefix("0x")?;
+        let modulus = BigUint::parse_bytes(digits.as_bytes(), 16)?;
+        wide(&modulus).then_some((string, digits.len(), modulus))
     });
-    let what = format!("{SEED_LENGTH}-byte BigInt literal in the iframe");
-    let (digits, real) = candidates::exactly_one(literals, &what)?;
-    let width = digits.len();
-    let proxy_digits = proxy.to_str_radix(16);
+    let what = format!("{SEED_LENGTH}-byte modulus in the iframe");
+    let (string, width, real) = candidates::exactly_one(encoded, &what)?;
+    let replacement =
+        deobfuscate::encode_string(&format!("0x{}", padded(proxy, width)?), string.key);
     ensure!(
-        proxy_digits.len() <= width,
-        "the proxy modulus needs {} hex digits, wider than the session's {width}",
-        proxy_digits.len()
+        replacement.len() == string.encoded.len() && html.matches(&string.encoded).count() == 1,
+        "the encoded modulus cannot be replaced in place"
     );
-    let mut rewritten = html.to_owned();
-    rewritten.replace_range(digits, &format!("{proxy_digits:0>width$}"));
-    Ok((rewritten, real))
+    Ok((html.replacen(&string.encoded, &replacement, 1), real))
+}
+
+/// Formats `proxy` as hexadecimal, padded with zeros to `width`.
+fn padded(proxy: &BigUint, width: usize) -> Result<String> {
+    let digits = proxy.to_str_radix(16);
+    ensure!(
+        digits.len() <= width,
+        "the proxy modulus needs {} hex digits, wider than the session's {width}",
+        digits.len()
+    );
+    Ok(format!("{digits:0>width$}"))
 }
 
 /// Generates a random prime half the seed's width, with its top bit set.
@@ -241,10 +273,29 @@ mod tests {
         let [proxy, real, _] = keys();
         for quote in ['"', '`'] {
             let html = page(quote, &real.modulus);
-            let (rewritten, found) = swap_modulus(&html, &proxy.modulus).unwrap();
+            let (rewritten, found) = swap_modulus(&html, &[], &proxy.modulus).unwrap();
             assert_eq!(found, real.modulus);
             assert_eq!(rewritten, page(quote, &proxy.modulus));
         }
+    }
+
+    /// Find the modulus inside a decoder call when the build encodes strings.
+    #[test]
+    fn swap_reencodes_an_encoded_modulus() {
+        let [proxy, real, _] = keys();
+        let key = 59141;
+        let text = |modulus: &BigUint| format!("0x00{modulus:x}");
+        let encoded = deobfuscate::encode_string(&text(&real.modulus), key);
+        let html = format!("<script>n = BigInt(decode(`{encoded}`));</script>");
+        let strings = [Encoded {
+            encoded: encoded.clone(),
+            key,
+            decoded: text(&real.modulus),
+        }];
+        let (rewritten, found) = swap_modulus(&html, &strings, &proxy.modulus).unwrap();
+        assert_eq!(found, real.modulus);
+        let swapped = deobfuscate::encode_string(&text(&proxy.modulus), key);
+        assert_eq!(rewritten, html.replace(&encoded, &swapped));
     }
 
     #[test]
@@ -266,7 +317,7 @@ mod tests {
             ),
         ];
         for (html, case) in cases {
-            assert!(swap_modulus(&html, &proxy.modulus).is_err(), "{case}");
+            assert!(swap_modulus(&html, &[], &proxy.modulus).is_err(), "{case}");
         }
     }
 }

@@ -4,10 +4,10 @@
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::reference;
 
+/// Builds can read the message using a property name stored in a register. Only `fromCodePoint` is
+/// guaranteed to appear in the probe strings.
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<()> {
     let strings = &probe.strings;
-    (strings.has("fromCodePoint")
-        && strings.has("message")
-        && strings.stores(reference::ERROR_MESSAGE_LENGTH_RESULT))
-    .then_some(())
+    (strings.has("fromCodePoint") && strings.stores(reference::ERROR_MESSAGE_LENGTH_RESULT))
+        .then_some(())
 }

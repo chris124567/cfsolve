@@ -1,5 +1,6 @@
 //! Recovers the format the iframe uses to summarize resource timings, then converts this
-//! client's fetch measurements to that format.
+//! client's fetch measurements to that format. Depending on the build, entries contain rounded-down
+//! phase durations or the original timestamps.
 
 use swc_core::ecma::ast::{AssignTarget, BinaryOp, BlockStmt, Expr, SimpleAssignTarget};
 
@@ -11,13 +12,30 @@ use crate::resource_timing::{LoadTiming, Phases, ResourceMeasurement};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Measure {
     Name,
-    /// `responseEnd - responseStart`.
+    /// `Math.floor(responseEnd - responseStart)`.
     Response,
-    /// `responseStart - requestStart`.
+    /// `Math.floor(responseStart - requestStart)`.
     Request,
+    /// `Math.floor(duration)`.
     Duration,
     Transfer,
     Body,
+    /// Original timestamps: `startTime`, `requestStart`, `responseStart`, `responseEnd`, and
+    /// `duration`.
+    Start,
+    RequestStart,
+    ResponseStart,
+    ResponseEnd,
+    ExactDuration,
+}
+
+/// A resource load with its name, start time, and measured phases. The start time is in
+/// milliseconds from the document's time origin. The response ends when the load finishes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Entry<'a> {
+    pub name: &'a str,
+    pub start: f64,
+    pub measured: ResourceMeasurement,
 }
 
 /// Maps collected resource timings to the six fields sent under the collection's option name.
@@ -30,31 +48,48 @@ pub struct ResourceTiming {
 }
 
 impl ResourceTiming {
-    /// Reduces a measured fetch to the session's resource timing format.
+    /// Converts a load to the resource timing format used by this session.
     #[must_use]
-    pub(crate) fn reduce(&self, url: &str, measured: &ResourceMeasurement) -> JsValue {
-        let mut entry = JsObject::new();
+    pub(crate) fn reduce(&self, entry: &Entry<'_>) -> JsValue {
+        let measured = &entry.measured;
+        // Restricted entries report a response start of zero; see
+        // `ResourceMeasurement::restricted`.
+        let response_end = entry.start + measured.duration;
+        let response_start = response_end - measured.response;
+        let request_start = response_start - measured.request;
+        let mut reduced = JsObject::new();
         for (name, measure) in &self.fields {
             let value = match measure {
-                Measure::Name => json!(url),
+                Measure::Name => json!(entry.name),
                 Measure::Response => json!(measured.response.floor()),
                 Measure::Request => json!(measured.request.floor()),
                 Measure::Duration => json!(measured.duration.floor()),
                 Measure::Transfer => json!(measured.transfer_size),
                 Measure::Body => json!(measured.body_size),
+                Measure::Start => json!(entry.start),
+                Measure::RequestStart => json!(request_start),
+                Measure::ResponseStart => json!(response_start),
+                Measure::ResponseEnd => json!(response_end),
+                Measure::ExactDuration => json!(measured.duration),
             };
-            entry.insert(name.clone(), value);
+            reduced.insert(name.clone(), value);
         }
-        JsValue::Object(entry)
+        JsValue::Object(reduced)
     }
 
-    /// Reduces `load` using its measured phases.
+    /// Converts measured phases from `load` to the session format. Times are relative to
+    /// `origin_ms`, the document navigation time in milliseconds since the Unix epoch.
     #[must_use]
-    pub(crate) fn entry(&self, load: &LoadTiming) -> JsValue {
-        self.reduce(&load.url, &load.measurement())
+    pub(crate) fn entry(&self, load: &LoadTiming, origin_ms: i64) -> JsValue {
+        self.reduce(&Entry {
+            name: &load.url,
+            start: (load.started_ms - origin_ms) as f64,
+            measured: load.measurement(),
+        })
     }
 
-    /// Splits the session's total document load time into the navigation's `phases`.
+    /// Splits the total document load time into navigation `phases`. Navigation starts at the
+    /// document's time origin.
     #[must_use]
     pub(crate) fn navigation(
         &self,
@@ -63,10 +98,11 @@ impl ResourceTiming {
         bytes: u64,
         phases: Phases,
     ) -> JsValue {
-        self.reduce(
-            url,
-            &ResourceMeasurement::estimated(duration, bytes, phases),
-        )
+        self.reduce(&Entry {
+            name: url,
+            start: 0.0,
+            measured: ResourceMeasurement::estimated(duration, bytes, phases),
+        })
     }
 }
 
@@ -90,7 +126,7 @@ pub(super) fn reduction(body: &BlockStmt) -> Option<Vec<(String, Measure)>> {
 }
 
 /// Recognizes a reduced entry when it has enough fields, includes the resource name, and uses
-/// only the name or `measured` locals.
+/// only properties of the entry itself or locals listed in `measured`.
 fn reduced_fields(
     fields: &[ObjectField<'_>],
     measured: &[(&str, Measure)],
@@ -98,7 +134,17 @@ fn reduced_fields(
     let mut reduced = Vec::with_capacity(fields.len());
     for field in fields {
         let measure = match field.value {
-            Expr::Member(member) if ast::member_str(&member.prop) == Some("name") => Measure::Name,
+            Expr::Member(member) => match ast::member_str(&member.prop)? {
+                "name" => Measure::Name,
+                "startTime" => Measure::Start,
+                "requestStart" => Measure::RequestStart,
+                "responseStart" => Measure::ResponseStart,
+                "responseEnd" => Measure::ResponseEnd,
+                "duration" => Measure::ExactDuration,
+                "transferSize" => Measure::Transfer,
+                "encodedBodySize" => Measure::Body,
+                _ => return None,
+            },
             Expr::Ident(ident) => {
                 let (_, measure) = measured.iter().rfind(|(local, _)| *local == &*ident.sym)?;
                 *measure
@@ -172,6 +218,59 @@ mod tests {
         assert_eq!(
             timing.navigation("u", 137.0, 1, chromium),
             json!({"n": "u", "r": 5.0, "q": 9.0, "d": 137.0, "t": 301, "b": 1})
+        );
+    }
+
+    /// Builds from 2026-10-27 onward copy original timestamps rather than rounding down phase
+    /// durations.
+    #[test]
+    fn summaries_may_copy_the_entrys_timestamps() {
+        let parsed = ast::parse_javascript(
+            "t.js",
+            "function f(e) { var r; r = { a: e.name, b: e.startTime, c: e.requestStart, \
+             d: e.responseStart, g: e.responseEnd, h: e.duration, i: e.transferSize, \
+             j: e.encodedBodySize }; list.push(r); }",
+        )
+        .unwrap();
+        let function = parsed.script.body[0]
+            .as_decl()
+            .unwrap()
+            .as_fn_decl()
+            .unwrap();
+        let fields = reduction(function.function.body.as_ref().unwrap()).unwrap();
+        let measures: Vec<Measure> = fields.iter().map(|(_, measure)| *measure).collect();
+        assert_eq!(
+            measures,
+            [
+                Measure::Name,
+                Measure::Start,
+                Measure::RequestStart,
+                Measure::ResponseStart,
+                Measure::ResponseEnd,
+                Measure::ExactDuration,
+                Measure::Transfer,
+                Measure::Body,
+            ]
+        );
+        let timing = ResourceTiming {
+            option: "t".into(),
+            fields,
+        };
+        let entry = Entry {
+            name: "u",
+            start: 10.0,
+            measured: ResourceMeasurement {
+                duration: 100.0,
+                request: 60.0,
+                response: 5.0,
+                transfer_size: 1300,
+                body_size: 1000,
+            },
+        };
+        assert_eq!(
+            timing.reduce(&entry),
+            json!({"a": "u", "b": 10.0, "c": 45.0, "d": 105.0, "g": 110.0, "h": 100.0,
+                "i": 1300, "j": 1000})
         );
     }
 }

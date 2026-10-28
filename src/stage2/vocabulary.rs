@@ -133,12 +133,6 @@ impl Vocabulary {
         self.candidates.get(index).copied().flatten()
     }
 
-    /// The reference name for a session name, wherever it appears.
-    #[must_use]
-    pub fn reference_name(&self, name: &str) -> Option<String> {
-        self.global.to_reference.get(name).cloned()
-    }
-
     /// Translates `name` for probe `index` in direction `side`, preferring the probe's own pairs
     /// over the program-wide map.
     fn find(
@@ -231,24 +225,23 @@ fn pair_probes<S: AsRef<[String]>>(
     session: &[S],
     reference: &[Vec<String>],
 ) -> (Vec<Option<usize>>, Vec<Option<Candidate>>) {
-    fn stable(strings: &[String]) -> HashSet<&str> {
-        strings
-            .iter()
-            .map(String::as_str)
-            .filter(|text| !is_name(text))
-            .collect()
-    }
-    let reference_sets: Vec<HashSet<&str>> = reference.iter().map(|probe| stable(probe)).collect();
+    let session_sets = distinctive(session.iter().map(AsRef::as_ref));
+    let reference_sets = distinctive(reference.iter().map(Vec::as_slice));
     // Each session probe's position, with one reference probe's similarity.
     let mut pairings: Vec<(usize, Candidate)> = Vec::new();
-    for (index, probe) in session.iter().enumerate() {
-        let session_set = stable(probe.as_ref());
+    for (index, session_set) in session_sets.iter().enumerate() {
         for (reference_probe, reference_set) in reference_sets.iter().enumerate() {
             let shared = session_set.intersection(reference_set).count();
-            let all = session_set.union(reference_set).count().max(1);
+            let all = session_set.union(reference_set).count();
+            // Probes containing only wrapper strings match each other.
+            let similarity = if all == 0 {
+                1.0
+            } else {
+                shared as f64 / all as f64
+            };
             let candidate = Candidate {
                 reference: reference_probe + 1,
-                similarity: shared as f64 / all as f64,
+                similarity,
             };
             pairings.push((index, candidate));
         }
@@ -270,6 +263,45 @@ fn pair_probes<S: AsRef<[String]>>(
         }
     }
     (pairs, best)
+}
+
+/// Returns strings that identify a probe across builds. Excludes randomized names, encrypted log
+/// messages regenerated for each build, and shared wrapper strings renamed together within a
+/// program.
+fn distinctive<'a>(probes: impl Iterator<Item = &'a [String]>) -> Vec<HashSet<&'a str>> {
+    let mut sets: Vec<HashSet<&str>> = probes
+        .map(|strings| {
+            strings
+                .iter()
+                .map(String::as_str)
+                .filter(|text| !is_name(text) && !is_log_message(text))
+                .collect()
+        })
+        .collect();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for set in &sets {
+        for text in set {
+            *counts.entry(text).or_default() += 1;
+        }
+    }
+    let probe_count = sets.len();
+    for set in &mut sets {
+        set.retain(|text| 2 * counts[text] < probe_count);
+    }
+    sets
+}
+
+/// Checks for an encrypted log message in the form `<base64>$<base64>`.
+fn is_log_message(text: &str) -> bool {
+    let is_base64 = |part: &str| {
+        !part.is_empty()
+            && part
+                .trim_end_matches('=')
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/')
+    };
+    text.split_once('$')
+        .is_some_and(|(cipher, iv)| is_base64(cipher) && is_base64(iv))
 }
 
 /// Aligns probe string sequences and pairs names between shared anchors. Requires equal counts

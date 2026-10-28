@@ -100,6 +100,9 @@ impl FirstPayload {
         let fields = &program.payload_fields;
         let options = &mut program.request.options;
         options.extend(installed.options);
+        if let Some(log) = &state.post_log {
+            log.start(options);
+        }
         let (merge_mark, marked_ms) = complete(options);
         options.extend(state.timestamps(
             &payload::differences(fields),
@@ -134,6 +137,9 @@ pub(crate) struct Merged {
     pub selector_log: Option<String>,
     /// The resource timing entries the first payload reports.
     pub resources: Vec<JsValue>,
+    /// Start of iframe navigation in milliseconds since the Unix epoch. Resource timing uses this
+    /// as its time origin.
+    pub time_origin_ms: i64,
     /// What the embedding page reported about itself in `extraParams`.
     pub page_signals: PageSignals,
 }
@@ -387,6 +393,7 @@ pub(crate) fn merge(
         globals: built.globals,
         selector_log: payload::selector_log(&built.program.payload_fields),
         resources,
+        time_origin_ms: navigation.started_ms,
         page_signals,
     };
     Ok((built.program, merged))

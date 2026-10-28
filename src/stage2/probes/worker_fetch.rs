@@ -15,9 +15,10 @@ pub(crate) const OUTPUTS: [&str; 2] = [
 
 /// The response header whose value the probe reports as its token.
 const HEADER: &str = "cf-chl-peek";
-/// Worker fetch URL prefix, including an explicit host. [`super::platform::url`] instead builds
-/// URLs relative to the iframe.
-const URL_PREFIX: &str = "https://brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/";
+/// Explicit host and path prefix for the worker fetch. Builds may store them as one string or two.
+/// [`super::platform::url`] builds URLs relative to the iframe instead.
+const HOST: &str = "brunhild.challenges.cloudflare.com";
+const PATH: &str = "/cdn-cgi/challenge-platform/h/";
 
 /// The session's options naming the request path's platform segment, ray and nonce.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -41,7 +42,7 @@ impl Fields {
     pub fn url(&self, options: &Options) -> Result<Url> {
         let option = |name: &str| js::string(options.get(name));
         Ok(Url::parse(&format!(
-            "{URL_PREFIX}{}/i/{}/{}",
+            "https://{HOST}{PATH}{}/i/{}/{}",
             option(&self.platform_property),
             option(&self.ray_property),
             option(&self.nonce_property),
@@ -86,9 +87,11 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         "cors",
         "omit",
         "no-store",
-        URL_PREFIX,
     ];
-    (strings.stores_all(&OUTPUTS) && strings.has_all(&markers)).then(|| Fields {
+    let requests = [HOST, PATH]
+        .iter()
+        .all(|part| strings.features().iter().any(|text| text.contains(part)));
+    (strings.stores_all(&OUTPUTS) && strings.has_all(&markers) && requests).then(|| Fields {
         platform_property: probe.session_name(reference::PLATFORM_OPTION),
         ray_property: probe.session_name(reference::RAY_OPTION),
         nonce_property: probe.session_name(reference::NONCE_OPTION),

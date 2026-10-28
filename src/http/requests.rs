@@ -7,6 +7,7 @@ use url::form_urlencoded::Serializer;
 use wreq::cookie::Jar;
 use wreq::header::LOCATION;
 use wreq::redirect::Policy;
+use wreq::ws::WebSocket;
 use wreq::{Response, StatusCode};
 
 use super::client::BrowserClient;
@@ -344,6 +345,20 @@ pub async fn fetch_from_worker(
         .context("fetching from the challenge worker")
 }
 
+/// Opens the iframe's WebSocket to `url`. Omits extension offers because the client cannot
+/// decompress messages.
+pub async fn open_websocket(
+    client: &BrowserClient,
+    iframe: &Iframe,
+    url: &Url,
+) -> Result<WebSocket> {
+    let origin = iframe.url.origin().ascii_serialization();
+    client
+        .websocket(url, &[("origin", Some(&origin))])
+        .await
+        .context("opening the iframe's WebSocket")
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -355,6 +370,7 @@ mod tests {
     use wreq::header::{HeaderMap, HeaderValue, USER_AGENT};
 
     use super::*;
+    use crate::http::Requests;
 
     /// A request the test server received.
     struct Received {
@@ -431,22 +447,25 @@ mod tests {
     }
 
     /// Runs widget requests against a loopback server. Returns its address and lowercase
-    /// request headers. Matches captured Safari traffic: the loader redirects, and the page
-    /// sends its origin as referrer when no policy is specified.
+    /// request headers. The WebKit case matches captured Safari traffic: the loader redirects,
+    /// and the page sends its origin as referrer when no policy is specified.
     async fn flow(client: &BrowserClient) -> (SocketAddr, Vec<String>) {
+        let webkit = client.engine == Engine::WebKit;
         let body = "<script>window._cf_chl_opt = {};</script>";
         let ok = format!(
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        let redirect =
-            b"HTTP/1.1 302 Found\r\nLocation: /b/api.js\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let mut responses = vec![ok.into_bytes(); 6];
-        responses.insert(1, redirect.to_vec());
+        if webkit {
+            let redirect =
+                b"HTTP/1.1 302 Found\r\nLocation: /b/api.js\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            responses.insert(1, redirect.to_vec());
+        }
         let (address, server) = serve(responses);
         let page = Url::parse(&format!("http://{address}/page")).unwrap();
         let origin = format!("http://{address}/");
-        let referer = Some(origin.as_str());
+        let referer = webkit.then_some(origin.as_str());
         navigate(client, &page).await.unwrap();
         let script = page.join("/api.js").unwrap();
         fetch_script(client, &script, ScriptLoad::Classic, &page, referer)
@@ -488,12 +507,54 @@ mod tests {
         sent
     }
 
+    /// Expected header order from the tracked Chrome 155 profile, verified against a headed
+    /// browser's book.sv network log.
+    #[tokio::test]
+    async fn requests_send_the_browsers_headers_in_its_order() {
+        let own = [
+            ("user-agent", "Mozilla/5.0"),
+            ("sec-ch-ua", "\"Chromium\";v=\"155\""),
+            ("sec-ch-ua-mobile", "?0"),
+            ("sec-ch-ua-platform", "\"Linux\""),
+        ];
+        let client = BrowserClient {
+            own: own
+                .iter()
+                .map(|(name, value)| (name.parse().unwrap(), value.parse().unwrap()))
+                .collect(),
+            ..BrowserClient::from_http(Client::new())
+        };
+        let (_, heads) = flow(&client).await;
+        let expected = [
+            "sec-ch-ua sec-ch-ua-mobile sec-ch-ua-platform upgrade-insecure-requests user-agent \
+             accept sec-fetch-site sec-fetch-mode sec-fetch-user sec-fetch-dest accept-encoding \
+             accept-language priority",
+            "sec-ch-ua-platform user-agent sec-ch-ua sec-ch-ua-mobile accept sec-fetch-site \
+             sec-fetch-mode sec-fetch-dest sec-fetch-storage-access accept-encoding \
+             accept-language",
+            "sec-ch-ua sec-ch-ua-mobile sec-ch-ua-platform upgrade-insecure-requests user-agent \
+             accept sec-fetch-site sec-fetch-mode sec-fetch-dest sec-fetch-storage-access \
+             accept-encoding accept-language priority",
+            "content-length sec-ch-ua-platform user-agent sec-ch-ua content-type cf-chl cf-chl-ra \
+             sec-ch-ua-mobile accept origin sec-fetch-site sec-fetch-mode sec-fetch-dest referer \
+             accept-encoding accept-language priority",
+            "sec-ch-ua-platform user-agent sec-ch-ua sec-ch-ua-mobile accept sec-fetch-site \
+             sec-fetch-mode sec-fetch-dest sec-fetch-storage-access referer accept-encoding \
+             accept-language priority",
+            "cache-control user-agent accept sec-fetch-site sec-fetch-mode sec-fetch-dest \
+             accept-encoding accept-language priority",
+        ];
+        assert_eq!(header_names(&heads), expected);
+    }
+
     /// Expected header order from the tracked iOS Safari 26.6 profile, verified against
     /// captchatest proxy traffic. Includes Safari's separate redirected-loader order.
     #[tokio::test]
     async fn webkit_requests_send_safaris_headers_in_its_order() {
         let client = BrowserClient {
             own: HeaderMap::from_iter([(USER_AGENT, HeaderValue::from_static("Mozilla/5.0"))]),
+            requests: Requests::from_profile(include_str!("../../profiles/safari-26-ios.json")),
+            engine: Engine::WebKit,
             ..BrowserClient::from_http(Client::new())
         };
         let (address, heads) = flow(&client).await;
@@ -586,7 +647,6 @@ mod tests {
         ] {
             assert!(headers.contains(expected), "missing {expected}: {headers}");
         }
-        // WebKit sends only the iframe's origin.
-        assert!(headers.contains(&format!("referer: http://{address}/\r\n")));
+        assert!(headers.contains(&format!("referer: http://{address}/iframe?lang=auto")));
     }
 }

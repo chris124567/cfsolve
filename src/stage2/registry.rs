@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use super::analysis::recognize::{Phase, ProbeView};
 use super::probes::{
-    clock, dates, dom_mutation, empty, error_message_length, image, media, network_information,
-    parent_info, performance, private_token, rects, stack, worker_fetch, worker_navigator,
+    clock, dates, dom_mutation, empty, error_message_length, host_reachability, image, media,
+    network_information, parent_info, performance, private_token, rects, stack, websocket_echo,
+    worker_fetch, worker_navigator,
 };
 use super::{benchmark, proof};
 use crate::embedding_page::page::PageSignals;
@@ -188,6 +189,10 @@ families! {
     // Rebuilt from the session's own script. The reference build's stack probe is probe 28.
     Stack { fields: stack::Fields } =>
         stack, "stack", Structural, Computed, [28];
+    HostReachability { fields: host_reachability::Fields } =>
+        host_reachability, "host_reachability", Structural, Computed, [];
+    WebSocketEcho { fields: websocket_echo::Fields } =>
+        websocket_echo, "websocket_echo", Structural, Computed, [];
     @empty [11, 26, 33];
     @replayed {
         EnvironmentAudit => "environment_audit", 2;
@@ -276,6 +281,9 @@ pub struct Observed {
     pub media: Option<media::Measurement>,
     pub private_token: Option<private_token::Measurement>,
     pub worker_fetch: Option<worker_fetch::Measurement>,
+    /// Host reachability fetch outcomes in URL order.
+    pub host_reachability: Option<Vec<host_reachability::Outcome>>,
+    pub websocket_echo: Option<websocket_echo::Measurement>,
     pub image: Option<image::Measurement>,
     pub performance: Option<performance::Measurement>,
     /// Pairs of consecutive worker clock readings.
@@ -283,6 +291,21 @@ pub struct Observed {
     pub benchmark: Option<benchmark::Measurement>,
     /// The stack probe's result, rebuilt from this session's script.
     pub stack: Option<String>,
+}
+
+impl Observed {
+    /// Returns the measured duration of completed work for a probe of `kind` in this session.
+    #[must_use]
+    pub fn duration_ms(&self, kind: Kind) -> Option<i64> {
+        match kind {
+            Kind::Benchmark => self
+                .benchmark
+                .as_ref()
+                .map(|run| run.elapsed_ms().ceil() as i64),
+            Kind::WebSocketEcho => self.websocket_echo.as_ref().map(|run| run.elapsed_ms),
+            _ => None,
+        }
+    }
 }
 
 impl Operation {
@@ -312,6 +335,14 @@ impl Operation {
             Self::WorkerFetch { fields } => Ok(fields.collect(measured(
                 observed.worker_fetch.as_ref(),
                 "worker fetch measurement",
+            )?)),
+            Self::HostReachability { fields } => Ok(fields.collect(measured(
+                observed.host_reachability.as_deref(),
+                "host reachability measurement",
+            )?)),
+            Self::WebSocketEcho { fields } => Ok(fields.collect(measured(
+                observed.websocket_echo.as_ref(),
+                "WebSocket echo measurement",
             )?)),
             Self::Image { fields } => {
                 Ok(fields.collect(measured(observed.image.as_ref(), "image measurement")?))

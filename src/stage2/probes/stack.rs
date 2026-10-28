@@ -2,7 +2,6 @@
 //! pass those calls to [`crate::stage2::call_stack::recover_probe`] to rebuild the frames.
 
 use std::collections::BTreeSet;
-use std::ops::RangeBounds;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,47 +27,20 @@ impl Fields {
     }
 }
 
-/// A VM call of a closure the program created.
-#[derive(Clone, Copy)]
-struct ClosureCall {
-    /// Where the called closure starts.
-    closure: u32,
-    opcode: u8,
-    arguments: usize,
-}
-
-/// Returns closure calls in `range`, in program-counter order.
-fn closure_calls(
-    index: &Index<'_>,
-    range: impl RangeBounds<u32>,
-) -> impl Iterator<Item = ClosureCall> {
-    let instructions = &index.listing().instructions;
-    index.effects_in(range).filter_map(move |(pc, effect)| {
-        let (callee, arguments) = effect.call()?;
-        let (_, Term::Closure { pc: closure, .. }) = index.dereference(pc, callee)? else {
-            return None;
-        };
-        Some(ClosureCall {
-            closure,
-            opcode: instructions[&pc].opcode,
-            arguments: arguments.len(),
-        })
-    })
-}
-
-/// Reads the calls from the program through the probe function at `entry` to `new Error()`.
+/// Finds the closure called by the probe function at `entry` to construct `new Error()`.
 fn calls(index: &Index<'_>, entry: u32) -> Option<ProbeCalls> {
-    let (inner, construct) = closure_calls(index, index.function_range(entry)?)
-        .find_map(|call| Some((call, construction(index, call.closure)?)))?;
-    let dispatch = closure_calls(index, ..).find(|call| call.closure == entry)?;
+    let construct = index
+        .effects_in(index.function_range(entry)?)
+        .find_map(|(pc, effect)| {
+            let (callee, _) = effect.call()?;
+            let (_, Term::Closure { pc: closure, .. }) = index.dereference(pc, callee)? else {
+                return None;
+            };
+            construction(index, closure)
+        })?;
     Some(ProbeCalls {
         construct,
-        inner: index.arity(inner.closure)?,
-        call: inner.opcode,
-        passed: inner.arguments,
-        outer: index.arity(entry)?,
-        dispatch: dispatch.opcode,
-        dispatched: dispatch.arguments,
+        arity: index.arity(entry)?,
     })
 }
 
@@ -89,6 +61,48 @@ fn construction(index: &Index<'_>, entry: u32) -> Option<u8> {
             });
             constructs.then(|| instructions[&pc].opcode)
         })
+}
+
+/// Finds the output field hidden by base64 encoding and a two-byte XOR key. A name that decodes to
+/// `stack` identifies the key. The output field is the remaining name after excluding `stack` and
+/// the record counter from the header.
+fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Option<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let decoded: Vec<Vec<u8>> = features
+        .iter()
+        .filter_map(|text| STANDARD.decode(text).ok())
+        .filter(|bytes| (3..=12).contains(&bytes.len()))
+        .collect();
+    for candidate in decoded.iter().filter(|bytes| bytes.len() == "stack".len()) {
+        let key = [candidate[0] ^ b's', candidate[1] ^ b't'];
+        let reveal = |bytes: &Vec<u8>| {
+            let revealed = bytes
+                .iter()
+                .zip(key.iter().cycle())
+                .map(|(byte, mask)| byte ^ mask);
+            String::from_utf8(revealed.collect()).ok()
+        };
+        if reveal(candidate).as_deref() != Some("stack") {
+            continue;
+        }
+        // Plain strings such as `this` can also be valid base64. Restrict candidates to the
+        // four-to-nine-character program names.
+        let names = decoded.iter().filter_map(reveal).filter(|name| {
+            (4..=9).contains(&name.len())
+                && name.starts_with(|first: char| first.is_ascii_alphabetic())
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+                && name != "stack"
+                && !header.contains(name)
+        });
+        if let Ok(result) = candidates::exactly_one(names, "stack result field") {
+            return Some(result);
+        }
+    }
+    None
 }
 
 /// Finds the output field in the string table by excluding the header's record-counter name,
@@ -124,10 +138,12 @@ fn result_field(features: &[String], header: &BTreeSet<String>) -> Option<String
 }
 
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
-    result_field(probe.session_features, probe.header).map(|result| Fields {
-        result,
-        calls: calls(probe.index, probe.entry),
-    })
+    result_field(probe.session_features, probe.header)
+        .or_else(|| encoded_result_field(probe.session_features, probe.header))
+        .map(|result| Fields {
+            result,
+            calls: calls(probe.index, probe.entry),
+        })
 }
 
 #[cfg(test)]
@@ -152,5 +168,28 @@ mod tests {
             assert_eq!(result.as_deref(), Some("KtSk9"), "{table}");
         }
         assert!(result_field(&[TABLES[0].to_owned()], &BTreeSet::new()).is_none());
+    }
+
+    /// Names captured from c787ce48cf6b sessions with XOR keys 0x91 0xa2 and 0xff 0x75. The second
+    /// key also decodes the plain string `this` to `ImS`, which must be excluded.
+    #[test]
+    fn reveals_encoded_names_with_the_key_that_spells_stack() {
+        let header = BTreeSet::from(["XNWt6".to_owned()]);
+        for features in [
+            [
+                "atob", "yezG1qc=", "0uj6w/Wb", "4tbwwfo=", "jROwcoLu", "this",
+            ],
+            [
+                "atob", "jAGeFpQ=", "pzuoAck=", "vD+UFJtM", "KKExCrEv", "this",
+            ],
+        ] {
+            let features = features.map(str::to_owned);
+            assert_eq!(
+                encoded_result_field(&features, &header).as_deref(),
+                Some("CJkad9"),
+                "{features:?}"
+            );
+            assert!(encoded_result_field(&features, &BTreeSet::new()).is_none());
+        }
     }
 }

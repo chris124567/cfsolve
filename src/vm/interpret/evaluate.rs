@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::slice;
+use std::{mem, slice};
 
 use swc_core::ecma::ast::{BinaryOp, Expr, Stmt, UpdateOp};
 
@@ -85,6 +85,22 @@ impl<'ast> Run<'ast, '_> {
         Ok(Flow::Normal)
     }
 
+    /// Checks whether `name` has already been declared in the current function.
+    fn declared(&self, name: Name<'ast>, locals: &Locals<'ast>) -> bool {
+        match name {
+            Name::Local(slot, _) => locals[slot].is_some(),
+            Name::Global(name) => self.frame().scope.borrow().variables.contains_key(name),
+        }
+    }
+
+    /// Declares `name` with `value`.
+    fn bind(&mut self, name: Name<'ast>, value: Value<'ast>, locals: &mut Locals<'ast>) {
+        match name {
+            Name::Local(slot, _) => locals[slot] = Some(value),
+            Name::Global(name) => self.declare(name.clone(), value),
+        }
+    }
+
     fn execute(
         &mut self,
         statement: &Statement<'ast>,
@@ -100,13 +116,39 @@ impl<'ast> Run<'ast, '_> {
                 for declaration in declarations {
                     let value = match &declaration.init {
                         Some(expression) => self.evaluate(expression, locals)?,
+                        None if declaration.keeps && self.declared(declaration.name, locals) => {
+                            continue;
+                        }
                         None => Value::Undefined,
                     };
-                    match declaration.name {
-                        Name::Local(slot, _) => locals[slot] = Some(value),
-                        Name::Global(name) => self.declare(name.clone(), value),
+                    self.bind(declaration.name, value, locals);
+                }
+            }
+            Statement::Try {
+                block,
+                parameter,
+                handler,
+                finalizer,
+            } => {
+                let mut outcome = self.execute_all(block, locals);
+                if let Some(handler) = handler
+                    && let Err(stop) = &mut outcome
+                    && let Stop::Throw(exception) = &mut **stop
+                {
+                    let exception = mem::replace(exception, Value::Undefined);
+                    if let Some(parameter) = parameter {
+                        self.bind(*parameter, exception, locals);
+                    }
+                    outcome = self.execute_all(handler, locals);
+                }
+                // A jump from `finally` overrides the previous completion of the block.
+                if let Some(finalizer) = finalizer {
+                    match self.execute_all(finalizer, locals)? {
+                        Flow::Normal => {}
+                        flow => return Ok(flow),
                     }
                 }
+                return outcome;
             }
             Statement::Block(statements) => return self.execute_all(statements, locals),
             Statement::If(test, yes, no) => {
@@ -232,7 +274,10 @@ impl<'ast> Run<'ast, '_> {
         match expression {
             Expression::Constant(value) => Ok(copied(value)),
             Expression::Name(Name::Local(slot, _)) if let Some(value) = &locals[*slot] => {
-                Ok(copied(value))
+                Ok(match value {
+                    Value::Symbolic(_) => self.refined(value),
+                    value => copied(value),
+                })
             }
             Expression::Binary(operator, left, right) => {
                 self.binary(*operator, left, right, locals)
@@ -463,6 +508,12 @@ impl<'ast> Run<'ast, '_> {
             None => self.evaluate(right, locals)?,
             Some(BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing) => {
                 return Err(Stop::unsupported("a logical assignment"));
+            }
+            // The script reapplies a new rolling mask to the program counter or key. The
+            // interpreter keeps that mask at zero; see `crate::vm::registers`.
+            Some(_) if matches!(&target, Location::Member(Value::Registers, Key::Name(_))) => {
+                self.evaluate(right, locals)?;
+                return self.read(&target, locals);
             }
             // The target's old value is read before the right side runs.
             Some(operator) => {

@@ -76,8 +76,11 @@ impl Machine<'_> {
 #[derive(Default)]
 struct Walk {
     listing: Listing,
-    /// Reached program counters and the dispatch key used at each one.
-    visited: HashMap<u32, u8>,
+    /// Reached program counters with their dispatch keys and the first instruction to reach each
+    /// one, if any.
+    visited: HashMap<u32, (u8, Option<u32>)>,
+    /// The instruction whose successors are being queued.
+    from: Option<u32>,
     queue: VecDeque<Position>,
     /// Candidate state names in the order found. Observed state comparisons always use
     /// complete string constants.
@@ -103,12 +106,20 @@ impl Walk {
         let Position { pc, key } = position;
         match self.visited.get(&pc) {
             None => {
-                self.visited.insert(pc, key);
+                self.visited.insert(pc, (key, self.from));
                 self.queue.push_back(position);
                 Ok(())
             }
-            Some(&earlier) if earlier == key => Ok(()),
-            Some(&earlier) => bail!("pc {pc} is reached under keys {earlier} and {key}"),
+            Some(&(earlier, _)) if earlier == key => Ok(()),
+            Some(&(earlier, first)) => {
+                let origin =
+                    |from: Option<u32>| from.map_or("an entry".to_owned(), |pc| format!("pc {pc}"));
+                bail!(
+                    "pc {pc} is reached under keys {earlier} from {} and {key} from {}",
+                    origin(first),
+                    origin(self.from)
+                )
+            }
         }
     }
 
@@ -118,6 +129,7 @@ impl Walk {
         loaded: &Loaded<'_, 'a>,
         instruction: Instruction,
     ) -> Result<()> {
+        self.from = Some(instruction.pc);
         for path in &instruction.paths {
             self.follow(path)?;
         }
@@ -155,7 +167,14 @@ impl Walk {
     }
 
     fn follow(&mut self, path: &Path) -> Result<()> {
-        let mut next: Vec<Position> = path.exit.continues_at().into_iter().collect();
+        let continues = match &path.exit {
+            // Handlers update a local program counter and store it when they finish. If a handler
+            // stops early, the stored counter remains just past the opcode, pointing into its
+            // operands.
+            Exit::Unfollowed { pc, .. } if self.from.is_some_and(|from| *pc == from + 1) => None,
+            exit => exit.continues_at(),
+        };
+        let mut next: Vec<Position> = continues.into_iter().collect();
         for effect in &path.effects {
             effect.visit_terms(&mut |term| match term {
                 Term::Closure { pc, key, .. } => {
@@ -233,6 +252,7 @@ impl Walk {
             // Once a compare has revealed its target, no other string can.
             let compare = hit.compare;
             self.probes.retain(|&(pc, _), _| pc != compare);
+            self.from = Some(compare);
             self.enqueue(hit.target)?;
             self.listing.hidden.push(hit);
         }
@@ -375,11 +395,11 @@ fn fuse_method_calls(listing: &mut Listing) {
     let functions = listing.functions.iter().map(|function| function.pc);
     let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
     let entries = functions.chain(hidden).map(|pc| (pc, Loads::default()));
-    let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |path, loads| {
+    let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
         for effect in &path.effects {
             update_loads(loads, effect);
         }
-        ControlFlow::<Infallible>::Continue(())
+        ControlFlow::<Infallible, bool>::Continue(true)
     });
     for (pc, instruction) in &mut listing.instructions {
         let Some(entry) = incoming.get(pc) else {

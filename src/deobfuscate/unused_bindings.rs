@@ -1,16 +1,19 @@
 //! Removes the declarations of unread locals, and their definitions when evaluating the value
-//! has no effects:
+//! has no side effects. If the value assigns another binding, removes only the unused definition:
 //!
 //! ```js
-//! var unused, add, all;
+//! var unused, add, all, copy;
 //! add = function(a, b) { var scratch; return a + b; };
 //! all = [add];  // everything is removed, `all` first
+//! copy = other = g();  // becomes other = g()
+//! [add, other];  // removed, as are other statements without effects
 //! ```
 //!
 //! Leaves globals, whose writes other scripts can observe, and parameters of functions using
 //! `arguments`, whose writes `arguments` reflects.
 
-use swc_core::ecma::ast::{Decl, Expr, Id, Program, SeqExpr, Stmt, VarDeclarator};
+use swc_core::common::util::take::Take;
+use swc_core::ecma::ast::{Decl, Expr, Id, Lit, Program, SeqExpr, Stmt, VarDeclarator};
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
 use super::analysis::{Analysis, Bindings, Globals};
@@ -111,12 +114,25 @@ impl VisitMut for RemoveUnused<'_> {
         {
             *expression = *sequence.exprs.remove(0);
         }
+        // Dropping `unused` preserves the value of `other = value`.
+        if let Some((id, value)) = ast::assignment(expression)
+            && value.is_assign()
+            && self.is_unused(&id)
+        {
+            *self.removed.entry(id).or_default() += 1;
+            *expression = *expression.take().expect_assign().right;
+            self.changed = true;
+        }
     }
 
     fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
         statements.visit_mut_children_with(self);
-        self.changed |=
-            removal::remove_expr_stmts(statements, |expression| self.remove_definition(expression));
+        // Remove unused definitions and statements with no side effects, including decoy arrays of
+        // helpers. Keep strings that may be directives.
+        self.changed |= removal::remove_expr_stmts(statements, |expression| {
+            self.remove_definition(expression)
+                || (!matches!(expression, Expr::Lit(Lit::Str(_))) && self.is_pure(expression))
+        });
         for statement in statements.iter_mut() {
             if let Stmt::Decl(Decl::Var(declaration)) = statement {
                 self.changed |= removal::retain(&mut declaration.decls, |declarator| {
@@ -151,5 +167,9 @@ mod tests {
         );
         let kept = ["global = function", "var v", "v = g()", "w = [", "p = 1"];
         testing::assert_contains(&output, &kept, &[]);
+        let output = transform("function f(a) { 'use strict'; [a, function() {}]; a; g(a); }");
+        testing::assert_contains(&output, &["'use strict';"], &["{ 'use strict'; g(a); }"]);
+        let output = transform("function f() { var c, o; c = o = g(); h(c = o = 1); return o; }");
+        testing::assert_contains(&output, &["var o;", "o = g();", "h(o = 1);"], &[]);
     }
 }

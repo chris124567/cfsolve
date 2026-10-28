@@ -23,15 +23,15 @@ impl<K: Ord + Clone, V: PartialEq + Clone> Facts for BTreeMap<K, V> {
 }
 
 /// Computes entry facts for instructions reachable from `entries`. `transfer` updates a copy of
-/// the facts along one instruction path, which then propagates through the path's exit, or
-/// stops the analysis.
+/// facts for one instruction path and reports whether it can run, or stops the analysis. Facts
+/// propagate through the exit only if the path can run.
 ///
 /// Only recorded exits propagate facts, so function entries and hidden branch targets need
 /// explicit entries. Reaching a position without an instruction ends that path.
 pub(crate) fn forward<F: Facts, B>(
     listing: &Listing,
     entries: impl IntoIterator<Item = (u32, F)>,
-    mut transfer: impl FnMut(&Path, &mut F) -> ControlFlow<B>,
+    mut transfer: impl FnMut(u32, &Path, &mut F) -> ControlFlow<B, bool>,
 ) -> ControlFlow<B, BTreeMap<u32, F>> {
     let mut incoming = BTreeMap::new();
     let mut pending = VecDeque::new();
@@ -45,8 +45,10 @@ pub(crate) fn forward<F: Facts, B>(
         let entry = incoming[&pc].clone();
         for path in &instruction.paths {
             let mut facts = entry.clone();
-            if let ControlFlow::Break(stop) = transfer(path, &mut facts) {
-                return ControlFlow::Break(stop);
+            match transfer(pc, path, &mut facts) {
+                ControlFlow::Break(stop) => return ControlFlow::Break(stop),
+                ControlFlow::Continue(false) => continue,
+                ControlFlow::Continue(true) => {}
             }
             if let Some(next) = path.exit.continues_at() {
                 reach(&mut incoming, &mut pending, next.pc, facts);
@@ -120,13 +122,13 @@ mod tests {
             };
             listing.instructions.insert(pc, instruction);
         }
-        let constants = |path: &Path, facts: &mut Constants| {
+        let constants = |_, path: &Path, facts: &mut Constants| {
             for effect in &path.effects {
                 if let Effect::Set(register, value) = effect {
                     facts.insert(*register, value.clone());
                 }
             }
-            ControlFlow::<()>::Continue(())
+            ControlFlow::<(), bool>::Continue(true)
         };
         let incoming = forward(&listing, [(0, Constants::new())], constants);
         let a = || Constants::from([(1, Term::Const(Constant::String("a".into())))]);

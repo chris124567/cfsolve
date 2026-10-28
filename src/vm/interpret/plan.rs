@@ -10,9 +10,10 @@ use std::rc::Rc;
 
 use swc_core::atoms::{Atom, atom};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignTarget, BinaryOp, BlockStmtOrExpr, Callee, Class, Decl, DoWhileStmt, Expr,
-    ExprOrSpread, Function, Ident, Lit, MemberExpr, MemberProp, Pat, Prop, PropName, PropOrSpread,
-    SimpleAssignTarget, Stmt, UnaryOp, UpdateOp, VarDecl, VarDeclOrExpr, VarDeclarator, WhileStmt,
+    ArrowExpr, AssignTarget, BinaryOp, BlockStmtOrExpr, Callee, CatchClause, Class, Decl,
+    DoWhileStmt, Expr, ExprOrSpread, FnDecl, Function, Ident, Lit, MemberExpr, MemberProp, Pat,
+    Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryOp, UpdateOp, VarDecl,
+    VarDeclKind, VarDeclOrExpr, VarDeclarator, WhileStmt,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
@@ -87,7 +88,7 @@ impl<'ast> FunctionPlan<'ast> {
         }
         let body = function.body.as_ref()?;
         body.visit_with(&mut compiler);
-        let body = compiler.statements(&body.stmts);
+        let body = compiler.body(&body.stmts);
         if compiler.rejected {
             return None;
         }
@@ -104,13 +105,19 @@ pub(super) fn scoped(statements: &[Stmt]) -> Vec<Statement<'_>> {
     PlanCompiler::default().statements(statements)
 }
 
+/// Scoped execution plan for a function body. Function declarations bind their names at the start
+/// of the call.
+pub(super) fn scoped_body(statements: &[Stmt]) -> Vec<Statement<'_>> {
+    PlanCompiler::default().body(statements)
+}
+
 pub(super) fn scoped_expression(expression: &Expr) -> Expression<'_> {
     PlanCompiler::default().expression(expression)
 }
 
 pub(super) fn scoped_arrow(arrow: &ArrowExpr) -> Vec<Statement<'_>> {
     match &*arrow.body {
-        BlockStmtOrExpr::BlockStmt(body) => scoped(&body.stmts),
+        BlockStmtOrExpr::BlockStmt(body) => scoped_body(&body.stmts),
         BlockStmtOrExpr::Expr(body) => vec![Statement::Return(Some(scoped_expression(body)))],
     }
 }
@@ -135,6 +142,19 @@ impl Visit for PlanCompiler {
         if name.sym == "arguments" {
             self.slot(&name.sym);
         }
+    }
+
+    /// Treat a nested function declaration as a local binding in the enclosing function.
+    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
+        self.slot(&declaration.ident.sym);
+    }
+
+    /// Treat a `catch` parameter as a function local in the execution plan.
+    fn visit_catch_clause(&mut self, clause: &CatchClause) {
+        if let Some(Pat::Ident(name)) = &clause.param {
+            self.slot(&name.sym);
+        }
+        clause.visit_children_with(self);
     }
 
     // Compile a nested function only if it captures no outer locals (see
@@ -163,6 +183,8 @@ pub(super) struct Case<'ast> {
 pub(super) struct Declaration<'ast> {
     pub(super) name: Name<'ast>,
     pub(super) init: Option<Expression<'ast>>,
+    /// A `var` declaration without an initializer preserves any existing value.
+    pub(super) keeps: bool,
 }
 
 pub(super) enum Statement<'ast> {
@@ -189,6 +211,13 @@ pub(super) enum Statement<'ast> {
     Break(Option<&'ast Atom>),
     Continue(Option<&'ast Atom>),
     Label(&'ast Atom, Box<Statement<'ast>>),
+    /// A `try` statement with its catch parameter, catch body, and finally body.
+    Try {
+        block: Vec<Statement<'ast>>,
+        parameter: Option<Name<'ast>>,
+        handler: Option<Vec<Statement<'ast>>>,
+        finalizer: Option<Vec<Statement<'ast>>>,
+    },
     Empty,
 }
 
@@ -279,6 +308,25 @@ impl PlanCompiler {
             .all(|name| !self.locals.contains_key(name) && !(arrow && name == "arguments"))
     }
 
+    /// Plans a function body, binding function declarations before executing statements.
+    /// Declarations beside the VM class are planned as statements and resolved as globals.
+    fn body<'a>(&mut self, statements: &'a [Stmt]) -> Vec<Statement<'a>> {
+        let mut plan = Vec::with_capacity(statements.len());
+        for statement in statements {
+            if let Stmt::Decl(Decl::Fn(declaration)) = statement {
+                let name = &declaration.ident.sym;
+                self.rejected |= !self.closes_over_nothing(&*declaration.function, false);
+                plan.push(Statement::Declare(vec![Declaration {
+                    name: self.name(name),
+                    init: Some(Expression::Function(Some(name), &declaration.function)),
+                    keeps: false,
+                }]));
+            }
+        }
+        plan.extend(self.statements(statements));
+        plan
+    }
+
     fn statements<'a>(&mut self, statements: &'a [Stmt]) -> Vec<Statement<'a>> {
         statements
             .iter()
@@ -347,7 +395,25 @@ impl PlanCompiler {
                 body_first: matches!(statement, Stmt::DoWhile(_)),
                 label,
             },
-            Stmt::Try(_) => Statement::Expression(self.unsupported("a try statement")),
+            Stmt::Try(attempt) => {
+                let handler = attempt.handler.as_ref();
+                let parameter = match handler.and_then(|handler| handler.param.as_ref()) {
+                    None => None,
+                    Some(Pat::Ident(name)) => Some(self.name(&name.sym)),
+                    Some(_) => {
+                        return Statement::Expression(self.unsupported("a destructuring catch"));
+                    }
+                };
+                Statement::Try {
+                    block: self.statements(&attempt.block.stmts),
+                    parameter,
+                    handler: handler.map(|handler| self.statements(&handler.body.stmts)),
+                    finalizer: attempt
+                        .finalizer
+                        .as_ref()
+                        .map(|body| self.statements(&body.stmts)),
+                }
+            }
             Stmt::ForIn(_) | Stmt::ForOf(_) => {
                 Statement::Expression(self.unsupported("a for-in or for-of loop"))
             }
@@ -371,6 +437,7 @@ impl PlanCompiler {
             declarations.push(Declaration {
                 name: self.name(&name.sym),
                 init: declarator.init.as_ref().map(|init| self.expression(init)),
+                keeps: declaration.kind == VarDeclKind::Var && declarator.init.is_none(),
             });
         }
         Statement::Declare(declarations)

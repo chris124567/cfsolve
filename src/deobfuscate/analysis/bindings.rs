@@ -4,16 +4,15 @@
 use std::mem;
 
 use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, BindingIdent, ClassDecl, Expr, FnDecl, ForHead, Function, Id, Ident,
+    ArrowExpr, AssignExpr, AssignOp, ClassDecl, Expr, FnDecl, ForHead, Function, Id, Ident, Param,
     Program, Prop, UpdateExpr, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 use swc_ecma_utils::DestructuringFinder;
 
 use crate::deobfuscate::{HashMap, HashSet};
-use crate::js::ast;
 
-/// Tracks writes, references, and declarations by resolved [`Id`]. Names alone are insufficient
+/// Tracks writes and references by resolved [`Id`]. Names are not enough
 /// because the obfuscator reuses them across scopes.
 ///
 /// Writes include assignments, updates, initialized declarations, `for-in` and `for-of`
@@ -24,9 +23,10 @@ use crate::js::ast;
 pub(crate) struct Bindings {
     writes: HashMap<Id, Vec<Write>>,
     references: HashMap<Id, usize>,
-    declared: HashSet<Id>,
     /// Bindings that receive a copy of each binding's value.
     copies: HashMap<Id, Vec<Id>>,
+    /// Parameters of functions and arrows.
+    parameters: HashSet<Id>,
     /// Parameters of functions that use `arguments`.
     mapped: HashSet<Id>,
     /// Whether the function being visited refers to its `arguments`.
@@ -37,8 +37,6 @@ pub(crate) struct Bindings {
 enum Write {
     /// `binding = other` or `var binding = other`.
     Copy(Id),
-    /// `binding = f()`, calling `f` without arguments.
-    Call(Id),
     Other,
 }
 
@@ -67,11 +65,10 @@ impl Bindings {
         self.references.get(id).copied().unwrap_or(0)
     }
 
-    /// Checks whether the program declares or assigns the binding, including parameter
-    /// bindings.
+    /// Returns whether the binding is a function or arrow parameter that can hold an argument.
     #[must_use]
-    pub(crate) fn is_bound(&self, id: &Id) -> bool {
-        self.declared.contains(id) || self.writes.contains_key(id)
+    pub(crate) fn is_parameter(&self, id: &Id) -> bool {
+        self.parameters.contains(id)
     }
 
     /// Checks whether this is a parameter of a function using `arguments`. In sloppy mode,
@@ -123,36 +120,6 @@ impl Bindings {
             .is_some_and(|copies| copies.iter().any(|copy| self.copy_source(copy) == Some(id)))
     }
 
-    /// Returns the callee whose result is the only value assigned to `id`.
-    #[must_use]
-    pub(crate) fn sole_call(&self, id: &Id) -> Option<Id> {
-        match self.writes.get(id)?.as_slice() {
-            [Write::Call(callee)] => Some(callee.clone()),
-            _ => None,
-        }
-    }
-
-    /// Returns `id` and all bindings that copy it, directly or through other copies, regardless
-    /// of assignment order.
-    #[must_use]
-    pub(crate) fn aliases(&self, id: &Id) -> HashSet<Id> {
-        let mut aliases = HashSet::from_iter([id.clone()]);
-        let mut pending = vec![id.clone()];
-        while let Some(source) = pending.pop() {
-            let copies = self.copies.get(&source).into_iter().flatten();
-            for copy in copies {
-                let copies_only_aliases = self.writes[copy]
-                    .iter()
-                    .all(|write| matches!(write, Write::Copy(from) if aliases.contains(from)));
-                if !aliases.contains(copy) && copies_only_aliases {
-                    aliases.insert(copy.clone());
-                    pending.push(copy.clone());
-                }
-            }
-        }
-        aliases
-    }
-
     fn write<N: VisitWith<DestructuringFinder<Id>>>(&mut self, target: &N) {
         for id in swc_ecma_utils::find_pat_ids::<_, Id>(target) {
             self.writes.entry(id).or_default().push(Write::Other);
@@ -167,8 +134,6 @@ impl Bindings {
                 .or_default()
                 .push(id.clone());
             Write::Copy(source.to_id())
-        } else if let Some((callee, [])) = ast::direct_call(value) {
-            Write::Call(callee.to_id())
         } else {
             Write::Other
         };
@@ -238,9 +203,16 @@ impl Visit for Bindings {
         }
     }
 
-    fn visit_binding_ident(&mut self, identifier: &BindingIdent) {
-        self.declared.insert(identifier.to_id());
-        identifier.visit_children_with(self);
+    fn visit_param(&mut self, parameter: &Param) {
+        self.parameters
+            .extend(swc_ecma_utils::find_pat_ids::<_, Id>(&parameter.pat));
+        parameter.visit_children_with(self);
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        self.parameters
+            .extend(swc_ecma_utils::find_pat_ids::<_, Id>(&arrow.params));
+        arrow.visit_children_with(self);
     }
 
     fn visit_ident(&mut self, identifier: &Ident) {
@@ -296,27 +268,16 @@ mod tests {
     }
 
     #[test]
-    fn follows_copies_sole_calls_and_mapped_parameters() {
+    fn follows_copies_and_mapped_parameters() {
         testing::check(
-            "function f(late, middle, other, mixed, table, h, p, q) {
-                late = middle; middle = d; other = d; other = middle;
-                mixed = d; mixed = g(); table = provider();
+            "function f(late, middle, mixed, h, p, q) {
+                late = middle; middle = d; mixed = d; mixed = g();
                 function d() {}
-                function provider() {}
                 h = {}; p = h; var q = p;
-                return parseInt(late);
+                return late;
             }",
             |program, id| {
                 let bindings = Bindings::collect(program);
-                let aliases = bindings.aliases(&id("d"));
-                for alias in ["d", "late", "middle", "other"] {
-                    assert!(aliases.contains(&id(alias)), "{alias}");
-                }
-                assert!(!aliases.contains(&id("mixed")));
-                assert_eq!(bindings.sole_call(&id("table")), Some(id("provider")));
-                assert_eq!(bindings.sole_call(&id("mixed")), None);
-                assert!(!bindings.is_bound(&id("parseInt")));
-                assert!(bindings.is_bound(&id("late")));
                 assert_eq!(bindings.root(&id("q")), id("h"));
                 assert_eq!(bindings.root(&id("late")), id("d"));
                 assert_eq!(bindings.root(&id("mixed")), id("mixed"));

@@ -252,7 +252,10 @@ pub(crate) fn payload(
             .get_mut(&timing.option)
             .and_then(JsValue::as_array_mut)
             .context("interaction has no resource timing list")?
-            .push(timing.entry(probe_post));
+            .push(timing.entry(probe_post, merged.time_origin_ms));
+    }
+    if let Some(log) = &merged.state.post_log {
+        log.record(&mut options, probe_post, merged.time_origin_ms)?;
     }
     let mut payload =
         plan.append_record(&input, result.fields, result.started_ms, result.finished_ms)?;

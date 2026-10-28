@@ -84,6 +84,28 @@ enum Shape {
 }
 
 impl Field {
+    /// Returns the option reported by this field, whether read directly or through a namespace
+    /// getter.
+    #[must_use]
+    pub(crate) fn option<'a>(&'a self, script: &'a ScriptState) -> Option<&'a str> {
+        expression::option_key(&self.expression).or_else(|| match self.global()? {
+            (name, Shape::Called) => script.getters.get(name).map(String::as_str),
+            _ => None,
+        })
+    }
+
+    /// Returns the two options subtracted by this field, if it reports a time difference.
+    #[must_use]
+    pub(crate) fn difference(&self) -> Option<Difference> {
+        match &self.expression {
+            Expr::Bin(binary) if binary.op == BinaryOp::Sub => Some(Difference {
+                later: expression::option_key(&binary.left)?.to_owned(),
+                earlier: expression::option_key(&binary.right)?.to_owned(),
+            }),
+            _ => None,
+        }
+    }
+
     /// The namespace property this field reads, if any.
     fn global(&self) -> Option<(&str, Shape)> {
         fn global(expression: &Expr) -> Option<&str> {
@@ -104,16 +126,7 @@ impl Field {
 /// Finds option pairs whose time difference appears in the payload.
 #[must_use]
 pub(crate) fn differences(fields: &[Field]) -> Vec<Difference> {
-    fields
-        .iter()
-        .filter_map(|field| match &field.expression {
-            Expr::Bin(binary) if binary.op == BinaryOp::Sub => Some(Difference {
-                later: expression::option_key(&binary.left)?.to_owned(),
-                earlier: expression::option_key(&binary.right)?.to_owned(),
-            }),
-            _ => None,
-        })
-        .collect()
+    fields.iter().filter_map(Field::difference).collect()
 }
 
 /// Evaluates fields against session options, omitting `undefined` values as `JSON.stringify`

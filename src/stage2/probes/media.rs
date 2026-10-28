@@ -2,7 +2,10 @@
 //! window, which [`super::ice`] refreshes for each session. Candidate times use wall-clock
 //! observations.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result, ensure};
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 
 use crate::js::{self, ErrorValue, JsObject, JsValue, json};
@@ -82,8 +85,11 @@ pub struct Connection {
     pub data_channel: Option<JsValue>,
     /// The offer the earlier probe saved.
     pub sdp: Option<JsValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_error: Option<JsValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub offer_error: Option<JsValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gather_error: Option<JsValue>,
 }
 
@@ -132,9 +138,12 @@ fn codec(value: &JsValue, audio: bool) -> Option<String> {
     Some(text)
 }
 
-/// Encodes a decoding result as bits for supported, smooth, and power efficient, in that order.
+/// Decoding result properties in bit order.
+const DECODING_PROPERTIES: [&str; 3] = ["supported", "smooth", "powerEfficient"];
+
+/// Encodes a decoding result as one bit per property.
 fn decoding_bits(properties: &JsObject) -> i32 {
-    ["supported", "smooth", "powerEfficient"]
+    DECODING_PROPERTIES
         .iter()
         .enumerate()
         .filter(|(_, key)| properties.get(**key).is_some_and(js::truthy))
@@ -325,6 +334,157 @@ impl Fields {
         }
         Ok(result)
     }
+
+    /// Recovers browser observations from `record` using reference field names. [`Self::collect`]
+    /// can then rebuild the record exactly. The connection snapshot begins at `started_ms`, the
+    /// record start mark. Codecs retain only properties present in the record. Treats decoding as
+    /// skipped for the V8 message length when no excluded type reports a result.
+    pub fn observed(&self, record: &JsObject, started_ms: i64) -> Result<Measurement> {
+        let measurement = self.read(record, started_ms)?;
+        ensure!(
+            self.collect(&measurement)? == *record,
+            "the media record holds values the probe would not write"
+        );
+        Ok(measurement)
+    }
+
+    fn read(&self, record: &JsObject, started_ms: i64) -> Result<Measurement> {
+        let field = |name: &str| {
+            record
+                .get(name)
+                .with_context(|| format!("the media record has no `{name}`"))
+        };
+        if *field(MEDIA_STATE)? == MEDIA_UNAVAILABLE {
+            return Ok(Measurement::Unavailable);
+        }
+        let spelled: [Vec<String>; 2] = js::from_value(field(MEDIA_CODECS)?.clone())
+            .context("the media codecs are not two lists")?;
+        let calls: Vec<Access> = spelled
+            .iter()
+            .enumerate()
+            .map(|(index, spelled)| {
+                let codecs: Vec<JsValue> = spelled
+                    .iter()
+                    .map(|text| unspell(text, index == 0))
+                    .collect::<Result<_>>()?;
+                Ok(Access::Returned {
+                    value: Some(json!({ "codecs": codecs })),
+                })
+            })
+            .collect::<Result<_>>()?;
+        // Read MediaSource support bits followed by decoding bits or null, for audio first and then
+        // video.
+        let (audio_support, video_support, audio_decoding, video_decoding): (
+            Vec<i8>,
+            Vec<i8>,
+            Option<Vec<i32>>,
+            Option<Vec<i32>>,
+        ) = js::from_value(field(MEDIA_SUPPORT)?.clone())
+            .context("the media support is not four entries")?;
+        let reported = [
+            (&self.audio_types, &audio_decoding),
+            (&self.video_types, &video_decoding),
+        ];
+        let excluded: Vec<i32> = reported
+            .iter()
+            .flat_map(|(types, bits)| types.iter().zip(bits.iter().flatten()))
+            .filter(|(mime, _)| self.excluded_types.contains(mime))
+            .map(|(_, &bits)| bits)
+            .collect();
+        let skipped = !excluded.is_empty() && excluded.iter().all(|&bits| bits == 0);
+        let type_support = audio_support
+            .iter()
+            .chain(&video_support)
+            .map(|&bit| (bit >= 0).then(|| json!(bit == 1)));
+        let preparation = Preparation {
+            receiver: Receiver::Observed { calls },
+            type_support: Some(type_support.collect()),
+            audio_decoding: self.decodes(&self.audio_types, audio_decoding, skipped),
+            video_decoding: self.decodes(&self.video_types, video_decoding, skipped),
+            message_length: skipped.then(|| json!(V8_MESSAGE_LENGTH)),
+        };
+
+        let candidates: Vec<JsObject> = js::from_value(field(MEDIA_CANDIDATES)?.clone())
+            .context("the media candidates are not objects")?;
+        let published_candidates: Vec<Candidate> = candidates
+            .into_iter()
+            .map(|mut candidate| {
+                let time = candidate
+                    .get(MEDIA_CANDIDATE_TIME)
+                    .and_then(JsValue::as_i64)
+                    .context("a media candidate has no time")?;
+                Ok(Candidate {
+                    candidate: candidate.shift_remove(MEDIA_CANDIDATE).unwrap_or_default(),
+                    observed_ms: started_ms + time,
+                })
+            })
+            .collect::<Result<_>>()?;
+        let elapsed = field(MEDIA_ELAPSED)?
+            .as_i64()
+            .context("the media probe's elapsed time is not a number")?;
+        let optional = |name: &str| record.get(name).cloned();
+        Ok(Measurement::Observed {
+            preparation,
+            snapshot: Box::new(Snapshot {
+                connection: Connection {
+                    published_candidates,
+                    data_channel: optional(MEDIA_DATA_CHANNEL),
+                    sdp: optional(MEDIA_SDP),
+                    channel_error: optional(MEDIA_CHANNEL_ERROR),
+                    offer_error: optional(MEDIA_SEED_OFFER_ERROR),
+                    gather_error: optional(MEDIA_SEED_GATHER_ERROR),
+                },
+                started_ms,
+                finished_ms: started_ms + elapsed,
+                ice_state: optional(MEDIA_ICE_STATE),
+            }),
+        })
+    }
+
+    /// Reconstructs one decoding result per type from `bits`, reversing [`decoding_bits`]. Omits
+    /// excluded types when `skipped` is true.
+    fn decodes(
+        &self,
+        types: &[String],
+        bits: Option<Vec<i32>>,
+        skipped: bool,
+    ) -> Option<Vec<Decode>> {
+        let decode = |(mime, bits): (&String, i32)| match bits {
+            _ if skipped && self.excluded_types.contains(mime) => Decode::Skipped,
+            -1 => Decode::Failed,
+            bits => {
+                let keys = DECODING_PROPERTIES.iter().enumerate();
+                let properties =
+                    keys.map(|(bit, key)| ((*key).to_owned(), json!(bits & (1 << bit) != 0)));
+                Decode::Resolved {
+                    properties: Some(properties.collect()),
+                }
+            }
+        };
+        Some(types.iter().zip(bits?).map(decode).collect())
+    }
+}
+
+/// Parses the output of [`codec`], preserving only the properties present in the string.
+fn unspell(text: &str, audio: bool) -> Result<JsValue> {
+    let (head, line) = text
+        .split_once(';')
+        .map_or((text, None), |(head, line)| (head, Some(line)));
+    let mut codec = JsObject::new();
+    if audio {
+        let (mime, rate) = head
+            .rsplit_once('/')
+            .and_then(|(mime, rate)| Some((mime, rate.parse::<f64>().ok()?)))
+            .with_context(|| format!("audio codec {text} has no clock rate"))?;
+        codec.insert("mimeType".to_owned(), json!(mime));
+        codec.insert("clockRate".to_owned(), json!(rate));
+    } else {
+        codec.insert("mimeType".to_owned(), json!(head));
+    }
+    if let Some(line) = line {
+        codec.insert("sdpFmtpLine".to_owned(), json!(line));
+    }
+    Ok(JsValue::Object(codec))
 }
 
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Box<Fields>> {
@@ -343,9 +503,14 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Box<Fields>> {
     ]) {
         return None;
     }
+    // Builds may percent-encode the type lists.
+    let decoded: Vec<Cow<'_, str>> = strings
+        .features()
+        .iter()
+        .filter_map(|text| percent_decode_str(text).decode_utf8().ok())
+        .collect();
     let find = |prefix: &str, codec: &str| {
-        strings
-            .features()
+        decoded
             .iter()
             .find(|text| text.starts_with(prefix) && text.contains(codec))
     };
@@ -358,4 +523,45 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Box<Fields>> {
         video_types: types(video),
         excluded_types: types(excluded),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe checks eight audio types and ten video types in this order.
+    fn fields() -> Fields {
+        let named = |kind: &str, count: usize| -> Vec<String> {
+            (0..count).map(|index| format!("{kind}{index}")).collect()
+        };
+        Fields {
+            audio_types: named("audio", 8),
+            video_types: named("video", 10),
+            // AC-3, E-AC-3 and Theora.
+            excluded_types: vec!["audio1".into(), "audio2".into(), "video9".into()],
+        }
+    }
+
+    /// Recover observations from each profile's media record and rebuild the same record, including
+    /// skipped decoding on V8.
+    #[test]
+    fn reads_back_the_observations_a_record_reports() {
+        // cfsolve.test ships only the Safari profile; the Chromium profile stays out.
+        let profiles = [(include_str!("../../../profiles/safari-26-ios.json"), false)];
+        for (profile, v8) in profiles {
+            let profile: JsValue = serde_json::from_str(profile).unwrap();
+            let media = profile["second"]["facts"]["media"].clone();
+            let recorded: Measurement = js::from_value(media).unwrap();
+            let record = fields().collect(&recorded).unwrap();
+            let Measurement::Observed { preparation, .. } = fields().observed(&record, 5).unwrap()
+            else {
+                panic!("the profile's connection was not read back");
+            };
+            let skipped = preparation.message_length == Some(json!(V8_MESSAGE_LENGTH));
+            assert_eq!(skipped, v8);
+        }
+        let unavailable = JsObject::from_iter([(MEDIA_STATE.to_owned(), json!(MEDIA_UNAVAILABLE))]);
+        let read = fields().observed(&unavailable, 5).unwrap();
+        assert!(matches!(read, Measurement::Unavailable));
+    }
 }

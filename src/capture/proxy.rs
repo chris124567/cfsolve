@@ -33,8 +33,9 @@ use super::rsa::{self, ProxyKey};
 use super::sessions::{self, Iframe, Post, Sessions};
 use super::traffic::{Connection, Traffic};
 use super::upstream::{self, Stream, UpstreamProxy};
-use crate::challenge;
 use crate::http::{self, BrowserClient, Proxied};
+use crate::js::ast;
+use crate::{challenge, deobfuscate};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 
@@ -423,10 +424,14 @@ impl CaptureProxy {
     fn rewrite_iframe(&self, url: &str, upstream: &Proxied) -> Option<Vec<u8>> {
         let encoding = header_value(&upstream.headers, header::CONTENT_ENCODING);
         let html = String::from_utf8(http::decode_body(&upstream.body, &encoding).ok()?).ok()?;
-        let (rewritten, real_modulus) =
-            rsa::swap_modulus(&html, &self.sessions.proxy_key.modulus).ok()?;
-        let alphabet = challenge::inline_javascript(&html)
-            .and_then(|javascript| sessions::scan_alphabet(&javascript))
+        let scanned = challenge::inline_javascript(&html).and_then(|javascript| {
+            let parsed = ast::parse_javascript("iframe.js", &javascript)?;
+            let strings = deobfuscate::inline_strings(&parsed.script);
+            let alphabet = sessions::scan_alphabet(&parsed.script, &strings)?;
+            let swapped = rsa::swap_modulus(&html, &strings, &self.sessions.proxy_key.modulus)?;
+            anyhow::Ok((alphabet, swapped))
+        });
+        let (alphabet, (rewritten, real_modulus)) = scanned
             .inspect_err(|error| eprintln!("{url}: forwarding the original iframe: {error:#}"))
             .ok()?;
         let encoded = http::encode_body(rewritten.as_bytes(), &encoding).ok()?;

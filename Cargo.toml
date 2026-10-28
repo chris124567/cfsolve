@@ -4,13 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 default-run = "cfsolve"
-# The files in tests/ are modules of one test binary (tests/main.rs), so swc and v8
-# are linked once instead of once per file. A new test file needs a `mod` line there.
 autotests = false
-
-[[test]]
-name = "integration"
-path = "tests/main.rs"
 
 # Without default features, the library is the solver alone: `Browser`, `Options`, `Outcome`
 # and `Error`. The tools in this repository use the rest.
@@ -63,7 +57,7 @@ tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "s
 url = "2.5.8"
 # `Url` leaves an upstream proxy's credentials percent-encoded.
 percent-encoding = "2.3.2"
-wreq = { version = "=0.16.1", features = ["cookies", "gzip", "brotli", "deflate", "zstd", "socks"] }
+wreq = { version = "=0.16.1", features = ["cookies", "gzip", "brotli", "deflate", "zstd", "socks", "ws"] }
 rustls-native-certs = { version = "0.8", optional = true }
 wreq-util = { version = "0.2.0", features = ["emulation-serde", "emulation-compression"] }
 # The UI audit's keyframe text, spelled as each engine serializes it.
@@ -80,10 +74,6 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"], optional = true }
 rcgen = { version = "0.14", features = ["x509-parser"], optional = true }
 
-[dev-dependencies]
-# The deobfuscator's differential tests compare its output's behavior in V8.
-v8 = "=152.2.0"
-
 # Chrome 154's ClientHello: ML-DSA and GREASE signature algorithms and the
 # trust_anchors extension, which the published crates cannot send. See the
 # "cfsolve patch" comments in vendor/.
@@ -92,7 +82,7 @@ btls-sys = { path = "vendor/btls-sys" }
 wreq = { path = "vendor/wreq" }
 http2 = { path = "vendor/http2" }
 
-# Full debug info for swc and v8 dominates link time and target/ size. Line tables
+# Full debug info for swc dominates link time and target/ size. Line tables
 # keep file:line in this crate's backtraces; dependencies get none.
 [profile.dev]
 debug = "line-tables-only"

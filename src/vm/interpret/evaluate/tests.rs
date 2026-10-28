@@ -84,6 +84,7 @@ fn locals_calls_and_operand_order_match() {
         "function f(a) { var o = {}; o.g = function(x, y) { return x | y + outer; }; return o.g(a, 4); }",
         "function f(a) { var g = function h(n) { return n ? h(n - 1) + 1 : 0; }; return g(a); }",
         "function f(a) { var g = (x) => x * 2 + this; return g(a); }",
+        "function f(a) { try { throw a; } catch (e) { return e + 1; } finally { outer = a; } }",
     ] {
         compare(
             source,
@@ -130,7 +131,7 @@ fn rejected_functions_use_scoped_plans() {
         "function f(a) { var g = function() { return a; }; return g(); }",
         "function f(arguments) { return arguments; }",
         "function f(a) { return {[a]: 1}; }",
-        "function f(a) { try { return a; } catch (e) { return 0; } }",
+        "function f(a) { try { return a; } catch ({ e }) { return 0; } }",
     ] {
         compare(source, vec![Value::Number(2.0)], vec![], false);
     }

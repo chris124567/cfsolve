@@ -41,7 +41,11 @@ builtins! {
     FromCharCode => "String.fromCharCode",
     Join => "Array.prototype.join",
     Slice => "Array.prototype.slice",
+    Push => "Array.prototype.push",
+    Pop => "Array.prototype.pop",
+    IsArray => "Array.isArray",
     CharCodeAt => "String.prototype.charCodeAt",
+    Repeat => "String.prototype.repeat",
     /// `Function.prototype.call`, `apply`, and `bind`, plus `Reflect.apply` and
     /// `Reflect.construct`.
     Call => "Function.prototype.call",
@@ -63,6 +67,18 @@ builtins! {
     Has => "Set.prototype.has",
     Add => "Set.prototype.add",
     Delete => "Set.prototype.delete",
+    /// `Map` and `WeakMap`, and their methods.
+    Map => "Map",
+    MapGet => "Map.prototype.get",
+    MapSet => "Map.prototype.set",
+    MapHas => "Map.prototype.has",
+    MapDelete => "Map.prototype.delete",
+    /// Typed arrays are modeled as empty objects because the script only uses them to cache values
+    /// it can recompute.
+    Int32Array => "Int32Array",
+    /// The register file's `read` and `write` methods (see [`crate::vm::registers`]).
+    RegisterRead => "registers.read",
+    RegisterWrite => "registers.write",
 }
 
 impl<'ast> Run<'ast, '_> {
@@ -123,6 +139,15 @@ impl<'ast> Run<'ast, '_> {
                     }
                 }
                 Ok(Value::String(units.into()))
+            }
+            Builtin::Repeat => {
+                let (Value::String(string), Some(count)) = (&this, argument(0).number()) else {
+                    return symbolic(self, global());
+                };
+                let count = convert::length(count)
+                    .filter(|&count| count.saturating_mul(string.len()) <= convert::MAXIMUM_LENGTH)
+                    .ok_or_else(|| Stop::unsupported(&format!("repeating {count} times")))?;
+                Ok(Value::String(JsString::from(string.units().repeat(count))))
             }
             Builtin::CharCodeAt => {
                 let method = || {
@@ -187,6 +212,32 @@ impl<'ast> Run<'ast, '_> {
                 let end = bound(argument(1), length)?;
                 Ok(Value::array(elements[start..end.max(start)].to_vec()))
             }
+            Builtin::Push => {
+                let Value::Array(elements) = &this else {
+                    return self.apply(Value::symbolic(global()), this, arguments);
+                };
+                let mut elements = elements.borrow_mut();
+                elements.extend(arguments);
+                Ok(Value::Number(elements.len() as f64))
+            }
+            // Handlers start with constructor-created stacks that earlier instructions may have
+            // filled. Popping beyond values pushed in this run returns a value from an earlier
+            // instruction.
+            Builtin::Pop => {
+                let Value::Array(elements) = &this else {
+                    return self.apply(Value::symbolic(global()), this, arguments);
+                };
+                let popped = elements.borrow_mut().pop();
+                match popped {
+                    Some(value) => Ok(value),
+                    None => symbolic(self, global()),
+                }
+            }
+            Builtin::IsArray => match argument(0) {
+                Value::Array(_) => Ok(Value::Bool(true)),
+                value if value.is_symbolic() => symbolic(self, global()),
+                _ => Ok(Value::Bool(false)),
+            },
             Builtin::Pow | Builtin::Min | Builtin::Max | Builtin::Floor if registers_decide => {
                 symbolic(self, global())
             }
@@ -264,6 +315,17 @@ impl<'ast> Run<'ast, '_> {
                 Ok(Value::array(mapped))
             }
             Builtin::Symbol => Ok(Value::Symbol(Rc::new(()))),
+            Builtin::Int32Array => Ok(Value::Object(Rc::default())),
+            Builtin::RegisterRead => {
+                let register = self.register(&Key::from(argument(0)))?;
+                Ok(self.register_value(register))
+            }
+            Builtin::RegisterWrite => {
+                let register = self.register(&Key::from(argument(0)))?;
+                let value = argument(1);
+                self.write_register(register, value.clone());
+                Ok(value)
+            }
             Builtin::Set => match argument(0) {
                 Value::Undefined | Value::Null => Ok(Value::Set(Rc::default())),
                 Value::Array(elements) => {
@@ -315,6 +377,44 @@ impl<'ast> Run<'ast, '_> {
                             semantics::same_value_zero(member, &key) != Some(true)
                         });
                         Ok(Value::Bool(members.len() < before))
+                    }
+                }
+            }
+            Builtin::Map => match argument(0) {
+                Value::Undefined | Value::Null => Ok(Value::Map(Rc::default())),
+                source => Err(Stop::unsupported(&format!("a map of {}", source.expr()))),
+            },
+            // Handlers start with constructor-created maps, such as the program closure registry.
+            // Earlier instructions may have filled them. Treat keys that depend on register values
+            // as absent.
+            Builtin::MapGet | Builtin::MapSet | Builtin::MapHas | Builtin::MapDelete => {
+                let Value::Map(entries) = &this else {
+                    return self.apply(Value::symbolic(global()), this, arguments);
+                };
+                let key = argument(0);
+                let position = entries
+                    .borrow()
+                    .iter()
+                    .position(|(member, _)| semantics::same_value_zero(member, &key) == Some(true));
+                match builtin {
+                    Builtin::MapGet => Ok(position.map_or(Value::Undefined, |position| {
+                        entries.borrow()[position].1.clone()
+                    })),
+                    Builtin::MapHas => Ok(Value::Bool(position.is_some())),
+                    Builtin::MapSet => {
+                        let value = argument(1);
+                        let mut entries = entries.borrow_mut();
+                        match position {
+                            Some(position) => entries[position].1 = value,
+                            None => entries.push((key, value)),
+                        }
+                        Ok(this.clone())
+                    }
+                    _ => {
+                        if let Some(position) = position {
+                            entries.borrow_mut().remove(position);
+                        }
+                        Ok(Value::Bool(position.is_some()))
                     }
                 }
             }
@@ -376,6 +476,7 @@ pub(super) fn member<'a>(object: &str, name: &str) -> Value<'a> {
     };
     match &*path {
         "WeakSet" => Value::function(Callable::Builtin(Builtin::Set)),
+        "WeakMap" => Value::function(Callable::Builtin(Builtin::Map)),
         "Number.NaN" => Value::Number(f64::NAN),
         "Number.POSITIVE_INFINITY" => Value::Number(f64::INFINITY),
         "Number.NEGATIVE_INFINITY" => Value::Number(f64::NEG_INFINITY),
@@ -549,11 +650,11 @@ mod tests {
             );
         }
         assert!(
-            method("Array.prototype", "push").is_none(),
+            method("Array.prototype", "splice").is_none(),
             "an array method that is not a builtin is not followed"
         );
         assert!(
-            matches!(member("", "Array.prototype.push"), Value::Symbolic(_)),
+            matches!(member("", "Array.prototype.splice"), Value::Symbolic(_)),
             "what is not a builtin stays a global the registers decide"
         );
         let Value::Function(random) = member("Math", "random") else {

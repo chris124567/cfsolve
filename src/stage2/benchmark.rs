@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use swc_core::ecma::ast::{CallExpr, Callee, MemberExpr, MemberProp, VarDeclarator};
 use swc_core::ecma::visit::{Visit, VisitWith};
 
-use crate::js::{JsObject, ast, json};
+use crate::js::{self, JsObject, ast, json};
 use crate::performance_clock::{PerformanceClock, Resolution};
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::worker_timing::Samples;
@@ -115,6 +115,35 @@ impl Fields {
             samples,
             compilation_ms: compiled - prepared,
             total_ms: spend(Duration::ZERO) - compiled,
+        })
+    }
+
+    /// Recovers device costs from a browser benchmark `record`, reversing [`Self::measure`].
+    /// Includes instantiation time and each kernel speed per round, rounded to a microsecond per
+    /// million iterations.
+    pub fn costs(&self, record: &JsObject) -> Result<WorkerCosts> {
+        let read = |name: &str| {
+            record
+                .get(name)
+                .with_context(|| format!("the benchmark record has no `{name}`"))
+        };
+        let samples: Vec<Vec<f64>> = js::from_value(read(&self.samples)?.clone())
+            .context("the benchmark samples are not lists of times")?;
+        let compile_ms = read(&self.compilation)?
+            .as_f64()
+            .context("the benchmark's instantiation time is not a number")?;
+        let mut speeds: Vec<Vec<f64>> = vec![Vec::new(); self.order.len()];
+        let kernels = self.order.iter().zip(&self.iterations).zip(&samples);
+        for ((&index, &iterations), samples) in kernels {
+            let per_million = |ms: &f64| (ms * 1e9 / f64::from(iterations)).round() / 1000.0;
+            speeds
+                .get_mut(index)
+                .with_context(|| format!("benchmark kernel {index} is outside the plan"))?
+                .extend(samples.iter().map(per_million));
+        }
+        Ok(WorkerCosts {
+            compile_ms: vec![compile_ms],
+            kernel_ms_per_million: speeds,
         })
     }
 }
@@ -337,6 +366,13 @@ mod tests {
             [[8.0, 8.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]
         );
         assert_eq!((measured.compilation_ms, measured.total_ms), (3.0, 22.0));
+        // Recover the input speeds from each round of the record.
+        let read = fields.costs(&fields.collect(&measured)).unwrap();
+        assert_eq!(read.compile_ms, [3.0]);
+        assert_eq!(
+            read.kernel_ms_per_million,
+            [[0.5, 0.5], [2.0, 2.0], [1.0, 1.0], [4.0, 4.0]]
+        );
         let missing = WorkerCosts {
             kernel_ms_per_million: costs.kernel_ms_per_million[..3].to_vec(),
             ..costs
@@ -362,4 +398,5 @@ mod tests {
             );
         }
     }
+
 }

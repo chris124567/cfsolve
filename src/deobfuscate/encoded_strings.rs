@@ -14,7 +14,7 @@
 use base64::engine::general_purpose::STANDARD;
 use swc_core::atoms::Wtf8Atom;
 use swc_core::atoms::wtf8::Wtf8Buf;
-use swc_core::ecma::ast::{BinaryOp, Expr, Id, Lit, Program, Str, VarDeclarator};
+use swc_core::ecma::ast::{BinaryOp, Expr, Id, Lit, Program, Script, Str, VarDeclarator};
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::analysis::Analysis;
@@ -37,6 +37,72 @@ pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
     let unread = removal::unread(&decode.decoded, bindings);
     program.visit_mut_with(&mut DropDecoders(unread));
     !decode.decoded.is_empty()
+}
+
+/// A string decoder call with constant arguments in the original script, including the encoded
+/// input, key, and decoded text.
+pub(crate) struct Encoded {
+    pub(crate) encoded: String,
+    pub(crate) key: u16,
+    pub(crate) decoded: String,
+}
+
+/// Finds constant decoder calls in `script` before name resolution. Identifies decoders by their
+/// declared names.
+pub(crate) fn inline_strings(script: &Script) -> Vec<Encoded> {
+    struct Calls<'decoders> {
+        decoders: &'decoders HashMap<Id, u16>,
+        found: Vec<Encoded>,
+    }
+    impl Visit for Calls<'_> {
+        fn visit_expr(&mut self, expression: &Expr) {
+            if let Some((callee, [argument])) = ast::direct_call(expression)
+                && argument.spread.is_none()
+                && let Some(&key) = self.decoders.get(&callee.to_id())
+                && let Some(encoded) = ast::static_str(&argument.expr)
+                && let Some(decoded) = decode(encoded, key)
+                && let Some(decoded) = decoded.as_str()
+            {
+                self.found.push(Encoded {
+                    encoded: encoded.to_owned(),
+                    key,
+                    decoded: decoded.to_owned(),
+                });
+            }
+            expression.visit_children_with(self);
+        }
+    }
+    let mut decoders = Decoders::default();
+    script.visit_with(&mut decoders);
+    let mut calls = Calls {
+        decoders: &decoders.0,
+        found: Vec::new(),
+    };
+    script.visit_with(&mut calls);
+    calls.found
+}
+
+/// Encodes `text` so that [`decode`] with `key` returns it.
+pub(crate) fn encode(text: &str, mut key: u16) -> String {
+    use base64::Engine;
+
+    let mut bytes = Vec::new();
+    let mut push = |byte: u8| {
+        key = key.rotate_left(8);
+        bytes.push(byte ^ (key >> 8) as u8);
+    };
+    for unit in text.encode_utf16() {
+        match u8::try_from(unit) {
+            Ok(byte) if byte != 255 => push(byte),
+            _ => {
+                let [low, high] = unit.to_le_bytes();
+                push(255);
+                push(low);
+                push(high);
+            }
+        }
+    }
+    STANDARD.encode(bytes)
 }
 
 /// Decodes `encoded` as the decoder holding `key` does, or `None` if it is not base64.
@@ -260,6 +326,22 @@ mod tests {
         testing::assert_contains(&output, &expected, &["var decode = function"]);
         let output = transform("decode = other; f(decode(`ZJd1i3w=`));");
         assert!(output.contains("decode(`ZJd1i3w=`)"), "{output}");
+    }
+
+    #[test]
+    fn finds_and_reencodes_the_strings_a_served_script_decodes() {
+        let source = format!("{DECODER}\nf(decode(`ZJd1i3w=`), decode('ZoZpiw=='), other(`x`));");
+        let parsed = crate::js::ast::parse_javascript("x.js", &source).unwrap();
+        let strings = super::inline_strings(&parsed.script);
+        let decoded: Vec<(&str, &str)> = strings
+            .iter()
+            .map(|string| (string.encoded.as_str(), string.decoded.as_str()))
+            .collect();
+        assert_eq!(decoded, [("ZJd1i3w=", "apply"), ("ZoZpiw==", "call")]);
+        assert_eq!(super::encode("apply", strings[0].key), "ZJd1i3w=");
+        // Code units of 255 or greater need an escape byte followed by two bytes.
+        let encoded = super::encode("a€", 59141);
+        assert_eq!(super::decode(&encoded, 59141).unwrap().as_str(), Some("a€"));
     }
 
     #[test]

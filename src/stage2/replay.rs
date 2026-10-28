@@ -7,8 +7,7 @@
 //! Classification across 28 captures, including 12 benchmarks, determines each [`Treatment`].
 //! Device facts are retained. [`Session`] refreshes iframe URLs and `document.lastModified`,
 //! plus trace membership and navigation sizes in the environment audit. Live requests, fresh
-//! WebRTC state, and benchmark results are computed separately, as are Chrome's stacks; WebKit
-//! replays the stack it recorded ([`Answers::stack`]).
+//! WebRTC state, benchmark results, and stacks are computed separately.
 
 use std::collections::BTreeMap;
 use std::mem;
@@ -39,9 +38,6 @@ pub struct Answers {
     pub reference: String,
     /// Stored probe answers indexed by one-based reference probe number.
     pub probes: BTreeMap<usize, Stored>,
-    /// The stack the stack probe reported, which no reference probe pairs with.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stack: Option<String>,
     /// The worker navigator, by API property.
     pub navigator: JsObject,
 }
@@ -109,10 +105,6 @@ impl Answers {
                     }
                 }
             }
-            if let Operation::Stack { fields: stack } = operation {
-                let reported = fields.get(&stack.result).and_then(JsValue::as_str);
-                answers.stack = reported.map(str::to_owned);
-            }
             if operation.kind().treatment() == Treatment::Computed {
                 continue;
             }
@@ -139,19 +131,6 @@ impl Answers {
             answers.probes.insert(partner, stored);
         }
         Ok(answers)
-    }
-
-    /// Returns the recorded stack with iframe URLs changed to `iframe_url`. JavaScriptCore
-    /// includes every VM level through the latest asynchronous probe. That probe depends on
-    /// execution order and engine features, so WebKit reuses the recording rather than
-    /// rebuilding from the listing. Source positions stay those of the recorded build.
-    pub fn stack(&self, iframe_url: &str) -> Result<String> {
-        let mut stack = self
-            .stack
-            .clone()
-            .context("the stored answers record no stack")?;
-        refresh_string(&mut stack, iframe_url, "");
-        Ok(stack)
     }
 
     /// Checks that stored answer names belong to the embedded reference build.

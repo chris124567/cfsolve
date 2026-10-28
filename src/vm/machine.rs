@@ -4,14 +4,14 @@ use anyhow::Result;
 use swc_core::ecma::ast::{BlockStmt, Class, Script, Stmt};
 
 use super::HashMap;
-use super::dispatch::{Decoded, Dispatch, Helpers};
+use super::dispatch::{Decoded, Dispatch};
 use super::extract::{self, Finder};
 use super::interpret::{self, Invocation, MAXIMUM_PATHS, Way};
 use super::output::{Cause, Failure, Instruction, Position};
 use super::session::Session;
 use super::value::Value;
 
-/// The VM's enclosing function body, class, dispatch table, and the statements that run before
+/// The VM class, enclosing function body, opcode decoder, and statements executed before
 /// its scope is entered.
 pub struct Definition {
     body: BlockStmt,
@@ -31,7 +31,8 @@ impl Definition {
         script.visit_with(&mut finder);
         let (body, class) = finder.found.context("no VM class in the script")?;
         let run = extract::method(&class, "run").context("the VM class has no run method")?;
-        let dispatch = Dispatch::from_run(run, &Helpers::new(script))?;
+        let functions = extract::functions(&body.stmts);
+        let dispatch = Dispatch::from_loop(&extract::run_method(&functions, run)?.dispatch)?;
         Ok(Self {
             prelude: extract::prelude(script, &body),
             body,
@@ -125,15 +126,19 @@ impl<'definition> Machine<'definition> {
         known: &[(u8, Value<'definition>)],
     ) -> Result<(u8, Vec<Way<'definition>>), Failure> {
         let fail = |cause| Failure { pc, key, cause };
-        let byte = *loaded
-            .program
-            .get(pc as usize)
-            .ok_or_else(|| fail(Cause::PastEnd))?;
-        let Decoded { opcode, key: next } = self.definition.dispatch.decode(key, byte);
+        if pc as usize >= loaded.program.len() {
+            return Err(fail(Cause::PastEnd));
+        }
+        let Decoded { opcode, key: next } = self
+            .definition
+            .dispatch
+            .decode(&self.session, loaded.program, pc, key)
+            .map_err(|reason| fail(Cause::Undecoded { reason }))?;
         let handler = self
             .session
             .handlers
             .get(&opcode)
+            .copied()
             .ok_or_else(|| fail(Cause::NoHandler { opcode }))?;
         let invocation = Invocation {
             session: &self.session,

@@ -17,10 +17,10 @@ use swc_ecma_transforms::{fixer, hygiene};
 
 use super::analysis::Analysis;
 use super::{
-    HashMap, argument_arrays, bitwise, blocks, constant_objects, control_flow, copy_propagation,
-    dead_branches, dead_properties, dispatch, encoded_strings, function_lengths, helper_objects,
-    indexed_table, int32_helpers, literals, loops, scratch_parameters, statements, static_members,
-    string_array, unused_bindings,
+    HashMap, argument_arrays, arrow_blocks, bitwise, blocks, call_helpers, control_flow,
+    copy_propagation, dead_branches, dead_properties, dispatch, encoded_strings, function_lengths,
+    helper_objects, int32_helpers, literals, loops, memoized_strings, merged_functions,
+    register_arrays, state_machines, statements, static_members, unused_bindings,
 };
 
 /// Deobfuscated JavaScript with optional convergence diagnostics for the caller to report.
@@ -176,18 +176,22 @@ const DECODE_STEPS: &[Step] = &[
     SIMPLIFY,
     step("function lengths", function_lengths::run),
     step("bitwise operands", bitwise::run),
-    step("constant objects", constant_objects::run),
     step("dead branches", dead_branches::run),
     // Recover tables.
     step("encoded strings", encoded_strings::run),
-    step("string array", string_array::run),
-    step("indexed table", indexed_table::run),
+    step("memoized strings", memoized_strings::run),
     step("argument arrays", argument_arrays::run),
     step("dispatch", dispatch::run),
 ];
 
 /// The steps that restructure the script once its tables are decoded.
 const LATER_STEPS: &[Step] = &[
+    // Restore locals and method calls the obfuscator hides.
+    step("register arrays", register_arrays::run),
+    step("call helpers", call_helpers::run),
+    // Inline call dispatchers first. Splitting merged functions would turn them into forwarders.
+    step("call dispatchers", dispatch::run_all),
+    step("merged functions", merged_functions::run),
     // Inline helpers, once unused scratch declarations no longer hide their returns.
     UNUSED_BINDINGS,
     STATIC_MEMBERS,
@@ -195,6 +199,8 @@ const LATER_STEPS: &[Step] = &[
     STATIC_MEMBERS,
     SIMPLIFY,
     CONTROL_FLOW,
+    step("state machines", state_machines::run),
+    step("arrow blocks", arrow_blocks::run),
     // Remove dead helpers.
     HELPER_OBJECTS,
     UNUSED_BINDINGS,
@@ -206,14 +212,12 @@ const LATER_STEPS: &[Step] = &[
     step("literals", literals::run),
     step("statements", statements::run),
     FIX_PARENTHESES,
-    // Clean up locals. Propagate copies before narrowing parameters so unused parameters are
-    // removed instead of declared. The next round fixes parentheses.
+    // Clean up locals. The next round fixes parentheses.
     step("blocks", blocks::run),
     step("loops", loops::run),
     step("copy propagation", copy_propagation::run),
     // Run after copy propagation so the masks are constants.
     step("int32 helpers", int32_helpers::run),
-    step("scratch parameters", scratch_parameters::run),
 ];
 
 /// Guards against rewrites that keep undoing each other.

@@ -16,16 +16,16 @@ use std::rc::Rc;
 use swc_core::atoms::Atom;
 use swc_core::common::SyntaxContext;
 use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, AssignTarget, CallExpr, Callee, Decl, Expr, ExprOrSpread, FnExpr,
-    ForStmt, Function, Id, Ident, Lit, MemberExpr, MemberProp, MetaPropExpr, Number, ObjectLit,
-    Program, ReturnStmt, SeqExpr, SimpleAssignTarget, Stmt, Super, ThisExpr, UnaryOp,
+    AssignExpr, AssignOp, AssignTarget, BlockStmt, CallExpr, Callee, Decl, Expr, ExprOrSpread,
+    FnExpr, ForStmt, Function, Id, Ident, Lit, MemberExpr, MemberProp, MetaPropExpr, Number,
+    ObjectLit, Program, ReturnStmt, SeqExpr, SimpleAssignTarget, Stmt, Super, ThisExpr, UnaryOp,
     VarDeclOrExpr,
 };
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::HashMap;
 use super::analysis::effects::{self, Effects};
-use super::analysis::hoisting::{self, HoistFacts, Hoisted, Hoisting};
+use super::analysis::hoisting::{self, HoistFacts, Hoisted, Hoisting, List};
 use super::analysis::{self, Analysis, Bindings, Globals, Properties, names};
 use crate::js::ast;
 
@@ -220,10 +220,18 @@ impl VisitMut for InlineHelpers<'_> {
             && self.bindings.is_written_once(&target.to_id())
         {
             let target = target.to_id();
-            // Track object definitions, helper functions, and copies of known objects by
-            // binding.
+            let method = assignment
+                .right
+                .as_member()
+                .and_then(|member| self.stable(member))
+                .and_then(|(object, property)| object.functions.get(&property))
+                .cloned();
+            // Track object definitions, helper functions, and copies of objects and helper methods
+            // by binding.
             let helpers = &mut self.hoisting.facts;
-            if let Some(object) = assignment.right.as_object() {
+            if let Some(method) = method {
+                helpers.functions.insert(target, Rc::new(method));
+            } else if let Some(object) = assignment.right.as_object() {
                 let properties = Rc::new(ObjectProperties::collect(object));
                 helpers.objects.insert(target, properties);
             } else if let Some(function) = assignment.right.as_fn_expr() {
@@ -240,6 +248,21 @@ impl VisitMut for InlineHelpers<'_> {
     fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
         self.lists += 1;
         let list = self.lists;
+        // Function declarations are available from the start of a function body. Top-level
+        // declarations can be replaced by other scripts.
+        if self.hoisting.list == List::FunctionBody {
+            for statement in statements.iter() {
+                if let Stmt::Decl(Decl::Fn(declaration)) = statement
+                    && self.bindings.is_written_once(&declaration.ident.to_id())
+                {
+                    let function = Rc::new(FnExpr::from(declaration.function.clone()));
+                    self.hoisting
+                        .facts
+                        .functions
+                        .insert(declaration.ident.to_id(), function);
+                }
+            }
+        }
         hoisting::visit_mut_stmts(self, statements, |inline, statement| {
             inline.statement(statement, list);
         });
@@ -247,6 +270,10 @@ impl VisitMut for InlineHelpers<'_> {
 
     fn visit_mut_function(&mut self, function: &mut Function) {
         hoisting::visit_mut_function(self, function);
+    }
+
+    fn visit_mut_block_stmt(&mut self, block: &mut BlockStmt) {
+        hoisting::visit_mut_block(self, block);
     }
 
     fn visit_mut_ident(&mut self, identifier: &mut Ident) {
@@ -763,6 +790,19 @@ mod tests {
         );
         let expected = ["((2)) + (1))", "Math.max((2))", "(3) + (4)", "read()]"];
         testing::assert_contains(&output, &[], &expected);
+        // Function declarations inside function bodies are also stable; top-level declarations are
+        // not.
+        let output = transform(
+            "function f(x) { return g(x, 1); function g(a, b) { return a + b; } } \
+             function h(a) { return a; } k(h(2));",
+        );
+        testing::assert_contains(&output, &[], &["return ((x) + (1));", "k(h(2));"]);
+        // Copies of helper methods are stable too.
+        let output = transform(
+            "function f(h, m) { h = { shr: function (a, b) { return a >> b; } }; m = h.shr; \
+             return m(8, 1); }",
+        );
+        assert!(output.contains("(8) >> (1)"), "{output}");
     }
 
     #[test]
@@ -800,5 +840,28 @@ mod tests {
         );
         assert!(output.contains("s.n,"), "{output}");
         assert_eq!(output.matches("h.re.test").count(), 2, "{output}");
+    }
+
+    /// A block function can run after the block references it or, in sloppy mode, after its
+    /// declaration exposes it to the enclosing function. Properties assigned before either point
+    /// are known.
+    #[test]
+    fn block_functions_see_properties_set_before_they_can_run() {
+        let output = transform(
+            r#"function f(h, p) { { h = {}; h.k = "v"; p = h; listen(g); function g(e) {
+                return e === p.k; } } }"#,
+        );
+        assert!(output.contains(r#"e === "v""#), "{output}");
+        // The function is referenced before its properties are assigned.
+        let output = transform(
+            r#"function f(h) { { listen(g); h = {}; h.k = "v"; function g(e) { return e === h.k; } } }"#,
+        );
+        assert!(output.contains("e === h.k"), "{output}");
+        // The declaration exposes the function to the enclosing scope before its properties are
+        // assigned.
+        let output = transform(
+            r#"function f(h) { { function g(e) { return e === h.k; } h = {}; h.k = "v"; } listen(g); }"#,
+        );
+        assert!(output.contains("e === h.k"), "{output}");
     }
 }

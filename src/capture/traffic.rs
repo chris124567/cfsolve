@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::sessions;
 use crate::{http, performance_clock};
@@ -14,14 +14,15 @@ use crate::{http, performance_clock};
 /// The directory beside `traffic.json` holding kept response bodies.
 const BODIES: &str = "bodies";
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
 pub(super) struct Traffic {
     connections: Vec<Connection>,
-    requests: Vec<Request>,
+    /// The requests, in the order they arrived.
+    pub(super) requests: Vec<Request>,
 }
 
 /// One intercepted connection, as the browser opened it.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Connection {
     pub(super) host: String,
@@ -36,19 +37,19 @@ pub(super) struct Connection {
 
 /// A request on an intercepted connection. hyper preserves header order, groups repeated values
 /// at the first occurrence of their name, and lowercases names as HTTP/2 does.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Request {
+pub(super) struct Request {
     /// Index of this request's connection in `connections`.
     connection: usize,
-    method: String,
-    url: String,
+    pub(super) method: String,
+    pub(super) url: String,
     version: String,
-    headers: Vec<(String, String)>,
+    pub(super) headers: Vec<(String, String)>,
     /// Time received, in milliseconds since the Unix epoch.
-    received_ms: i64,
+    pub(super) received_ms: i64,
     /// Time the response was handed to the browser.
-    answered_ms: Option<i64>,
+    pub(super) answered_ms: Option<i64>,
     /// The file holding the decoded response body, relative to `traffic.json`, if kept.
     #[serde(skip_serializing_if = "Option::is_none")]
     body_file: Option<String>,
@@ -114,6 +115,30 @@ impl Traffic {
     }
 }
 
+impl Request {
+    /// Creates a request received at the current time on connection 0.
+    #[cfg(test)]
+    pub(super) fn received(method: &str, url: &str, headers: Vec<(String, String)>) -> Self {
+        Self {
+            connection: 0,
+            method: method.to_owned(),
+            url: url.to_owned(),
+            version: "HTTP/2.0".to_owned(),
+            headers,
+            received_ms: performance_clock::epoch_ms(),
+            answered_ms: None,
+            body_file: None,
+            body: Vec::new(),
+        }
+    }
+
+    /// Returns the value of header `name`. The name must be lowercase.
+    pub(super) fn header(&self, name: &str) -> Option<&str> {
+        let mut headers = self.headers.iter();
+        headers.find_map(|(header, value)| (header == name).then_some(value.as_str()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +158,8 @@ mod tests {
         let file = log["requests"][script]["bodyFile"].as_str().unwrap();
         assert_eq!(file, "bodies/0001-orchestrator.js");
         assert_eq!(fs::read(dir.join(file)).unwrap(), b"script");
+        let read: Traffic = serde_json::from_value(log).unwrap();
+        assert_eq!(read.requests[script].url, "https://example.com/v1");
         fs::remove_dir_all(dir).unwrap();
     }
 }

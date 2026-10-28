@@ -6,14 +6,17 @@
 //! count. Visitors process ordinary statements first and record identifier uses through
 //! [`reference`]. They then visit declarations with the facts valid for each one.
 //!
-//! This treatment applies only to declarations in function bodies. Top-level functions can be
-//! called by other scripts at any time. Block functions exist only once the block executes.
-//! Both use the facts known on entry.
+//! Block declarations work the same way, with an extra rule for sloppy mode: after a block function
+//! declaration runs, the function is also accessible through the enclosing function's `var`
+//! binding. Include the facts known at that declaration.
+//!
+//! Other scripts can call top-level functions at any time. Any switch case can call functions
+//! declared in another case. For both, use only the facts known on entry.
 
 use std::mem;
 use std::rc::Rc;
 
-use swc_core::ecma::ast::{Decl, Function, Id, Ident, Stmt};
+use swc_core::ecma::ast::{BlockStmt, Decl, Function, Id, Ident, Stmt};
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use crate::deobfuscate::{HashMap, HashSet};
@@ -51,6 +54,16 @@ fn is_declaration(statement: &Stmt) -> bool {
     matches!(statement, Stmt::Decl(Decl::Fn(_)))
 }
 
+/// Context of a statement list containing declarations.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum List {
+    /// A script's top level or a switch case.
+    #[default]
+    Other,
+    FunctionBody,
+    Block,
+}
+
 /// Tracks current facts, active function declarations, and facts collected at references to
 /// those declarations.
 #[derive(Default)]
@@ -60,8 +73,8 @@ pub(crate) struct Hoisting<F> {
     /// Intersection of facts at references to each declaration; `None` before its first
     /// reference.
     pending: HashMap<Id, Option<F>>,
-    /// Whether the next statement list is a function body.
-    pub(crate) function_body: bool,
+    /// Context to use for the next statement list.
+    pub(crate) list: List,
 }
 
 /// The function declarations of one statement list, from
@@ -72,7 +85,9 @@ struct Declarations<F> {
     callers: Vec<Vec<usize>>,
     /// Facts at list entry, saved when the list contains declarations.
     entry: Option<F>,
-    function_body: bool,
+    list: List,
+    /// Facts known at each block declaration, in statement order.
+    reached: Vec<F>,
 }
 
 /// One function declaration of a statement list, at `position` in it.
@@ -85,7 +100,7 @@ impl<F: HoistFacts> Hoisting<F> {
     /// Starts visiting `statements` with the entry facts.
     #[must_use]
     fn enter(&mut self, statements: &[Stmt]) -> Declarations<F> {
-        let function_body = mem::take(&mut self.function_body);
+        let mut list = mem::take(&mut self.list);
         let declarations: Vec<Declaration> = statements
             .iter()
             .enumerate()
@@ -94,8 +109,16 @@ impl<F: HoistFacts> Hoisting<F> {
                 Some(Declaration { position, id })
             })
             .collect();
+        // Sharing a binding with an enclosing declaration would stop tracking that binding.
+        if list == List::Block
+            && declarations
+                .iter()
+                .any(|declaration| self.pending.contains_key(&declaration.id))
+        {
+            list = List::Other;
+        }
         let mut callers = vec![];
-        if function_body {
+        if list != List::Other {
             let mut indices: HashMap<Id, Vec<usize>> = HashMap::default();
             for (index, declaration) in declarations.iter().enumerate() {
                 indices
@@ -117,7 +140,15 @@ impl<F: HoistFacts> Hoisting<F> {
             entry: (!declarations.is_empty()).then(|| self.facts.clone()),
             declarations,
             callers,
-            function_body,
+            list,
+            reached: Vec::new(),
+        }
+    }
+
+    /// Records the facts known when a block declaration runs.
+    fn reach(&self, declarations: &mut Declarations<F>) {
+        if declarations.list == List::Block {
+            declarations.reached.push(self.facts.clone());
         }
     }
 
@@ -129,12 +160,13 @@ impl<F: HoistFacts> Hoisting<F> {
             declarations,
             callers,
             entry,
-            function_body,
+            list,
+            reached,
         } = declarations;
         let Some(entry) = entry else {
             return vec![];
         };
-        if !function_body {
+        if list == List::Other {
             return declarations
                 .into_iter()
                 .map(|declaration| (declaration.position, entry.clone()))
@@ -165,6 +197,9 @@ impl<F: HoistFacts> Hoisting<F> {
                     }
                 }
             }
+            if let Some(reached) = reached.get(index) {
+                meet(&mut facts, reached);
+            }
             declared.push((declaration.position, facts.unwrap_or_else(|| entry.clone())));
         }
         declared
@@ -185,9 +220,11 @@ pub(crate) fn visit_mut_stmts<V: Hoisted + VisitMut>(
     statements: &mut [Stmt],
     mut statement: impl FnMut(&mut V, &mut Stmt),
 ) {
-    let declarations = visitor.hoisting().enter(statements);
+    let mut declarations = visitor.hoisting().enter(statements);
     for other in statements.iter_mut() {
-        if !is_declaration(other) {
+        if is_declaration(other) {
+            visitor.hoisting().reach(&mut declarations);
+        } else {
             statement(visitor, other);
         }
     }
@@ -199,34 +236,23 @@ pub(crate) fn visit_mut_stmts<V: Hoisted + VisitMut>(
     }
 }
 
-/// [`visit_mut_stmts`] for a visitor that only reads the tree.
-pub(crate) fn visit_stmts<V: Hoisted + Visit>(
-    visitor: &mut V,
-    statements: &[Stmt],
-    mut statement: impl FnMut(&mut V, &Stmt),
-) {
-    let declarations = visitor.hoisting().enter(statements);
-    for other in statements {
-        if !is_declaration(other) {
-            statement(visitor, other);
-        }
-    }
-    let declared = visitor.hoisting().leave(declarations);
-    for (position, facts) in declared {
-        with_facts(visitor, facts, |visitor| {
-            statements[position].visit_with(visitor);
-        });
-    }
-}
-
 /// Marks a function body for [`Hoisting::enter`] before visiting it.
 pub(crate) fn visit_mut_function<V: Hoisted + VisitMut>(visitor: &mut V, function: &mut Function) {
     function.decorators.visit_mut_with(visitor);
     function.params.visit_mut_with(visitor);
     if let Some(body) = &mut function.body {
-        visitor.hoisting().function_body = true;
+        visitor.hoisting().list = List::FunctionBody;
         body.visit_mut_with(visitor);
     }
+}
+
+/// Marks non-function blocks for [`Hoisting::enter`] before visiting them.
+pub(crate) fn visit_mut_block<V: Hoisted + VisitMut>(visitor: &mut V, block: &mut BlockStmt) {
+    let list = &mut visitor.hoisting().list;
+    if *list == List::Other {
+        *list = List::Block;
+    }
+    block.visit_mut_children_with(visitor);
 }
 
 /// Records current facts at a reference to `identifier`. Direct `eval` can reference any

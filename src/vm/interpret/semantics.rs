@@ -99,6 +99,7 @@ pub(super) fn strict_equal<'a>(left: &Value<'a>, right: &Value<'a>) -> Option<bo
         (Value::Array(a), Value::Array(b)) => Rc::ptr_eq(a, b),
         (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
         (Value::Set(a), Value::Set(b)) => Rc::ptr_eq(a, b),
+        (Value::Map(a), Value::Map(b)) => Rc::ptr_eq(a, b),
         (Value::Function(a), Value::Function(b)) => Rc::ptr_eq(a, b),
         (Value::Symbol(a), Value::Symbol(b)) => Rc::ptr_eq(a, b),
         (Value::Namespace(a), Value::Namespace(b)) => a == b,
@@ -113,6 +114,7 @@ fn is_object(value: &Value<'_>) -> bool {
         Value::Array(_)
             | Value::Object(_)
             | Value::Set(_)
+            | Value::Map(_)
             | Value::Function(_)
             | Value::Namespace(_)
     )

@@ -219,7 +219,7 @@ impl<'ast> Run<'ast, '_> {
         let body = self
             .session
             .compiled
-            .scoped(body, |body| plan::scoped(&body.stmts));
+            .scoped(body, |body| plan::scoped_body(&body.stmts));
         self.body(Frame { this, scope }, &body, &mut [])
     }
 

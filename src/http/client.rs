@@ -13,6 +13,7 @@ use wreq::cookie::{Cookie, Jar};
 use wreq::header::HeaderMap;
 use wreq::http2::{StreamDependency, StreamId};
 use wreq::redirect::Policy;
+use wreq::ws::{WebSocket, WebSocketRequestBuilder};
 use wreq::{Client, Proxy, RequestBuilder, Response};
 #[cfg(feature = "internals")]
 use wreq::{Method, StatusCode};
@@ -168,6 +169,53 @@ impl BrowserClient {
         kind: RequestKind,
         supplied: &[(&str, Option<&str>)],
     ) -> Result<Response, wreq::Error> {
+        let (http, request) = self.ordered(request, kind, supplied).build_split();
+        let mut request = request?;
+        let urgency = request
+            .headers()
+            .get("priority")
+            .and_then(|priority| priority.to_str().ok())
+            .map_or(3, urgency);
+        if let Some(&weight) = self.requests.weights.get(&urgency) {
+            // The wire weight is one less than the configured weight. The stream exclusively
+            // depends on the connection while no other stream is open.
+            let dependency = StreamDependency::new(StreamId::zero(), (weight - 1) as u8, true);
+            request.extensions_mut().insert(dependency);
+        }
+        RequestBuilder::from_parts(http, request).send().await
+    }
+
+    /// Opens a WebSocket to `url` using the profile's handshake headers. The client appends the
+    /// handshake key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the profile has no `websocket` header order.
+    pub(super) async fn websocket(
+        &self,
+        url: &Url,
+        supplied: &[(&str, Option<&str>)],
+    ) -> Result<WebSocket, wreq::Error> {
+        let request = self.ordered(
+            self.http.get(url.as_str()),
+            RequestKind::WebSocket,
+            supplied,
+        );
+        WebSocketRequestBuilder::new(request)
+            .send()
+            .await?
+            .into_websocket()
+            .await
+    }
+
+    /// Replaces default headers with the profile's order for `kind`. Takes values from `supplied`,
+    /// omitting headers whose value is `None`.
+    fn ordered(
+        &self,
+        request: RequestBuilder,
+        kind: RequestKind,
+        supplied: &[(&str, Option<&str>)],
+    ) -> RequestBuilder {
         debug_assert!(
             supplied.len() == kind.supplied().len()
                 && supplied
@@ -197,20 +245,7 @@ impl BrowserClient {
                 },
             };
         }
-        let (http, request) = request.build_split();
-        let mut request = request?;
-        let urgency = request
-            .headers()
-            .get("priority")
-            .and_then(|priority| priority.to_str().ok())
-            .map_or(3, urgency);
-        if let Some(&weight) = self.requests.weights.get(&urgency) {
-            // The wire weight is one less than the configured weight. The stream exclusively
-            // depends on the connection while no other stream is open.
-            let dependency = StreamDependency::new(StreamId::zero(), (weight - 1) as u8, true);
-            request.extensions_mut().insert(dependency);
-        }
-        RequestBuilder::from_parts(http, request).send().await
+        request
     }
 
     /// Forwards a capture-proxy request without following redirects or decoding the response.

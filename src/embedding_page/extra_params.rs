@@ -7,7 +7,7 @@ use swc_core::ecma::ast::{CallExpr, Expr, KeyValueProp};
 use swc_core::ecma::visit::{Visit, VisitWith};
 use url::Url;
 
-use crate::challenge::reduced_timing::ResourceTiming;
+use crate::challenge::reduced_timing::{Entry, ResourceTiming};
 use crate::embedding_page::page::{Layout, PageSignals, RenderedPage};
 use crate::embedding_page::render_sample::RenderSample;
 use crate::engine::Engine;
@@ -191,7 +191,11 @@ impl ApiScript {
     /// Reduces [`Self::timing`] to the six fields forwarded by the challenge.
     #[must_use]
     pub(crate) fn reduced(&self, timing: &ResourceTiming) -> JsValue {
-        timing.reduce(self.url.as_str(), &self.measurement())
+        timing.reduce(&Entry {
+            name: self.url.as_str(),
+            start: self.start_time_ms,
+            measured: self.measurement(),
+        })
     }
 }
 
@@ -288,12 +292,60 @@ pub(crate) struct ExtraParams<'page> {
     #[serde(rename = "wPr")]
     pub signals: PageSignals,
     pub widget_id: &'page str,
+    #[serde(flatten)]
+    pub times: ElapsedTimes,
+}
+
+/// Elapsed loader times reported at the end of [`ExtraParams`], in milliseconds.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ElapsedTimes {
     pub time_extra_params_ms: i64,
     pub time_init_ms: i64,
     pub time_load_init_ms: i64,
     pub time_params_ms: i64,
     pub time_render_ms: i64,
     pub time_tief_ms: i64,
+}
+
+impl Timeline {
+    /// Returns the elapsed times reported by the loader.
+    fn times(&self) -> ElapsedTimes {
+        ElapsedTimes {
+            time_extra_params_ms: self.sent - self.render_start,
+            time_init_ms: self.init_start - self.render_end,
+            // The clock starts when the loader script runs, so the mark is already an elapsed time.
+            time_load_init_ms: self.sent,
+            time_params_ms: self.params_start - self.init_start,
+            time_render_ms: self.render_end - self.render_start,
+            time_tief_ms: self.sent - self.collect_start,
+        }
+    }
+
+    /// Reconstructs the timeline from reported `times` and the `implicit_render` stack sample.
+    /// Reverses [`Self::times`]. The caller supplies `script_fetch` because payloads do not report
+    /// when the loader was fetched.
+    #[must_use]
+    pub(crate) fn from_times(
+        times: &ElapsedTimes,
+        implicit_render: i64,
+        script_fetch: f64,
+    ) -> Self {
+        let sent = times.time_load_init_ms;
+        let render_start = sent - times.time_extra_params_ms;
+        let render_end = render_start + times.time_render_ms;
+        let init_start = render_end + times.time_init_ms;
+        Self {
+            script_fetch,
+            implicit_render,
+            render_start,
+            render_end,
+            init_start,
+            params_start: init_start + times.time_params_ms,
+            collect_start: sent - times.time_tief_ms,
+            sent,
+        }
+    }
 }
 
 /// Builds the reply to `requestExtraParams`. Omits widget parameters that the page does not
@@ -339,13 +391,7 @@ pub(crate) fn collect<'page>(
         url: page.url.as_str(),
         signals: page.signals(layout, mode),
         widget_id: &page.widget_id,
-        time_extra_params_ms: timeline.sent - timeline.render_start,
-        time_init_ms: timeline.init_start - timeline.render_end,
-        // The loader script starts the clock, so this is the mark itself.
-        time_load_init_ms: timeline.sent,
-        time_params_ms: timeline.params_start - timeline.init_start,
-        time_render_ms: timeline.render_end - timeline.render_start,
-        time_tief_ms: timeline.sent - timeline.collect_start,
+        times: timeline.times(),
     }
 }
 
@@ -388,6 +434,20 @@ pub(crate) fn widget_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::challenge::reduced_timing::Measure;
+
+    fn page() -> RenderedPage {
+        RenderedPage::render(
+            r#"<html><head><title>t</title>
+            <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></head>
+            <body><div class="cf-turnstile" data-sitekey="0x4AAA" data-action="login"
+                data-theme="dark" data-size="compact" data-language="de"></div></body></html>"#,
+            Url::parse("https://example.com/login").unwrap(),
+            "j5gbk",
+            None,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn finds_build_hashes_and_routes_only_where_the_loader_keeps_them() {

@@ -219,12 +219,11 @@ fn click_delay(index: &Index<'_>, stack_field: &str) -> Result<u64> {
 /// The checkbox program record's status, message and clock fields.
 fn envelope(index: &Index<'_>, record: &RecordTemplate) -> Result<Completion> {
     let stores = index.stores();
-    let names = index.header();
+    // Look for field names throughout the program; they are not limited to the header.
     let status = candidates::exactly_one(
         stores.iter().filter(|store| {
-            names.values().any(|name| name == &store.key)
-                && matches!(store.value, Term::Const(Constant::Number(status))
-                    if status == f64::from(COMPLETED_STATUS))
+            matches!(store.value, Term::Const(Constant::Number(status))
+                if status == f64::from(COMPLETED_STATUS))
         }),
         "completed status write",
     )?;

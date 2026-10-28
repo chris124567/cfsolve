@@ -20,8 +20,7 @@ mod semantics;
 mod setup;
 
 pub(crate) use builtin::Builtin;
-pub(crate) use explore::{Invocation, MAXIMUM_PATHS, Way, explore};
+pub(crate) use explore::{Invocation, MAXIMUM_PATHS, Way, decode, explore};
 pub(crate) use plan::Plans;
 pub(crate) use run::{Run, Spare};
-pub(crate) use semantics::numeric;
 pub(crate) use setup::setup;

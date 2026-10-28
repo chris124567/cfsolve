@@ -1,6 +1,8 @@
 //! Reduces `performance.getEntries()` results to rows with type-specific formats.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::Infallible;
+use std::ops::ControlFlow;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -8,12 +10,12 @@ use swc_core::ecma::ast::{BinaryOp, UnaryOp};
 
 use crate::engine::Engine;
 use crate::js::{JsObject, JsValue, json};
-use crate::listing::fold::{Frame, Known};
+use crate::listing::fold::{self, Frame, Known};
 use crate::resource_timing::{LoadTiming, NEXT_HOP_PROTOCOL};
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::records::ProbePlan;
 use crate::stage2::registry::Operation;
-use crate::vm::{Effect, Exit, Term};
+use crate::vm::{Effect, Exit, Listing, Term, dataflow};
 
 /// How the probe writes the row of one entry type.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -200,16 +202,41 @@ struct RowWrite {
 /// Recovers row formats from `entryType` comparisons and the row blocks they branch to.
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     let index = probe.index;
+    let listing = index.listing();
     let code = index.reachable(probe.entry);
-    let mut frame: Frame<Held> = Frame::default();
+    // Registers are reused across branches. At each instruction, keep only facts shared by every
+    // incoming path. The probe and its nested functions start with no known values. Ignore paths
+    // ruled out by known values.
+    let mut entries = vec![probe.entry];
+    for pc in &code {
+        for effect in listing.instructions[pc].effects() {
+            effect.visit_terms(&mut |term| {
+                if let Term::Closure { pc, .. } = term {
+                    entries.push(*pc);
+                }
+            });
+        }
+    }
+    let starts = entries.into_iter().map(|pc| (pc, Frame::default()));
+    let ControlFlow::Continue(incoming) = dataflow::forward(listing, starts, |pc, path, frame| {
+        frame.begin();
+        let runs = fold::feasible(path, |term| frame.resolve(term));
+        if runs {
+            frame.follow(pc, &path.effects, evaluate, |_, _| {});
+        }
+        ControlFlow::<Infallible, bool>::Continue(runs)
+    });
     let mut targets: Vec<(String, u32)> = Vec::new();
     let mut mark_prefix = None;
     // Index rows by the program counter where their objects were created.
     let mut rows: BTreeMap<u32, Row> = BTreeMap::new();
     for &pc in &code {
-        let instruction = &index.listing().instructions[&pc];
-        for path in &instruction.paths {
+        for path in &listing.instructions[&pc].paths {
+            let mut frame: Frame<Held> = incoming.get(&pc).cloned().unwrap_or_default();
             frame.begin();
+            if !fold::feasible(path, |term| frame.resolve(term)) {
+                continue;
+            }
             // A comparison against a type string leads to that type's block.
             if let Exit::Next { pc: target, .. } = path.exit
                 && let [(condition, holds)] = path.conditions.as_slice()
@@ -271,13 +298,13 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     let entries = rows
         .values()
         .find_map(|row| (!row.list.is_empty()).then(|| row.list.clone()))?;
-    // Each type's block is the first row created at or after its target.
     let mut formats = BTreeMap::new();
     let mut claimed = BTreeSet::new();
     for (kind, target) in targets {
-        let Some((&pc, row)) = rows.range(target..).next() else {
+        let Some(pc) = block_row(listing, &rows, target) else {
             continue;
         };
+        let row = &rows[&pc];
         claimed.insert(pc);
         let (marker, rest) = marked(&row.columns)?;
         let columns: Vec<(String, Column)> = rest
@@ -311,6 +338,28 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         raw,
         mark_prefix,
     })
+}
+
+/// Finds the first row created by a type's block, following the single path from `target`. Returns
+/// no row for comparisons that only produce a boolean for a later branch.
+fn block_row(listing: &Listing, rows: &BTreeMap<u32, Row>, target: u32) -> Option<u32> {
+    let mut pc = target;
+    loop {
+        if rows.contains_key(&pc) {
+            return Some(pc);
+        }
+        let instruction = listing.instructions.get(&pc)?;
+        let mut next = instruction
+            .paths
+            .iter()
+            .filter_map(|path| path.exit.continues_at());
+        let first = next.next()?;
+        // Ignore paths that throw, such as call guards.
+        if next.any(|other| other.pc != first.pc) || first.pc <= pc {
+            return None;
+        }
+        pc = first.pc;
+    }
 }
 
 /// The row's marker and columns, with its first column stored separately.
@@ -349,6 +398,8 @@ fn evaluate(frame: &Frame<Held>, term: &Term) -> Option<Known<Held>> {
             Term::Get(_, key) if is_text(frame, key, "getEntries") => Known::Ext(Held::Entries),
             _ => return None,
         },
+        // If `getEntries` is missing, the probe uses an empty list, which also has no entries.
+        Term::Array(elements) if elements.is_empty() => Known::Ext(Held::Entries),
         Term::Get(object, key) => match (frame.resolve(object), frame.resolve(key)) {
             (Some(Known::Ext(Held::Entries)), _) => Known::Ext(Held::Entry),
             (Some(Known::Ext(Held::Entry)), Some(Known::Literal(JsValue::String(name))))

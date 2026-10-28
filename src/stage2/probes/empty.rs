@@ -7,33 +7,26 @@ use crate::js::JsValue;
 use crate::listing::fold::{Frame, Known};
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::records::{COMPLETED_STATUS, INITIAL_STATUS};
-use crate::stage2::reference;
 use crate::vm::{Constant, Effect, Exit, Listing, Term, dataflow};
 
 /// Array methods the wrapper calls on its own state.
 const ARRAY_METHODS: [&str; 5] = ["eval", "slice", "push", "pop", "length"];
 
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<()> {
-    let empty = empty_probe(probe.index.listing(), probe.entry, |name| {
-        probe
-            .vocabulary
-            .reference_name(name)
-            .unwrap_or_else(|| name.to_owned())
-    });
-    empty.then_some(())
+    empty_probe(probe.index.listing(), probe.entry, probe.wrapper).then_some(())
 }
 
 /// Recognizes probes whose successful path writes only status and timing. Requires a positive
-/// match; an unrecognized family may still produce results. `reference_name` maps names to the
-/// reference build and leaves unknown names unchanged.
-fn empty_probe(listing: &Listing, entry: u32, reference_name: impl Fn(&str) -> String) -> bool {
+/// match because an unknown probe family may still produce results. `wrapper` contains the shared
+/// strings used for wrapper reads and writes. Builds rename these strings together.
+fn empty_probe(listing: &Listing, entry: u32, wrapper: &BTreeSet<String>) -> bool {
     let mut closures = BTreeSet::new();
     let registers: Frame = Frame::default();
-    let reached = dataflow::forward(listing, [(entry, registers)], |path, registers| {
+    let reached = dataflow::forward(listing, [(entry, registers)], |_, path, registers| {
         // A path that throws, such as a check that a callee is a function,
         // is not the successful one.
         if path.exit == Exit::Throw {
-            return ControlFlow::Continue(());
+            return ControlFlow::Continue(true);
         }
         for effect in &path.effects {
             if let Effect::SetProperty { object, key, value } = effect {
@@ -44,8 +37,7 @@ fn empty_probe(listing: &Listing, entry: u32, reference_name: impl Fn(&str) -> S
                 let key = registers.resolve(key);
                 let value = registers.resolve(value);
                 let wrapper_write = matches!(&key,
-                        Some(Known::Literal(JsValue::String(name)))
-                            if reference_name(name) == reference::EMPTY_COLLECTOR)
+                        Some(Known::Literal(JsValue::String(name))) if wrapper.contains(name))
                     || matches!(&value, Some(Known::Literal(JsValue::Number(number)))
                     if [INITIAL_STATUS, COMPLETED_STATUS].map(f64::from).contains(number))
                     || matches!(&value, Some(Known::Literal(JsValue::String(text)))
@@ -61,9 +53,8 @@ fn empty_probe(listing: &Listing, entry: u32, reference_name: impl Fn(&str) -> S
                     closures.insert(*pc);
                 }
                 Term::Get(_, key) if let Term::Const(Constant::String(name)) = &**key => {
-                    let name = reference_name(name);
-                    extra_work |= !reference::EMPTY_WRAPPER_READS.contains(&name.as_str())
-                        && !ARRAY_METHODS.contains(&name.as_str());
+                    extra_work |=
+                        !wrapper.contains(name) && !ARRAY_METHODS.contains(&name.as_str());
                 }
                 Term::New { .. } => extra_work = true,
                 _ => {}
@@ -75,7 +66,7 @@ fn empty_probe(listing: &Listing, entry: u32, reference_name: impl Fn(&str) -> S
                 registers.set(*register, registers.resolve(value));
             }
         }
-        ControlFlow::Continue(())
+        ControlFlow::Continue(true)
     });
     // Every wrapper path must stay within decoded instructions.
     matches!(reached, ControlFlow::Continue(reached)
@@ -107,10 +98,7 @@ mod tests {
                     arity: 0,
                 },
             ),
-            Effect::Set(
-                2,
-                Term::Const(Constant::String(reference::EMPTY_COLLECTOR.into())),
-            ),
+            Effect::Set(2, Term::Const(Constant::String("collector".into()))),
             set_property(Term::Reg(2), Term::Reg(1)),
             Effect::Set(3, Term::Const(Constant::Number(3.0))),
             set_property(Term::Reg(7), Term::Reg(3)),
@@ -131,13 +119,13 @@ mod tests {
             )]),
             ..Listing::default()
         };
-        let reference_name = |name: &str| name.to_owned();
-        assert!(empty_probe(&listing, 0, reference_name));
+        let wrapper = BTreeSet::from(["collector".to_owned()]);
+        assert!(empty_probe(&listing, 0, &wrapper));
         let path = &mut listing.instructions.get_mut(&0).unwrap().paths[0];
         path.effects.push(set_property(
             Term::Const(Constant::String("collected".into())),
             Term::Reg(20),
         ));
-        assert!(!empty_probe(&listing, 0, reference_name));
+        assert!(!empty_probe(&listing, 0, &wrapper));
     }
 }

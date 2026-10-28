@@ -15,7 +15,7 @@ use wreq::header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 /// Each kind of request the challenge flow makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum RequestKind {
+pub(crate) enum RequestKind {
     /// A navigation to a typed address.
     Navigation,
     /// A navigation retried with the high-entropy client hints its response demanded.
@@ -43,6 +43,10 @@ pub(super) enum RequestKind {
     /// A worker's `fetch(url, {cache: "no-store", credentials: "omit"})`.
     WorkerFetchWithoutCredentials,
     Form,
+    /// HTTP/1.1 WebSocket handshake from the iframe. Handshakes are not captured, so profiles
+    /// specify this order manually.
+    #[serde(rename = "websocket")]
+    WebSocket,
 }
 
 impl RequestKind {
@@ -82,7 +86,27 @@ impl RequestKind {
             }
             Self::WorkerFetch | Self::WorkerFetchWithoutCredentials => &["sec-fetch-site"],
             Self::Form => &["content-length", "origin", "sec-fetch-site", "referer"],
+            Self::WebSocket => &["origin"],
         }
+    }
+
+    /// Converts a captured header to an order entry for [`Slot::parse`]. Uses a bare name if the
+    /// request or browser identity supplies its value.
+    #[must_use]
+    pub(crate) fn entry(self, name: &str, value: &str) -> String {
+        if self.gives_value(name) {
+            name.to_owned()
+        } else {
+            format!("{name}: {value}")
+        }
+    }
+
+    /// Checks whether the request or browser identity supplies a value for header `name`, as with
+    /// the user agent and client hints.
+    fn gives_value(self, name: &str) -> bool {
+        name == USER_AGENT.as_str()
+            || name.starts_with("sec-ch-")
+            || self.supplied().contains(&name)
     }
 }
 
@@ -111,9 +135,8 @@ impl Slot {
         };
         let Some((name, value)) = entry.split_once(':') else {
             let name = header(entry)?;
-            let identity = name == USER_AGENT || name.as_str().starts_with("sec-ch-");
             ensure!(
-                identity || kind.supplied().contains(&name.as_str()),
+                kind.gives_value(name.as_str()),
                 "nothing gives `{name}` a value; write it as `{name}: <value>`"
             );
             return Ok(Self::Named(name));
@@ -222,6 +245,21 @@ mod tests {
             error.contains("the order of `navigation` requests"),
             "a navigation supplies no referer: {error}"
         );
+
+        // Converting a sent header to an order entry preserves how it is read back.
+        let entries = [
+            (RequestKind::Form, "referer", "referer"),
+            (RequestKind::Image, "sec-ch-ua-model", "sec-ch-ua-model"),
+            (RequestKind::Image, "user-agent", "user-agent"),
+            (
+                RequestKind::Navigation,
+                "sec-fetch-mode",
+                "sec-fetch-mode: navigate",
+            ),
+        ];
+        for (kind, name, entry) in entries {
+            assert_eq!(kind.entry(name, "navigate"), entry);
+        }
     }
 
     #[test]

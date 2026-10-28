@@ -2,12 +2,15 @@
 
 use std::mem;
 
-use super::run::Run;
-use crate::vm::HashMap;
-use crate::vm::extract::{Handler, Operand};
+use swc_core::ecma::ast::Function;
+
+use super::copies::Copies;
+use super::run::{Run, Stop};
+use crate::vm::dispatch::Decoded;
 use crate::vm::output::Path;
 use crate::vm::session::Session;
 use crate::vm::value::{Callable, Value};
+use crate::vm::{HashMap, convert};
 
 /// Maximum symbolic branches explored per handler.
 pub(crate) const MAXIMUM_PATHS: usize = 64;
@@ -20,7 +23,7 @@ pub(crate) struct Invocation<'session, 'ast> {
     pub pc: u32,
     /// The dispatch key the opcode byte leaves.
     pub key: u8,
-    pub handler: &'session Handler<'ast>,
+    pub handler: &'ast Function,
     /// The instance fields the constructor derives from the program.
     pub fields: &'session HashMap<String, Value<'ast>>,
     /// Registers whose values are known, such as a candidate string.
@@ -45,29 +48,15 @@ pub(crate) struct Way<'ast> {
 #[must_use]
 pub(crate) fn explore<'ast>(invocation: &Invocation<'_, 'ast>) -> Option<Ways<'ast>> {
     let mut ways = Ways::default();
-    let this = if invocation.handler.bound {
-        Value::Machine
-    } else {
-        Value::Undefined
-    };
-    let arguments: Vec<Value<'_>> = invocation
-        .handler
-        .arguments
-        .iter()
-        .map(|operand| match *operand {
-            Operand::Machine => Value::Machine,
-            Operand::Number(number) => Value::Number(number),
-        })
-        .collect();
     let handler = Callable::Script {
         name: None,
-        function: invocation.handler.function,
+        function: invocation.handler,
         scope: None,
     };
     let mut decisions = Vec::new();
     for _ in 0..MAXIMUM_PATHS {
         let mut run = Run::handler(invocation, decisions);
-        let outcome = run.invoke(&handler, this.clone(), arguments.clone());
+        let outcome = run.invoke(&handler, Value::Undefined, vec![Value::Machine]);
         decisions = mem::take(&mut run.branches.decisions);
         decisions.truncate(run.branches.decided);
         let scopes = run.scopes();
@@ -91,4 +80,41 @@ pub(crate) fn explore<'ast>(invocation: &Invocation<'_, 'ast>) -> Option<Ways<'a
         }
     }
     None
+}
+
+/// Runs `decoder` after setting the program counter and dispatch key registers. Returns the decoded
+/// opcode and updated key, or the reason execution stopped.
+pub(crate) fn decode<'ast>(
+    session: &Session<'ast>,
+    program: &[u8],
+    decoder: &'ast Function,
+    arguments: Vec<Value<'ast>>,
+    pc: u32,
+    key: u8,
+) -> Result<Decoded, String> {
+    let mut run = Run::new(session, program, Vec::new(), Some(Copies::default()));
+    run.start_at(pc, key);
+    let decoder = Callable::Script {
+        name: None,
+        function: decoder,
+        scope: None,
+    };
+    let outcome = run.invoke(&decoder, Value::Undefined, arguments);
+    let next = run.register_value(session.layout.key);
+    for scope in run.scopes() {
+        scope.borrow_mut().variables.clear();
+    }
+    let opcode = outcome.map_err(|stop| match *stop {
+        Stop::Throw(value) => format!("throws {}", value.expr()),
+        Stop::Unsupported(reason) => reason,
+    })?;
+    let byte = |value: &Value<'_>| value.number().and_then(convert::byte);
+    match (byte(&opcode), byte(&next)) {
+        (Some(opcode), Some(key)) => Ok(Decoded { opcode, key }),
+        _ => Err(format!(
+            "decoding leaves opcode {} and key {}",
+            opcode.expr(),
+            next.expr()
+        )),
+    }
 }

@@ -13,8 +13,8 @@ use std::mem;
 use swc_core::common::Span;
 use swc_core::common::util::take::Take;
 use swc_core::ecma::ast::{
-    AssignOp, BinaryOp, CondExpr, Expr, IfStmt, LabeledStmt, Lit, Program, ReturnStmt, Stmt,
-    ThrowStmt, UnaryExpr, UnaryOp, VarDeclOrExpr,
+    AssignOp, BinaryOp, CondExpr, Decl, Expr, IfStmt, LabeledStmt, Lit, Program, ReturnStmt, Stmt,
+    ThrowStmt, UnaryExpr, UnaryOp, VarDeclKind, VarDeclOrExpr,
 };
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
@@ -237,6 +237,26 @@ impl ExpandStatements {
                 (prefix, statement.discriminant) = self.split_sequence(statement.discriminant);
                 Stmt::Switch(statement)
             }
+            // In `var name = (first(), value)`, `first()` runs before the value is stored. Moving
+            // it before earlier uninitialized `var` declarations is safe because those declarations
+            // do nothing: `var a, b = (a = f(), v)`. This would be unsafe with `let` or `const`,
+            // because `a` would not yet be initialized.
+            Stmt::Decl(Decl::Var(mut declaration)) => {
+                let storing = match declaration.kind {
+                    VarDeclKind::Var => declaration
+                        .decls
+                        .iter()
+                        .position(|declarator| declarator.init.is_some()),
+                    VarDeclKind::Let | VarDeclKind::Const => Some(0),
+                };
+                if let Some(declarator) = storing.and_then(|at| declaration.decls.get_mut(at))
+                    && let Some(init) = &mut declarator.init
+                    && !ends_with_anonymous_function(init)
+                {
+                    (prefix, *init) = self.split_sequence(init.take());
+                }
+                Stmt::Decl(Decl::Var(declaration))
+            }
             Stmt::For(mut statement) => {
                 statement.init = match statement.init.take() {
                     Some(VarDeclOrExpr::Expr(initializer)) => {
@@ -319,6 +339,25 @@ mod tests {
                 "effect(); a = function named() {}",
                 "b = obj.x; first(); a = b + 1;",
             ],
+        );
+        // The sequence in the first initializer runs before the value is stored.
+        let output = transform(
+            "function f() { var v = (first(), flag && second(), value), w = (third(), more); \
+             var g = (effect(), function () {}); }",
+        );
+        testing::assert_contains(
+            &output,
+            &["w = (third(), more)", "g = (effect(), function() {})"],
+            &["first(); if (flag) { second(); } var v = value"],
+        );
+        // Earlier uninitialized `var` declarations have no effect.
+        let output = transform(
+            "function f() { var a, b = (a = first(), value); let c, d = (c = second(), other); }",
+        );
+        testing::assert_contains(
+            &output,
+            &["d = (c = second(), other)"],
+            &["a = first(); var a, b = value;"],
         );
         let output = transform(
             "function f() { for (start(), setup(); test(), ready; tick(), step()) body(); \

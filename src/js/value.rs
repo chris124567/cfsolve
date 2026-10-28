@@ -294,7 +294,6 @@ macro_rules! json {
 pub(crate) use json;
 
 /// Deserializes `T` from a JavaScript value using the same rules as `serde_json::from_value`.
-#[cfg(test)]
 pub(crate) fn from_value<T: serde::de::DeserializeOwned>(value: JsValue) -> serde_json::Result<T> {
     serde_json::from_value(serde_json::Value::from(value))
 }

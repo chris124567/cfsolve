@@ -9,8 +9,8 @@ use base64::engine::general_purpose::STANDARD;
 use num_bigint::BigUint;
 use serde::Serialize;
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignTarget, BlockStmt, CallExpr, Callee, Decl, Expr, Function, IfStmt,
-    ObjectLit, SimpleAssignTarget, Stmt,
+    ArrowExpr, AssignExpr, AssignTarget, BindingIdent, BlockStmt, CallExpr, Callee, ClassDecl,
+    Expr, FnDecl, Function, IfStmt, ObjectLit, Script, SimpleAssignTarget, Stmt, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 use url::Url;
@@ -227,8 +227,8 @@ struct Root {
 impl Root {
     fn read(root: &BlockStmt, definition: &Expr, parsed: &ParsedScript) -> Result<Self> {
         Ok(Self {
-            key_transform: key_transform(root, definition)?,
-            alphabet: base64_alphabet(root)?,
+            key_transform: key_transform(&parsed.script, definition)?,
+            alphabet: base64_alphabet(ast::string_literals(root))?,
             modulus: rsa_modulus(root)?,
             bootstrap: bootstrap(root, parsed),
         })
@@ -263,26 +263,44 @@ impl Visit for EncoderRoot<'_> {
     }
 }
 
-/// Finds the encoder's one callee not declared by the IIFE, which the VM creates at runtime.
-fn key_transform(root: &BlockStmt, definition: &Expr) -> Result<String> {
+/// Finds the encoder callee created by the VM at runtime. It is the only callee without a binding
+/// in the script; any remaining deobfuscation helpers have bindings.
+fn key_transform(script: &Script, definition: &Expr) -> Result<String> {
     let mut calls = Calls::default();
     definition.visit_with(&mut calls);
-    let declared = |name: &str| {
-        root.stmts.iter().any(|statement| {
-            matches!(statement, Stmt::Decl(Decl::Fn(function)) if function.ident.sym == name)
-        })
-    };
-    let undeclared = calls
+    let mut bound = Bound::default();
+    script.visit_with(&mut bound);
+    let unbound = calls
         .0
-        .iter()
-        .filter(|name| *name != "Number" && !declared(name));
-    candidates::exactly_one(undeclared, "VM-defined key transform").cloned()
+        .into_iter()
+        .filter(|name| name != "Number" && !bound.0.contains(name));
+    candidates::exactly_one(unbound, "VM-defined key transform")
 }
 
-/// Finds the session alphabet among the string literals in `node`, whether bound once or
-/// repeated at each use.
-pub(crate) fn base64_alphabet(node: &impl VisitWith<ast::StringLiterals>) -> Result<String> {
-    let alphabets = ast::string_literals(node).into_iter().filter(|candidate| {
+/// Names declared or assigned anywhere in the script.
+#[derive(Default)]
+struct Bound(BTreeSet<String>);
+
+impl Visit for Bound {
+    fn visit_binding_ident(&mut self, identifier: &BindingIdent) {
+        self.0.insert(identifier.sym.to_string());
+    }
+
+    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
+        self.0.insert(declaration.ident.sym.to_string());
+        declaration.visit_children_with(self);
+    }
+
+    fn visit_class_decl(&mut self, declaration: &ClassDecl) {
+        self.0.insert(declaration.ident.sym.to_string());
+        declaration.visit_children_with(self);
+    }
+}
+
+/// Finds the custom base64 alphabet in `candidates`: a string with 64 distinct ASCII characters and
+/// optional trailing padding.
+pub(crate) fn base64_alphabet(candidates: impl IntoIterator<Item = String>) -> Result<String> {
+    let alphabets = candidates.into_iter().filter(|candidate| {
         if !candidate.is_ascii() || !ALPHABET_LENGTH.contains(&candidate.len()) {
             return false;
         }
@@ -374,23 +392,34 @@ impl Visit for Definition<'_> {
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
 
     fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        // A sequence evaluates to its final expression. Some sessions reset
-        // the seed immediately before yielding the encoder function.
-        let mut value = assignment.right.unwrap_parens();
-        while let Expr::Seq(sequence) = value {
-            let Some(last) = sequence.exprs.last() else {
-                return;
-            };
-            value = last.unwrap_parens();
-        }
         if let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assignment.left
             && target.id.sym == *self.name
-            && matches!(value, Expr::Fn(_) | Expr::Arrow(_))
+            && let Some(function) = yielded_function(&assignment.right)
         {
-            self.found = Some(value.clone());
+            self.found = Some(function.clone());
         }
         assignment.visit_children_with(self);
     }
+
+    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
+        if let Some(target) = declarator.name.as_ident()
+            && target.id.sym == *self.name
+            && let Some(function) = declarator.init.as_deref().and_then(yielded_function)
+        {
+            self.found = Some(function.clone());
+        }
+        declarator.visit_children_with(self);
+    }
+}
+
+/// Finds the function produced by `value`, including through sequence expressions. Some sessions
+/// reset the seed just before returning the encoder function.
+fn yielded_function(value: &Expr) -> Option<&Expr> {
+    let mut value = value.unwrap_parens();
+    while let Expr::Seq(sequence) = value {
+        value = sequence.exprs.last()?.unwrap_parens();
+    }
+    matches!(value, Expr::Fn(_) | Expr::Arrow(_)).then_some(value)
 }
 
 /// The names called directly, as `name(...)`.

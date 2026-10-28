@@ -7,41 +7,18 @@
 //! writes. Records are shuffled per session, so this is the key for reading
 //! a capture's second payload by hand.
 
-use std::{env, fs};
+use std::env;
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use cfsolve::challenge;
-use cfsolve::script::Source;
+use cfsolve::capture::CapturedSession;
 use cfsolve::stage2::analysis;
 use cfsolve::stage2::registry::Treatment;
-use serde_json::Value;
-use url::Url;
 
 fn main() -> Result<()> {
     let path = env::args().nth(1).context("supply a capture JSON file")?;
-    let capture: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    let html = capture["iframeHtml"]
-        .as_str()
-        .context("the capture has no iframe HTML")?;
-    let javascript = challenge::inline_javascript(html)?;
-    let deobfuscated = cfsolve::deobfuscate(javascript)?;
-    let source = Source::try_new(&deobfuscated.text)?;
-
-    // The first payload's response is the probe program, masked with the ray
-    // its URL carries.
-    let post = &capture["posts"][0];
-    let url = Url::parse(post["url"].as_str().context("the capture has no POST")?)?;
-    let body = post["responseBody"]
-        .as_str()
-        .context("the first payload has no response")?;
-    let program = STANDARD.decode(challenge::decode_response(
-        body.as_bytes(),
-        challenge::ray(&url)?,
-    )?)?;
-
-    let analysis = analysis::analyze(&source, &program)?;
+    let capture = CapturedSession::read(Path::new(&path))?;
+    let analysis = analysis::analyze(&capture.source()?, &capture.program()?)?;
     let plan = analysis.plan();
     println!("record\tkind\ttreatment\treference");
     for (position, probe) in plan.probes().iter().enumerate() {

@@ -6,38 +6,14 @@ use anyhow::{Context, Result, bail, ensure};
 use swc_core::atoms::Atom;
 use swc_core::common::Span;
 use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, AssignTarget, BlockStmt, CallExpr, Callee, Class, ClassMember, Decl,
-    Expr, ExprOrSpread, Function, Lit, MemberExpr, MemberProp, ReturnStmt, Script,
-    SimpleAssignTarget, Stmt, SwitchStmt,
+    AssignExpr, AssignOp, AssignTarget, BlockStmt, CallExpr, Class, ClassMember, Decl, Expr,
+    ExprOrSpread, Function, Lit, ReturnStmt, Script, SimpleAssignTarget, Stmt, SwitchStmt,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
 use super::output::Position;
 use super::{HashMap, convert};
 use crate::js::ast;
-
-/// The handler an opcode dispatches to, and what the dispatch case passes it.
-pub(crate) struct Handler<'ast> {
-    pub function: &'ast Function,
-    /// Whether the case calls it with the machine as `this`.
-    pub bound: bool,
-    pub arguments: Vec<Operand>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum Operand {
-    Machine,
-    Number(f64),
-}
-
-/// Names of the fields that keep the run loop's state in `this.<registers>[this.<field>]`.
-pub(super) struct StateFields {
-    pub registers: String,
-    pub pc: String,
-    pub key: String,
-    pub cells: String,
-    pub program: String,
-}
 
 /// Finds a class with a `run` method and the innermost function body declaring it.
 #[derive(Default)]
@@ -122,16 +98,60 @@ enum Source {
     Parameter(usize),
     /// `this.<name>`.
     Field(String),
-    /// `this.<registers>[this.<index>]`.
+    /// Register read as `<registers>.read(<index>)`. Both the register file and index come from
+    /// fields.
     Register {
         registers: String,
         index: String,
     },
 }
 
-/// Finds [`StateFields`] by tracking plain assignments in `run`'s own statements. An unsupported
-/// assigned value invalidates what is known about its local.
-pub(super) fn state_fields(run: &Function) -> Result<StateFields> {
+/// Register layout and state setup recovered from `run`.
+pub(super) struct RunMethod<'ast> {
+    /// Field containing the register file. Fields on that file identify the program counter and
+    /// dispatch key registers.
+    pub registers: String,
+    /// Fields containing the cells and program register indices.
+    pub cells: String,
+    pub program: String,
+    pub dispatch: DispatchLoop<'ast>,
+}
+
+/// Dispatch function declared beside the class and called by `run` with the machine. Some builds
+/// move both loops out of `run`; both dispatch the same handlers.
+pub(crate) struct DispatchLoop<'ast> {
+    pub function: &'ast Function,
+    /// Argument values passed by `run`, in parameter order.
+    pub arguments: Vec<Argument>,
+}
+
+/// Argument passed from `run` to a dispatch loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Argument {
+    Machine,
+    Registers,
+    Program,
+    Other,
+}
+
+impl DispatchLoop<'_> {
+    /// The parameter receiving the machine.
+    fn machine(&self) -> Option<&Atom> {
+        let position = self
+            .arguments
+            .iter()
+            .position(|argument| *argument == Argument::Machine)?;
+        Some(&self.function.params.get(position)?.pat.as_ident()?.sym)
+    }
+}
+
+/// Tracks assignments in `run`, including copies of register fields and indices, program counter
+/// and key setup, storing the third argument in the cells register, reading the program register,
+/// and calling dispatch loops. An unsupported assignment clears the known value of its local.
+pub(super) fn run_method<'a>(
+    functions: &HashMap<Atom, &'a Function>,
+    run: &Function,
+) -> Result<RunMethod<'a>> {
     let body = run.body.as_ref().context("the run method has no body")?;
     let mut locals: HashMap<Atom, Source> = run
         .params
@@ -144,7 +164,7 @@ pub(super) fn state_fields(run: &Function) -> Result<StateFields> {
             ))
         })
         .collect();
-    let mut stored: [Option<(String, String)>; 3] = Default::default();
+    let mut cells = None;
     let mut loaded = Vec::new();
     for statement in &body.stmts {
         let Stmt::Expr(statement) = statement else {
@@ -155,86 +175,175 @@ pub(super) fn state_fields(run: &Function) -> Result<StateFields> {
             expr => vec![expr],
         };
         for expr in expressions {
+            if let Some((Source::Field(registers), arguments)) = method_call(&locals, expr, "write")
+                && let [Some(Source::Field(index)), Some(Source::Parameter(2))] = &arguments[..]
+            {
+                cells = Some((registers, index.clone()));
+                continue;
+            }
             let Expr::Assign(assign) = expr else { continue };
+            let AssignTarget::Simple(SimpleAssignTarget::Ident(name)) = &assign.left else {
+                continue;
+            };
             let value = match assign.op {
                 AssignOp::Assign => source(&locals, &assign.right),
                 _ => None,
             };
-            match &assign.left {
-                AssignTarget::Simple(SimpleAssignTarget::Ident(name)) => {
-                    if let Some(Source::Register { index, .. }) = &value {
-                        loaded.push(index.clone());
-                    }
-                    match value {
-                        Some(value) => locals.insert(name.sym.clone(), value),
-                        None => locals.remove(&name.sym),
-                    };
-                }
-                AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
-                    if let Some(Source::Register { registers, index }) =
-                        member_source(&locals, member)
-                        && let Some(Source::Parameter(parameter)) = value
-                        && let Some(slot) = stored.get_mut(parameter)
-                    {
-                        *slot = Some((registers, index));
-                    }
-                }
-                _ => {}
+            if let Some(Source::Register { registers, index }) = &value {
+                loaded.push((registers.clone(), index.clone()));
             }
+            match value {
+                Some(value) => locals.insert(name.sym.clone(), value),
+                None => locals.remove(&name.sym),
+            };
         }
     }
-    let [
-        Some((registers, pc)),
-        Some((key_registers, key)),
-        Some((cell_registers, cells)),
-    ] = stored
-    else {
-        bail!("the run method does not store its pc, key and cells in registers");
-    };
-    ensure!(
-        registers == key_registers && registers == cell_registers,
-        "the run method stores its arguments in different register files"
-    );
-    loaded.retain(|index| ![&pc, &key, &cells].contains(&index));
+    let (registers, cells) =
+        cells.context("the run method writes its cells argument to no register")?;
+    loaded.retain(|(file, index)| *file == registers && *index != cells);
     loaded.sort();
     loaded.dedup();
-    let [program] = &loaded[..] else {
+    let [(_, program)] = &loaded[..] else {
         bail!(
             "the run method loads {} registers besides its arguments",
             loaded.len()
         );
     };
-    Ok(StateFields {
-        program: program.clone(),
+    let program = program.clone();
+    let mut calls = DispatchCall {
+        functions,
+        found: None,
+    };
+    body.visit_with(&mut calls);
+    let (function, call) = calls
+        .found
+        .context("the run method calls no dispatch loop with the machine")?;
+    let arguments = call
+        .args
+        .iter()
+        .map(|argument| match &*argument.expr {
+            Expr::This(_) => Argument::Machine,
+            Expr::Ident(name) => match locals.get(&name.sym) {
+                Some(Source::Field(field)) if *field == registers => Argument::Registers,
+                Some(Source::Register { index, .. }) if *index == program => Argument::Program,
+                _ => Argument::Other,
+            },
+            _ => Argument::Other,
+        })
+        .collect();
+    Ok(RunMethod {
         registers,
-        pc,
-        key,
         cells,
+        program,
+        dispatch: DispatchLoop {
+            function,
+            arguments,
+        },
     })
+}
+
+/// Finds the first call in `run` whose first argument is the machine and whose target contains a
+/// dispatch switch.
+struct DispatchCall<'functions, 'ast> {
+    functions: &'functions HashMap<Atom, &'ast Function>,
+    found: Option<(&'ast Function, CallExpr)>,
+}
+
+impl Visit for DispatchCall<'_, '_> {
+    fn visit_call_expr(&mut self, call: &CallExpr) {
+        if self.found.is_none()
+            && call
+                .args
+                .first()
+                .is_some_and(|argument| argument.expr.is_this())
+            && let Some(callee) = call.callee.as_expr().and_then(|callee| callee.as_ident())
+            && let Some(&function) = self.functions.get(&callee.sym)
+            && first_switch_in(function).is_some()
+        {
+            self.found = Some((function, call.clone()));
+        }
+        call.visit_children_with(self);
+    }
+}
+
+/// Resolves `<object>.<name>(<arguments>)`, including the values of the object and arguments.
+fn method_call(
+    locals: &HashMap<Atom, Source>,
+    expr: &Expr,
+    name: &str,
+) -> Option<(Source, Vec<Option<Source>>)> {
+    let (object, arguments) = ast::method_call(expr, name)?;
+    let arguments = arguments
+        .iter()
+        .map(|argument| source(locals, &argument.expr))
+        .collect();
+    Some((source(locals, object)?, arguments))
 }
 
 fn source(locals: &HashMap<Atom, Source>, expr: &Expr) -> Option<Source> {
     match expr {
         Expr::Ident(name) => locals.get(&name.sym).cloned(),
         Expr::Paren(paren) => source(locals, &paren.expr),
-        Expr::Member(member) => member_source(locals, member),
+        Expr::Member(member) if member.obj.is_this() => {
+            Some(Source::Field(ast::member_str(&member.prop)?.to_owned()))
+        }
+        Expr::Call(_) => match method_call(locals, expr, "read")? {
+            (Source::Field(registers), arguments) => match &arguments[..] {
+                [Some(Source::Field(index))] => Some(Source::Register {
+                    registers,
+                    index: index.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        },
         _ => None,
     }
 }
 
-fn member_source(locals: &HashMap<Atom, Source>, member: &MemberExpr) -> Option<Source> {
-    if let Expr::This(_) = &*member.obj {
-        return Some(Source::Field(ast::member_str(&member.prop)?.to_owned()));
+/// Finds the string decryption function called by the register reader as
+/// `decrypt(this.<values>[index])`.
+pub(super) fn record_decoder(body: &BlockStmt) -> Option<Atom> {
+    /// Matches `<decoder>(this.<values>[<index>])`.
+    struct Decoders {
+        index: Atom,
+        found: Vec<Atom>,
     }
-    let MemberProp::Computed(index) = &member.prop else {
-        return None;
-    };
-    match (source(locals, &member.obj)?, source(locals, &index.expr)?) {
-        (Source::Field(registers), Source::Field(index)) => {
-            Some(Source::Register { registers, index })
+
+    impl Visit for Decoders {
+        fn visit_call_expr(&mut self, call: &CallExpr) {
+            if let Some(callee) = call.callee.as_expr().and_then(|callee| callee.as_ident())
+                && let [argument] = &call.args[..]
+                && let Some(member) = argument.expr.as_member()
+                && member
+                    .obj
+                    .as_member()
+                    .is_some_and(|values| values.obj.is_this())
+                && member
+                    .prop
+                    .as_computed()
+                    .and_then(|index| index.expr.as_ident())
+                    .is_some_and(|name| name.sym == self.index)
+            {
+                self.found.push(callee.sym.clone());
+            }
+            call.visit_children_with(self);
+        }
+    }
+
+    let read = body.stmts.iter().find_map(|statement| match statement {
+        Stmt::Decl(Decl::Class(declaration)) if method(&declaration.class, "write").is_some() => {
+            method(&declaration.class, "read")
         }
         _ => None,
-    }
+    })?;
+    let mut decoders = Decoders {
+        index: read.params.first()?.pat.as_ident()?.sym.clone(),
+        found: Vec::new(),
+    };
+    read.visit_with(&mut decoders);
+    let [decoder]: [Atom; 1] = decoders.found.try_into().ok()?;
+    Some(decoder)
 }
 
 /// The first class declaration with a `run` method.
@@ -256,18 +365,20 @@ pub(super) fn method<'a>(class: &'a Class, name: &str) -> Option<&'a Function> {
     })
 }
 
-/// Reads `case <opcode>: <handler>(<operands>...); break;`, or `<handler>.call(this,
-/// <operands>...)`, where each operand is `this` or a number.
+/// Extracts opcode and handler pairs from `case <opcode>: <handler>(<machine>); break;`.
 pub(super) fn handlers<'a>(
     functions: &HashMap<Atom, &'a Function>,
-    run: &'a Function,
-) -> Result<HashMap<u8, Handler<'a>>> {
-    let body = run.body.as_ref().context("the run method has no body")?;
-    let switch = body
-        .stmts
-        .iter()
-        .find_map(first_switch)
-        .context("the run method has no switch")?;
+    dispatch: &DispatchLoop<'a>,
+) -> Result<HashMap<u8, &'a Function>> {
+    let switch = first_switch_in(dispatch.function).context("the dispatch loop has no switch")?;
+    let machine = dispatch.machine();
+    let is_machine = |argument: &ExprOrSpread| {
+        argument.spread.is_none()
+            && argument
+                .expr
+                .as_ident()
+                .is_some_and(|name| Some(&name.sym) == machine)
+    };
     let mut handlers = HashMap::default();
     for case in &switch.cases {
         let Some(test) = &case.test else { continue };
@@ -280,57 +391,26 @@ pub(super) fn handlers<'a>(
             .iter()
             .find_map(|statement| statement.as_expr()?.expr.as_call())
             .with_context(|| format!("dispatch case {opcode} calls no handler"))?;
-        let Callee::Expr(callee) = &call.callee else {
-            bail!("dispatch case {opcode} calls no handler");
-        };
-        let (name, bound, operands) = match &**callee {
-            Expr::Ident(name) => (name, false, &call.args[..]),
-            Expr::Member(member) if ast::member_str(&member.prop) == Some("call") => {
-                let Expr::Ident(name) = &*member.obj else {
-                    bail!("dispatch case {opcode} calls no named handler");
-                };
-                let [receiver, operands @ ..] = &call.args[..] else {
-                    bail!(
-                        "dispatch case {opcode} calls {} without a receiver",
-                        name.sym
-                    );
-                };
-                ensure!(
-                    matches!(operand(receiver), Some(Operand::Machine)),
-                    "dispatch case {opcode} does not call {} on the machine",
-                    name.sym
-                );
-                (name, true, operands)
-            }
-            _ => bail!("dispatch case {opcode} calls no named handler"),
+        let Some(name) = call.callee.as_expr().and_then(|callee| callee.as_ident()) else {
+            bail!("dispatch case {opcode} calls no named handler");
         };
         let function = functions
             .get(&name.sym)
             .with_context(|| format!("no handler function {}", name.sym))?;
-        let arguments: Option<Vec<Operand>> = operands.iter().map(operand).collect();
-        let arguments = arguments.with_context(|| {
-            let name = &name.sym;
-            format!("an argument of handler {name} is neither the machine nor a number")
-        })?;
-        let previous = handlers.insert(
-            opcode,
-            Handler {
-                function,
-                bound,
-                arguments,
-            },
+        ensure!(
+            matches!(&call.args[..], [argument] if is_machine(argument)),
+            "dispatch case {opcode} does not pass {} only the machine",
+            name.sym
         );
+        let previous = handlers.insert(opcode, *function);
         ensure!(previous.is_none(), "opcode {opcode} has two dispatch cases");
     }
     Ok(handlers)
 }
 
-fn operand(argument: &ExprOrSpread) -> Option<Operand> {
-    match (&argument.spread, &*argument.expr) {
-        (None, Expr::This(_)) => Some(Operand::Machine),
-        (None, Expr::Lit(Lit::Num(number))) => Some(Operand::Number(number.value)),
-        _ => None,
-    }
+/// Finds the first dispatch switch in the body of `function`.
+fn first_switch_in(function: &Function) -> Option<&SwitchStmt> {
+    function.body.as_ref()?.stmts.iter().find_map(first_switch)
 }
 
 /// Finds the first dispatch `switch`; both dispatch loops use the same form.

@@ -9,6 +9,7 @@ use swc_core::ecma::ast::{ArrowExpr, Function as ScriptFunction};
 
 use super::interpret::Builtin;
 use super::output::{Constant, Term};
+use super::registers::Slots;
 use super::{HashMap, convert};
 
 /// A value produced by a handler. Uses a word-sized discriminant so the whole value occupies
@@ -25,6 +26,8 @@ pub(crate) enum Value<'ast> {
     Object(Rc<RefCell<Vec<(String, Value<'ast>)>>>),
     /// A `Set` or `WeakSet`.
     Set(Rc<RefCell<Vec<Value<'ast>>>>),
+    /// A `Map` or `WeakMap`, with its entries in insertion order.
+    Map(Rc<RefCell<Vec<(Value<'ast>, Value<'ast>)>>>),
     Function(Rc<Callable<'ast>>),
     /// A `Symbol()`, which only equals itself.
     Symbol(Rc<()>),
@@ -35,14 +38,14 @@ pub(crate) enum Value<'ast> {
     Symbolic(Rc<Term>),
     /// The interpreter instance, `this` inside a handler.
     Machine,
+    /// The register file (see [`super::registers`]).
     Registers,
+    /// One of the register file's parallel arrays.
+    RegisterSlots(Slots),
     Program,
     /// The closure cells of the running function.
     Cells,
     Cell(u32),
-    /// Decoded-string cache filled only during handler runs (see
-    /// [`super::session::Session::decoded`]). Other runs always miss.
-    Cache,
 }
 
 /// Variables of a call or of setup. Functions capture scopes by reference, so later assignments
@@ -248,10 +251,11 @@ impl<'ast> Value<'ast> {
                 callable => closure(callable).unwrap_or_else(|| Term::Opaque("function".into())),
             },
             Self::Set(_) => Term::Opaque("set".into()),
+            Self::Map(_) => Term::Opaque("map".into()),
             Self::Symbol(_) => Term::Opaque("symbol".into()),
             Self::Namespace(path) if path.is_empty() => Term::Global("globalThis".into()),
             Self::Namespace(path) => Term::Global(path.to_string()),
-            Self::Machine | Self::Registers | Self::Program | Self::Cache => {
+            Self::Machine | Self::Registers | Self::RegisterSlots(_) | Self::Program => {
                 Term::Opaque("machine internals".into())
             }
         }

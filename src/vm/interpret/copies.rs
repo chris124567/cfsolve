@@ -23,6 +23,7 @@ pub(super) fn copy<'a>(value: &Value<'a>, copies: &mut Copies<'a>) -> Value<'a> 
         Value::Array(elements) => Rc::as_ptr(elements).addr(),
         Value::Object(properties) => Rc::as_ptr(properties).addr(),
         Value::Set(members) => Rc::as_ptr(members).addr(),
+        Value::Map(entries) => Rc::as_ptr(entries).addr(),
         Value::Function(callable) => Rc::as_ptr(callable).addr(),
         _ => return value.clone(),
     };
@@ -32,6 +33,13 @@ pub(super) fn copy<'a>(value: &Value<'a>, copies: &mut Copies<'a>) -> Value<'a> 
     match value {
         Value::Array(elements) => copy_elements(elements, address, copies, Value::Array, copy),
         Value::Set(members) => copy_elements(members, address, copies, Value::Set, copy),
+        Value::Map(entries) => copy_elements(
+            entries,
+            address,
+            copies,
+            Value::Map,
+            |(key, value), copies| (copy(key, copies), copy(value, copies)),
+        ),
         Value::Object(properties) => copy_elements(
             properties,
             address,

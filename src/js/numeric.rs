@@ -107,29 +107,6 @@ pub(crate) fn string_number(text: &str) -> f64 {
     text.parse().unwrap_or(f64::NAN)
 }
 
-/// `parseInt(text)` with no radix: decimal, or hexadecimal after `0x`.
-#[must_use]
-pub(crate) fn parse_integer(text: &str) -> f64 {
-    let text = text.trim_start_matches(is_whitespace);
-    let (sign, text) = match text.strip_prefix('-') {
-        Some(text) => (-1.0, text),
-        None => (1.0, text.strip_prefix('+').unwrap_or(text)),
-    };
-    let (radix, text) = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(text) => (16, text),
-        None => (10, text),
-    };
-    if !text.starts_with(|character: char| character.is_digit(radix)) {
-        return f64::NAN;
-    }
-    let digits = text
-        .chars()
-        .map_while(|character| character.to_digit(radix));
-    sign * digits.fold(0.0, |value, digit| {
-        value * f64::from(radix) + f64::from(digit)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,20 +141,6 @@ mod tests {
         ] {
             assert!(string_number(text).is_nan(), "{text:?}");
         }
-    }
-
-    #[test]
-    fn parses_javascript_integer_prefixes() {
-        for (text, expected) in [
-            ("  -12tail", -12.0),
-            ("+0x20suffix", 32.0),
-            ("1e3", 1.0),
-            ("\u{feff}42", 42.0),
-        ] {
-            assert_eq!(parse_integer(text), expected, "{text:?}");
-        }
-        assert!(parse_integer("text").is_nan());
-        assert!(parse_integer("\u{85}12").is_nan());
     }
 
     #[test]

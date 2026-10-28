@@ -1,5 +1,5 @@
-//! Inlines calls to dispatchers whose first argument selects a return value through `if`,
-//! `switch`, or nested blocks. Supports applied calls and operator expressions:
+//! Inlines dispatcher calls by following `if`, `switch`, and nested blocks with known numeric
+//! arguments. Handles applied calls, direct calls, and operator expressions:
 //!
 //! ```js
 //! function b(n, f, args) {
@@ -7,15 +7,23 @@
 //!     case 973348: return Reflect.apply(f, undefined, args);
 //!   }
 //! }
+//! function c(n, m, f, x) { switch (n) { case 1: switch (m) { case 2: return f(x); } } }
 //! function w(op, x, y) { if (op === 0) return x + y; else return x - y; }
 //!
 //! b(971996, encode, [payload]);  // encode(payload)
+//! c(1, 2, encode, payload);      // encode(payload)
 //! w(1, 630, 622);                // 630 - 622
 //! ```
 //!
-//! Requires a literal selector. Applied targets must be identifiers to preserve undefined
-//! `this`. Operator arguments must have no side effects so repeated or reordered evaluation is
-//! safe. `Reflect` and `undefined` must resolve to globals.
+//! The first selector must be a literal. Applied and direct call targets must be identifiers to
+//! keep `this` undefined. Direct calls must forward the remaining parameters in order, omitting
+//! only numeric selectors. Operator arguments must have no side effects because they may be
+//! evaluated repeatedly or in a different order. `Reflect` and `undefined` must refer to globals.
+//!
+//! The decoding pass only follows the first argument and leaves direct calls unchanged. This
+//! preserves the dispatcher frames needed to recover click stacks.
+
+use std::iter;
 
 use swc_core::ecma::ast::{
     BinaryOp, CallExpr, Callee, Expr, ExprOrSpread, FnDecl, Function, Id, Lit, Program, Stmt,
@@ -27,7 +35,24 @@ use super::analysis::{Analysis, Globals, effects, names};
 use super::{HashMap, helper_objects};
 use crate::js::ast;
 
+/// Dispatcher patterns enabled for a pass.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Applied calls and operations selected by the first argument.
+    Decoding,
+    /// Also includes direct calls and selection by any numeric argument.
+    All,
+}
+
 pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
+    inline(program, analysis, Reach::Decoding)
+}
+
+pub(super) fn run_all(program: &mut Program, analysis: &mut Analysis) -> bool {
+    inline(program, analysis, Reach::All)
+}
+
+fn inline(program: &mut Program, analysis: &mut Analysis, reach: Reach) -> bool {
     let globals = analysis.globals;
     let bindings = analysis.bindings(program);
     let mut functions = Functions::default();
@@ -41,6 +66,7 @@ pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
     let mut inline = InlineDispatchers {
         functions: &functions.0,
         globals,
+        reach,
         changed: false,
     };
     program.visit_mut_with(&mut inline);
@@ -107,16 +133,15 @@ fn may_select<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> bool {
     false
 }
 
-/// Follows a function body for one known selector value.
-struct Path<'body> {
-    selector: &'body Id,
-    value: f64,
+/// Follows a function body for known numeric parameter values.
+struct Path {
+    values: HashMap<Id, f64>,
 }
 
-impl<'body> Path<'body> {
+impl Path {
     /// Returns `Some(Some(value))` for a return with a value, `Some(None)` for normal
     /// completion, and `None` for a path it cannot analyze.
-    fn run(
+    fn run<'body>(
         &self,
         statements: impl IntoIterator<Item = &'body Stmt>,
     ) -> Option<Option<&'body Expr>> {
@@ -190,9 +215,29 @@ impl<'body> Path<'body> {
 
     fn number(&self, expression: &Expr) -> Option<f64> {
         ast::fold_number(expression, &|leaf| {
-            (leaf.as_ident()?.to_id() == *self.selector).then_some(self.value)
+            self.values.get(&leaf.as_ident()?.to_id()).copied()
         })
     }
+}
+
+/// Returns parameter positions for the target and arguments of a call such as `target(a, b)`. Each
+/// must refer to a parameter.
+fn parameter_call(expression: &Expr, params: &[Id]) -> Option<Vec<usize>> {
+    let call = expression.as_call()?;
+    let arguments = call
+        .args
+        .iter()
+        .map(|arg| arg.spread.is_none().then_some(&*arg.expr));
+    iter::once(Some(&**call.callee.as_expr()?))
+        .chain(arguments)
+        .map(|expression| parameter_position(expression?, params))
+        .collect()
+}
+
+/// Returns the index in `params` of the parameter named by `expression`.
+fn parameter_position(expression: &Expr, params: &[Id]) -> Option<usize> {
+    let id = expression.as_ident()?.to_id();
+    params.iter().position(|param| *param == id)
 }
 
 /// The parameter positions of `target` and `args` in `Reflect.apply(target, undefined, args)`.
@@ -202,10 +247,6 @@ struct ReflectApply {
 }
 
 fn reflect_apply(expression: &Expr, params: &[Id], globals: Globals) -> Option<ReflectApply> {
-    let position = |expression: &Expr| {
-        let id = expression.as_ident()?.to_id();
-        params.iter().position(|param| *param == id)
-    };
     if let Some((reflect, [function, this, arguments])) = ast::method_call(expression, "apply")
         && reflect
             .as_ident()
@@ -222,8 +263,8 @@ fn reflect_apply(expression: &Expr, params: &[Id], globals: Globals) -> Option<R
         }
     {
         Some(ReflectApply {
-            target: position(&function.expr)?,
-            arguments: position(&arguments.expr)?,
+            target: parameter_position(&function.expr, params)?,
+            arguments: parameter_position(&arguments.expr, params)?,
         })
     } else {
         None
@@ -243,6 +284,7 @@ fn is_operation(expression: &Expr, leaf: &impl Fn(&Expr) -> bool) -> bool {
 struct InlineDispatchers<'functions> {
     functions: &'functions HashMap<Id, Candidate>,
     globals: Globals,
+    reach: Reach,
     changed: bool,
 }
 
@@ -252,16 +294,41 @@ impl InlineDispatchers<'_> {
         if args.iter().any(|arg| arg.spread.is_some()) {
             return None;
         }
-        let Expr::Lit(Lit::Num(selector)) = &*args.first()?.expr else {
-            return None;
+        let number = |arg: &ExprOrSpread| match &*arg.expr {
+            Expr::Lit(Lit::Num(number)) => Some(number.value),
+            _ => None,
+        };
+        number(args.first()?)?;
+        let selectors = match self.reach {
+            Reach::Decoding => 1,
+            Reach::All => args.len(),
         };
         // Returns the selected expression only if choosing it requires constant selector
         // comparisons with no other evaluation.
         let path = Path {
-            selector: &candidate.params[0],
-            value: selector.value,
+            values: candidate
+                .params
+                .iter()
+                .zip(&args[..selectors])
+                .filter_map(|(param, arg)| Some((param.clone(), number(arg)?)))
+                .collect(),
         };
         let returned = path.run(&candidate.body)??;
+        if self.reach == Reach::All
+            && let Some(positions) = parameter_call(returned, &candidate.params)
+            && args.len() == candidate.params.len()
+            && positions.is_sorted_by(|before, after| before < after)
+            && (0..args.len())
+                .all(|index| positions.contains(&index) || number(&args[index]).is_some())
+            && let [target, passed @ ..] = &positions[..]
+            && args[*target].expr.is_ident()
+        {
+            return Some(Expr::Call(CallExpr {
+                callee: Callee::Expr(args[*target].expr.clone()),
+                args: passed.iter().map(|&index| args[index].clone()).collect(),
+                ..Default::default()
+            }));
+        }
         if let Some(apply) = reflect_apply(returned, &candidate.params, self.globals)
             && let Some(target) = args.get(apply.target)
             && target.expr.is_ident()
@@ -351,6 +418,29 @@ mod tests {
         }
         let reassigned = inline(&format!("{APPLY} b = h; f(b(971996, encode, [x]));"));
         assert!(reassigned.contains("f(b("), "{reassigned}");
+    }
+
+    #[test]
+    fn calls_targets_selected_by_several_selectors_only_in_argument_order() {
+        let inline = |source: &str| testing::rewrite(source, super::run_all, /* fix= */ true);
+        let dispatchers = "function c(n, m, f, x, y) {
+                switch (n ^ 5) { case 1: switch (3 ^ m) { case 1: return f(x, y); } return; }
+            }
+            function d(n, f, x, y) { switch (n) { case 0: return f(y, x); } }";
+        let source = format!("{dispatchers} g(c(4, 2, encode, a(), b));");
+        let output = inline(&source);
+        assert!(output.contains("g(encode(a(), b))"), "{output}");
+        let decoding = testing::rewrite(&source, super::run, /* fix= */ true);
+        assert!(decoding.contains("g(c(4, 2,"), "{decoding}");
+        for call in [
+            "c(4, 2, o.encode, a, b)",
+            "c(4, 2, encode, a)",
+            "c(4, 1, encode, a, b)",
+            "d(0, encode, a, b)",
+        ] {
+            let output = inline(&format!("{dispatchers} g({call});"));
+            assert!(output.contains(&format!("g({call})")), "{output}");
+        }
     }
 
     #[test]

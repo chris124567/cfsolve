@@ -1,13 +1,15 @@
-//! Replaces computed properties with dot accesses:
+//! Converts constant property accesses to dot notation and constant object keys to named keys:
 //!
 //! ```js
-//! console["log"];  // becomes console.log
+//! console["log"];       // becomes console.log
+//! h = { ["add"]: f };   // becomes h = { add: f }
 //! ```
 //!
 //! Accepts string literals and templates without substitutions only when the value is a valid
-//! identifier. Both forms then access the same property.
+//! identifier. Both forms access the same property. A computed `__proto__` key stays computed: it
+//! defines a property, while a named key sets the prototype.
 
-use swc_core::ecma::ast::{IdentName, MemberExpr, MemberProp, Program};
+use swc_core::ecma::ast::{IdentName, MemberExpr, MemberProp, Program, Prop, PropName};
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
 use super::analysis::Analysis;
@@ -35,6 +37,20 @@ impl VisitMut for NameStaticMembers {
             self.changed = true;
         }
     }
+
+    fn visit_mut_prop(&mut self, property: &mut Prop) {
+        property.visit_mut_children_with(self);
+
+        if let Prop::KeyValue(property) = property
+            && let PropName::Computed(key) = &property.key
+            && let Some(name) = ast::static_str(&key.expr)
+            && swc_ecma_utils::is_valid_ident(name)
+            && name != "__proto__"
+        {
+            property.key = PropName::Ident(IdentName::new(name.into(), key.span));
+            self.changed = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -47,5 +63,11 @@ mod tests {
             testing::transform(r#"obj[`lo\u0067`](); obj?.[`name`]; obj[`a-b`]; obj[`${key}`];"#);
         let expected = ["obj.log()", "obj?.name", "obj[`a-b`]", "obj[`${key}`]"];
         testing::assert_contains(&output, &expected, &[]);
+        let output = testing::transform(r#"f({ ["add"]: 1, [`a-b`]: 2, ["__proto__"]: 3 });"#);
+        testing::assert_contains(
+            &output,
+            &[],
+            &["add: 1", "[`a-b`]: 2", r#"["__proto__"]: 3"#],
+        );
     }
 }

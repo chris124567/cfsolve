@@ -15,7 +15,7 @@ use crate::browser::Page;
 use crate::challenge::orchestrator::{self, ChallengePage};
 use crate::challenge::payload;
 use crate::challenge::program::{PreparedSession, SessionEncoder};
-use crate::challenge::reduced_timing::ResourceTiming;
+use crate::challenge::reduced_timing::{Entry, ResourceTiming};
 use crate::challenge::source::InitialRequest;
 use crate::challenge::state::{Intervals, ScriptState};
 use crate::embedding_page::challenge_page::WIDGET_HOST;
@@ -351,10 +351,19 @@ pub(crate) fn page_resource_timing(
     post: &LoadTiming,
     iframe: &LoadTiming,
 ) -> Vec<JsValue> {
+    // Times run from the challenge page's navigation.
+    let since = |load: &LoadTiming| (load.started_ms - navigation.started_ms) as f64;
+    let reduce = |load: &LoadTiming, measured: ResourceMeasurement| {
+        timing.reduce(&Entry {
+            name: &load.url,
+            start: since(load),
+            measured,
+        })
+    };
     let estimate = |fetch: &LoadTiming| {
-        timing.reduce(
-            &fetch.url,
-            &ResourceMeasurement::estimated(fetch.duration_ms, fetch.body_bytes, phases),
+        reduce(
+            fetch,
+            ResourceMeasurement::estimated(fetch.duration_ms, fetch.body_bytes, phases),
         )
     };
     let loading = ResourceMeasurement {
@@ -369,15 +378,15 @@ pub(crate) fn page_resource_timing(
         duration: loaded_ms - navigation.started_ms as f64,
         ..loading
     };
-    let iframe_end = (iframe.started_ms - navigation.started_ms) as f64 + iframe.duration_ms;
-    let mut entries = vec![timing.reduce(&navigation.url, &loading)];
+    let iframe_end = since(iframe) + iframe.duration_ms;
+    let mut entries = vec![reduce(navigation, loading)];
     entries.extend(loads.iter().map(estimate));
-    entries.push(timing.reduce(&navigation.url, &loaded));
-    entries.push(timing.entry(post));
+    entries.push(reduce(navigation, loaded));
+    entries.push(timing.entry(post, navigation.started_ms));
     entries.extend(loads.last().map(estimate));
-    entries.push(timing.reduce(
-        &iframe.url,
-        &ResourceMeasurement::restricted(iframe.duration_ms, iframe_end),
+    entries.push(reduce(
+        iframe,
+        ResourceMeasurement::restricted(iframe.duration_ms, iframe_end),
     ));
     entries
 }

@@ -10,7 +10,9 @@
 
 use std::rc::Rc;
 
-use swc_core::ecma::ast::{AssignOp, Decl, Expr, Function, Id, Ident, Lit, Program, Stmt};
+use swc_core::ecma::ast::{
+    AssignOp, BlockStmt, Decl, Expr, Function, Id, Ident, Lit, Program, Stmt,
+};
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
 use super::analysis::hoisting::{self, Hoisted, Hoisting};
@@ -95,6 +97,10 @@ impl VisitMut for PropagateCopies<'_> {
         hoisting::visit_mut_function(self, function);
     }
 
+    fn visit_mut_block_stmt(&mut self, block: &mut BlockStmt) {
+        hoisting::visit_mut_block(self, block);
+    }
+
     fn visit_mut_ident(&mut self, identifier: &mut Ident) {
         hoisting::reference(self, identifier);
     }
@@ -150,14 +156,19 @@ impl PropagateCopies<'_> {
     }
 
     /// Excludes regex literals, which have identity and state. A copied binding must already
-    /// hold its sole assigned value.
+    /// hold its only assigned value, or be a parameter whose argument is never overwritten.
     fn is_stable(&self, value: &Expr) -> bool {
         match value {
             Expr::Lit(literal) => !matches!(literal, Lit::Regex(_)),
             Expr::Tpl(template) => template.exprs.is_empty(),
             Expr::Ident(identifier) => {
                 let id = identifier.to_id();
-                self.hoisting.facts.contains_key(&id) || self.functions.contains(&id)
+                let unchanged_parameter = self.bindings.is_parameter(&id)
+                    && self.bindings.write_count(&id) == 0
+                    && !self.bindings.is_mapped_parameter(&id);
+                self.hoisting.facts.contains_key(&id)
+                    || self.functions.contains(&id)
+                    || unchanged_parameter
             }
             _ => false,
         }
@@ -189,6 +200,11 @@ mod tests {
         // A read before the write keeps the binding.
         let output = transform("function f(a) { use(a); a = 1; return a; }");
         testing::assert_contains(&output, &["return 1;"], &["use(a); a = 1;"]);
+        // Parameters whose arguments are never overwritten.
+        let output = transform("function f(p, q) { var a, b; a = p; b = q; q = 1; return a + b; }");
+        testing::assert_contains(&output, &["return p + b;"], &[]);
+        let output = transform("function f(p) { var a; a = p; return a + arguments[0]; }");
+        testing::assert_contains(&output, &["return a + arguments[0];"], &[]);
     }
 
     #[test]

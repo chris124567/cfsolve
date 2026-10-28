@@ -47,11 +47,6 @@ pub(crate) const DATES_TODAY: &str = "LKWB0";
 pub(crate) const DATES_OFFSET: &str = "kCaP5";
 pub(crate) const DATES_ZONE: &str = "vFsge3";
 
-/// Where the common wrapper shared by all probes stores its collection function.
-pub(crate) const EMPTY_COLLECTOR: &str = "kplY0";
-/// Properties the wrapper reads without collecting anything.
-pub(crate) const EMPTY_WRAPPER_READS: [&str; 2] = ["xdiN1", "SMMhU4"];
-
 pub(crate) const DOM_MUTATION_RESULT: &str = "yocl1";
 
 // Environment and environment-audit names with session-specific replay patches.
@@ -180,9 +175,6 @@ mod tests {
             (Kind::DateParsingOffsets, DATES_TODAY),
             (Kind::DateParsingOffsets, DATES_OFFSET),
             (Kind::DateParsingOffsets, DATES_ZONE),
-            (Kind::Empty, EMPTY_COLLECTOR),
-            (Kind::Empty, EMPTY_WRAPPER_READS[0]),
-            (Kind::Empty, EMPTY_WRAPPER_READS[1]),
             (Kind::DomMutation, DOM_MUTATION_RESULT),
             (Kind::Environment, ENVIRONMENT_REFERRER),
             (Kind::EnvironmentAudit, ENVIRONMENT_AUDIT_GROUPS),

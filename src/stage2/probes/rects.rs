@@ -1,5 +1,6 @@
 //! Recovers rectangle-probe element IDs for the selector log. Replays the measured result.
 
+use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 
 use crate::stage2::analysis::recognize::ProbeView;
@@ -41,11 +42,18 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     {
         return None;
     }
-    strings.windows(3).find_map(|parts| {
-        if parts[2] != "split" || parts[1].is_empty() {
+    // Match `list.split(separator)`, including lists decoded from percent encoding first.
+    (2..strings.len()).find_map(|at| {
+        let separator = &strings[at - 1];
+        if strings[at] != "split" || separator.is_empty() {
             return None;
         }
-        let ids: Vec<String> = parts[0].split(&parts[1]).map(str::to_owned).collect();
+        let list = match &strings[at - 2] {
+            decode if decode == "decodeURIComponent" => strings.get(at.checked_sub(3)?)?,
+            list => list,
+        };
+        let list = percent_decode_str(list).decode_utf8().ok()?;
+        let ids: Vec<String> = list.split(separator.as_str()).map(str::to_owned).collect();
         let valid = ids.len() == 10
             && ids
                 .iter()

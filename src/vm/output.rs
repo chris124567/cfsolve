@@ -150,6 +150,10 @@ pub struct Failure {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cause {
     PastEnd,
+    /// Reason the dispatch decoder stopped without producing an opcode.
+    Undecoded {
+        reason: String,
+    },
     /// The byte decodes to an opcode the run loop has no case for.
     NoHandler {
         opcode: u8,
@@ -170,6 +174,7 @@ impl Display for Failure {
         let pc = self.pc;
         match &self.cause {
             Cause::PastEnd => write!(f, "pc {pc} is past the end of the program"),
+            Cause::Undecoded { reason } => write!(f, "pc {pc} decodes no opcode: {reason}"),
             Cause::NoHandler { opcode } => write!(f, "no handler for opcode {opcode} at pc {pc}"),
             Cause::Faults { opcode, reasons } => {
                 let reasons = reasons.join("; ");

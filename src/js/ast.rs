@@ -361,15 +361,6 @@ pub(crate) fn returned(function: &Function) -> Option<&Expr> {
     }
 }
 
-/// Returns the sequence operands from a function whose entire body is `return a, b, ...;`.
-#[must_use]
-pub(crate) fn return_sequence(function: &Function) -> Option<&[Box<Expr>]> {
-    if function.is_async || function.is_generator {
-        return None;
-    }
-    Some(returned(function)?.as_seq()?.exprs.as_slice())
-}
-
 /// A block grouping statements that came from one place.
 #[must_use]
 pub(crate) fn block(statements: Vec<Stmt>) -> Stmt {
