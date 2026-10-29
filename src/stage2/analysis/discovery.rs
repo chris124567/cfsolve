@@ -104,14 +104,23 @@ pub(super) fn discover(index: &Index<'_>, pool: &str) -> Result<ProbeDiscovery> 
         let index_one = position + 1;
         let created = &graph[phases[0]].code;
         let values = descriptors(listing, strings, created, *dispatcher.start(), pool)?;
+        let (input_position, input): (usize, JsValue) = values
+            .iter()
+            .enumerate()
+            .find_map(|(position, text)| {
+                serde_json::from_str(text)
+                    .ok()
+                    .map(|input| (position, input))
+            })
+            .with_context(|| format!("probe {index_one} has no input"))?;
+        // The token is the longest other descriptor: the record's opaque value, beside its
+        // field names and its JSON input. Its version markers change between builds.
         let token = values
             .iter()
-            .find(|text| text.contains("-1.2.1.1-"))
-            .context("probe has no token")?;
-        let input: JsValue = values
-            .iter()
-            .find_map(|text| serde_json::from_str(text).ok())
-            .with_context(|| format!("probe {index_one} has no input"))?;
+            .enumerate()
+            .filter_map(|(position, text)| (position != input_position).then_some(text))
+            .max_by_key(|text| text.len())
+            .with_context(|| format!("probe {index_one} has no token: {values:?}"))?;
         let body = &listing.instructions[&states[phases[1]]];
         let function = body
             .effects()
