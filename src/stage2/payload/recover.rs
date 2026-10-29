@@ -14,6 +14,11 @@ use crate::listing::Index;
 use crate::listing::fold::{self, Frame, Known, PAYLOAD_CELL};
 use crate::vm::{Constant, Effect, Term};
 
+/// Minimum length of a record's opaque token and input values. Field names run five or six
+/// characters, and short enums and sitekeys stay well below this, while record values run
+/// sixty characters and up.
+const OPAQUE_LENGTH: usize = 32;
+
 /// Additional values tracked during payload folding. Treats decoded literals as ordinary
 /// literals because only their values matter here.
 #[derive(Clone, PartialEq)]
@@ -363,30 +368,42 @@ impl Scan {
                 objects.entry(id).or_default().push(write);
             }
         }
-        let records = objects.into_values().filter_map(|fields| {
-            // The first string literal written to the record that contains `marker`.
-            let literal = |marker: &str| {
-                fields.iter().find_map(|write| match &write.value {
-                    Written::Expression(Expression::Literal {
-                        value: JsValue::String(text),
-                    }) if text.contains(marker) => Some((write.key.clone(), text.clone())),
-                    _ => None,
-                })
-            };
-            let (token_field, token) = literal("-1.2.1.1-")?;
-            let (input_field, input) = literal("-1.3.1.1-")?;
-            let started = fields
-                .iter()
-                .find(|write| matches!(write.value, Written::Now))?;
-            Some(RecordTemplate {
-                token_field,
-                token,
-                input_field,
-                input: json!(input),
-                started_field: started.key.clone(),
-            })
-        });
+        let records = objects
+            .into_values()
+            .filter_map(|fields| Self::record_template(&fields));
         candidates::exactly_one(records, "checkbox program token/input record construction")
+    }
+
+    /// The record template held by one object's fields, if those fields carry a start mark
+    /// and exactly two opaque string values.
+    fn record_template(fields: &[&Write]) -> Option<RecordTemplate> {
+        let started = fields
+            .iter()
+            .find(|write| matches!(write.value, Written::Now))?;
+        // The record's opaque values run long; field names and enums stay short. The old
+        // `-1.2.1.1-`/`-1.3.1.1-` version markers are gone in new builds, so the token is
+        // the shorter opaque value and the input the longer one.
+        let mut opaque_values: Vec<(&str, &str)> = Vec::new();
+        for write in fields {
+            if let Written::Expression(Expression::Literal {
+                value: JsValue::String(text),
+            }) = &write.value
+                && text.len() >= OPAQUE_LENGTH
+            {
+                opaque_values.push((write.key.as_str(), text.as_str()));
+            }
+        }
+        opaque_values.sort_by_key(|(_, text)| text.len());
+        let [(token_field, token), (input_field, input)] = opaque_values.as_slice() else {
+            return None;
+        };
+        Some(RecordTemplate {
+            token_field: (*token_field).to_owned(),
+            token: (*token).to_owned(),
+            input_field: (*input_field).to_owned(),
+            input: json!(*input),
+            started_field: started.key.clone(),
+        })
     }
 }
 
