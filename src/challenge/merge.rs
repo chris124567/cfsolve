@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use swc_core::ecma::ast::{
-    AssignTarget, BinaryOp, CallExpr, Callee, Expr, FnDecl, SimpleAssignTarget, Stmt, UnaryOp,
+    AssignTarget, BinaryOp, CallExpr, Callee, Decl, Expr, FnDecl, SimpleAssignTarget, Stmt, UnaryOp,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
@@ -288,6 +288,13 @@ fn writes(function: &FnDecl) -> Vec<OptionWrite> {
             writes.push(write);
             continue;
         }
+        if let Stmt::Decl(Decl::Var(declaration)) = statement {
+            staged.extend(declaration.decls.iter().filter_map(|declarator| {
+                let local = &*declarator.name.as_ident()?.id.sym;
+                Some((local, expression::option_key(declarator.init.as_deref()?)?))
+            }));
+            continue;
+        }
         let Some(assignment) = expression::assignment(statement) else {
             continue;
         };
@@ -460,6 +467,32 @@ mod tests {
         ] {
             let source = format!("{SOURCE}\n{caller}");
             assert!(Mapping::from_javascript(&source).is_ok(), "{caller}");
+        }
+    }
+
+    /// Stored state may override an option copied through a local. Some builds declare the local
+    /// with its value; others assign it separately.
+    #[test]
+    fn recovers_options_copied_through_locals() {
+        for staging in [
+            "var z8 = e._cf_chl_opt.qBdzw2;",
+            "z8 = e._cf_chl_opt.qBdzw2;",
+        ] {
+            let source = SOURCE.replace(
+                "e._cf_chl_opt.WbdgY0 = z2;",
+                &format!(
+                    "{staging} try {{ z8 = localStorage.getItem(`u`) || z8; }} catch (z9) {{}} e._cf_chl_opt.WbdgY0 = z8;"
+                ),
+            );
+            let mapping = Mapping::from_javascript(&source).expect("modified source parses");
+            let copied = OptionSource::Copied("qBdzw2".into());
+            assert!(
+                mapping
+                    .0
+                    .iter()
+                    .any(|entry| entry.option == "WbdgY0" && entry.source == copied),
+                "WbdgY0 is not copied from qBdzw2 after {staging}"
+            );
         }
     }
 

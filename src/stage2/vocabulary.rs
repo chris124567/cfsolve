@@ -218,6 +218,11 @@ fn best_partners<'a>(
     best.into_values().map(|(pair, _)| pair).collect()
 }
 
+/// The lowest similarity that pairs two probes. Below it, probes share mostly common wrapper
+/// strings: unrelated probes score at most 0.2. The devtools probe scores only about 0.5 against
+/// its reference, and drops to 0.49 in programs that never name `document`.
+const MIN_PAIR_SIMILARITY: f64 = 0.35;
+
 /// Pairs probes by descending Jaccard similarity of stable strings, using each reference probe
 /// at most once. Also retains each session probe's closest reference match regardless of
 /// pairing.
@@ -254,8 +259,7 @@ fn pair_probes<S: AsRef<[String]>>(
     let mut used = HashSet::new();
     let mut pairs = vec![None; session.len()];
     for (index, candidate) in pairings {
-        // Below this threshold, probes share mostly common wrapper strings.
-        if candidate.similarity < 0.5 {
+        if candidate.similarity < MIN_PAIR_SIMILARITY {
             break;
         }
         if pairs[index].is_none() && used.insert(candidate.reference) {
@@ -536,6 +540,24 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// A probe that shares only three of seven stable strings with its reference still pairs,
+    /// as the devtools probe must when a program never names `document`.
+    #[test]
+    fn pairs_a_probe_below_half_similarity() {
+        let session = [
+            strings("debug stack console"),
+            strings("fetch then"),
+            strings("now floor"),
+        ];
+        let reference = [
+            strings("debug stack console document create remove append"),
+            strings("fetch then"),
+            strings("now floor"),
+        ];
+        let (pairs, _) = pair_probes(&session, &reference);
+        assert_eq!(pairs, [Some(1), Some(2), Some(3)]);
     }
 
     #[test]
