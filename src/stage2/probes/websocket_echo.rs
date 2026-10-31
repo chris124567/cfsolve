@@ -126,7 +126,13 @@ impl Fields {
 ///   or before opening. The close status follows.
 /// - The platform option precedes the URL suffix `/w`.
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
-    let strings = probe.session_features;
+    let mut strings: Vec<String> = probe
+        .session_features
+        .iter()
+        .filter(|text| !matches!(text.as_str(), "Date" | "Math" | "length"))
+        .cloned()
+        .collect();
+    strings.dedup();
     let markers = ["WebSocket", "onopen", "onmessage", "onclose", "isFinite"];
     if !markers
         .iter()
@@ -141,12 +147,21 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     };
     let before = |sequence: &[&str]| strings.get(find(sequence)?.checked_sub(1)?).cloned();
 
-    let length = find(&["length"])?;
-    let [status, sent, received, opened, _error] = strings.get(length.checked_sub(5)?..length)?
+    let start = find(&["readyState", "close"])? + 2;
+    let candidates: std::collections::BTreeSet<_> = strings[start..]
+        .windows(7)
+        .filter(|fields| {
+            fields[..5]
+                .iter()
+                .all(|name| probe.writes.fields.contains(name))
+                && fields[5..].iter().all(|name| {
+                    super::super::vocabulary::is_name(name) && !probe.writes.fields.contains(name)
+                })
+        })
+        .collect();
+    let [status, sent, received, opened, _error, complete, incomplete] =
+        crate::candidates::exactly_one(candidates, "WebSocket summary").ok()?
     else {
-        return None;
-    };
-    let [complete, incomplete] = strings.get(length + 1..length + 3)? else {
         return None;
     };
     let finite = find(&["isFinite"])?;
@@ -163,11 +178,11 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         received: received.clone(),
         opened: opened.clone(),
         round_trips: before(&["JSON", "stringify"])?,
-        elapsed: before(&["String", "Date", "now"])?,
+        elapsed: before(&["String", "now"])?,
         statuses: Statuses {
             complete: complete.clone(),
             incomplete: incomplete.clone(),
-            timed_out: before(&["String", "Math", "round"])?,
+            timed_out: before(&["String", "round"])?,
             failed_before_open: failed_before_open.clone(),
             failed_after_open: failed_after_open.clone(),
             closed: closed.clone(),
@@ -191,6 +206,68 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovers_summary_after_string_conversion_reads() {
+        use crate::{
+            listing::Index,
+            stage2::{analysis::recognize::Strings, records::WriteOrder, vocabulary::Vocabulary},
+            vm::Listing,
+        };
+        use std::collections::BTreeSet;
+
+        let mut features: Vec<String> = "WebSocket readyState close Status1 Sent1 String Sent1 Recv1 String Recv1 Open1 Trips1 JSON stringify Elapsed1 String now Error1 Status1 Sent1 Recv1 Open1 Error1 Done1 Short1 send Time1 String round isFinite"
+            .split_whitespace().map(str::to_owned).collect();
+        features.push(String::new());
+        features.extend(
+            "After1 Before1 Closed1 Route1 /w onopen onmessage onclose"
+                .split_whitespace()
+                .map(str::to_owned),
+        );
+        let writes = WriteOrder {
+            fields: "Status1 Sent1 Recv1 Open1 Error1 Trips1 Elapsed1"
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect(),
+            ..WriteOrder::default()
+        };
+        let listing = Listing::default();
+        let index = Index::new(&listing);
+        let vocabulary = Vocabulary::infer::<&[String]>(&[]);
+        let empty = BTreeSet::new();
+        let recover = |features: &[String]| {
+            recognize(&ProbeView {
+                index: &index,
+                vocabulary: &vocabulary,
+                position: 0,
+                header: &empty,
+                wrapper: &empty,
+                pool: "",
+                entry: 0,
+                session_features: features,
+                writes: &writes,
+                strings: Strings::new(features, &empty),
+            })
+        };
+        let fields = recover(&features).unwrap();
+        assert_eq!(fields.status, "Status1");
+        assert_eq!(fields.sent, "Sent1");
+        assert_eq!(fields.received, "Recv1");
+        assert_eq!(fields.opened, "Open1");
+        assert_eq!(fields.round_trips, "Trips1");
+        assert_eq!(fields.elapsed, "Elapsed1");
+        assert_eq!(fields.statuses.complete, "Done1");
+        assert_eq!(fields.statuses.incomplete, "Short1");
+        features.extend(
+            "Status1 Sent1 Recv1 Open1 Error1 Other1 Other2"
+                .split_whitespace()
+                .map(str::to_owned),
+        );
+        assert!(
+            recover(&features).is_none(),
+            "ambiguous summaries must not be guessed"
+        );
+    }
 
     fn fields() -> Fields {
         Fields {

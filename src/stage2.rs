@@ -20,6 +20,7 @@ pub mod records;
 pub(crate) mod reference;
 pub mod registry;
 pub mod replay;
+pub(crate) mod session_names;
 pub mod trace;
 pub mod vocabulary;
 mod worker_timing;

@@ -66,6 +66,7 @@ impl Analysis {
             function: (evidence.function.pc, evidence.function.key),
             operation: probe.operation.as_ref(),
             features: &probe.features,
+            expanded_features: &probe.expanded_features,
             writes: &probe.writes,
             reference: evidence.reference,
         });
@@ -111,6 +112,7 @@ struct ProbeArtifact<'analysis> {
     function: (u32, u8),
     operation: Option<&'analysis Operation>,
     features: &'analysis [String],
+    expanded_features: &'analysis [String],
     writes: &'analysis WriteOrder,
     reference: Option<usize>,
 }
@@ -120,7 +122,8 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     // Include `cf-chl-peek` when resolving hashed comparisons. The worker-fetch probe reads
     // this header but does not store its name as a program string.
     let machine = source.machine()?;
-    let listing = machine.disassemble_from(program, &[machine.entry()], &["cf-chl-peek"])?;
+    let mut listing = machine.disassemble_from(program, &[machine.entry()], &["cf-chl-peek"])?;
+    crate::listing::normalize::constants(&mut listing);
     let index = Index::new(&listing);
     let (pool_pc, pool) = index.pool()?;
     let discovery = discovery::discover(&index, pool)?;
@@ -130,14 +133,12 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
         .map(|probe| probe.features.as_slice())
         .collect();
     let mut vocabulary = Vocabulary::infer(&session_features);
-    for (position, raw) in discovery.probes.iter().enumerate() {
-        if vocabulary.partner(position) == Some(AUDIT_PROBE)
-            && let Some(names) = audit::names(&index, &raw.writes.fields)
-        {
-            vocabulary.pin(position, names);
-        }
-    }
-    let header: BTreeSet<String> = index.header().values().cloned().collect();
+    let expanded_features: Vec<&[String]> = discovery
+        .probes
+        .iter()
+        .map(|probe| probe.expanded_features.as_slice())
+        .collect();
+    vocabulary.extend_expanded(&expanded_features);
     let mut wrapper: BTreeSet<String> = discovery
         .probes
         .first()
@@ -146,12 +147,32 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     for probe in &discovery.probes {
         wrapper.retain(|text| probe.features.contains(text));
     }
+    for (position, raw) in discovery.probes.iter().enumerate() {
+        if let Some(reference) = vocabulary.partner(position) {
+            vocabulary.pin(
+                position,
+                super::outputs::names(&index, raw.function.pc, reference, &wrapper),
+            );
+        }
+        if vocabulary.partner(position) == Some(AUDIT_PROBE)
+            && let Some(names) = audit::names(&index, &raw.writes.fields)
+        {
+            vocabulary.pin(position, names);
+        }
+    }
+    let mut header: BTreeSet<String> = index.header().values().cloned().collect();
+    header.extend(envelope::counter(&index, &discovery.creation));
     let mut probes = Vec::new();
     let mut evidence = Vec::new();
     for (position, raw) in discovery.probes.into_iter().enumerate() {
         let to_reference = |text: &String| vocabulary.to_reference(position, text).to_owned();
         let features: Vec<String> = raw.features.iter().map(to_reference).collect();
-        let outputs: BTreeSet<String> = raw.outputs.iter().map(to_reference).collect();
+        let outputs: BTreeSet<String> = raw
+            .outputs
+            .iter()
+            .filter(|name| raw.writes.fields.contains(name))
+            .map(to_reference)
+            .collect();
         let reference = vocabulary.partner(position);
         // Treat an unrecognized computed probe as a device fact and replay its paired reference
         // answer.
@@ -174,6 +195,7 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
             input: raw.input,
             operation,
             features: raw.features,
+            expanded_features: raw.expanded_features,
             writes: raw.writes,
         });
         evidence.push(ProbeEvidence {

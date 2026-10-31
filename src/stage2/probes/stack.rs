@@ -72,8 +72,17 @@ fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Optio
 
     let decoded: Vec<Vec<u8>> = features
         .iter()
-        .filter_map(|text| STANDARD.decode(text).ok())
-        .filter(|bytes| (3..=12).contains(&bytes.len()))
+        .filter_map(|text| {
+            let decoded;
+            let text = if text.starts_with('\0') {
+                decoded = crate::listing::decode_string(text, "").ok()?;
+                &decoded
+            } else {
+                text
+            };
+            STANDARD.decode(text).ok()
+        })
+        .filter(|bytes| (3..=25).contains(&bytes.len()))
         .collect();
     for candidate in decoded.iter().filter(|bytes| bytes.len() == "stack".len()) {
         let key = [candidate[0] ^ b's', candidate[1] ^ b't'];
@@ -90,13 +99,7 @@ fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Optio
         // Plain strings such as `this` can also be valid base64. Restrict candidates to the
         // four-to-nine-character program names.
         let names = decoded.iter().filter_map(reveal).filter(|name| {
-            (4..=9).contains(&name.len())
-                && name.starts_with(|first: char| first.is_ascii_alphabetic())
-                && name
-                    .chars()
-                    .all(|character| character.is_ascii_alphanumeric())
-                && name != "stack"
-                && !header.contains(name)
+            crate::stage2::vocabulary::is_name(name) && name != "stack" && !header.contains(name)
         });
         if let Ok(result) = candidates::exactly_one(names, "stack result field") {
             return Some(result);
@@ -140,6 +143,33 @@ fn result_field(features: &[String], header: &BTreeSet<String>) -> Option<String
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     result_field(probe.session_features, probe.header)
         .or_else(|| encoded_result_field(probe.session_features, probe.header))
+        .or_else(|| {
+            use base64::Engine;
+            use base64::engine::general_purpose::STANDARD;
+            calls(probe.index, probe.entry)?;
+            let encoded_stack = probe.session_features.iter().any(|text| {
+                let Ok(bytes) = STANDARD.decode(text) else {
+                    return false;
+                };
+                bytes.len() == 5
+                    && bytes
+                        .iter()
+                        .zip(b"stack")
+                        .enumerate()
+                        .all(|(i, (byte, plain))| byte ^ plain == bytes[i % 2] ^ b"stack"[i % 2])
+            });
+            if !encoded_stack {
+                return None;
+            }
+            let fields = probe.writes.fields.iter().filter(|name| {
+                crate::stage2::vocabulary::is_name(name)
+                    && !probe.header.contains(*name)
+                    && !probe.wrapper.contains(*name)
+            });
+            candidates::exactly_one(fields, "plain stack result")
+                .ok()
+                .cloned()
+        })
         .map(|result| Fields {
             result,
             calls: calls(probe.index, probe.entry),

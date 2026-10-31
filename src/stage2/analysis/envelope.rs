@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
+use swc_core::ecma::ast::BinaryOp;
 
 use crate::js::JsValue;
 use crate::listing::fold::{Frame, Known};
@@ -11,6 +12,22 @@ use crate::listing::{Index, query};
 use crate::stage2::payload::RecordLiteral;
 use crate::stage2::records::{Completion, Envelope, INITIAL_STATUS, Probe};
 use crate::vm::{Effect, Term};
+
+pub(super) fn counter(index: &Index<'_>, creation: &BTreeSet<u32>) -> Option<String> {
+    let fields: BTreeSet<String> = index
+        .stores()
+        .iter()
+        .filter(|store| creation.contains(&store.pc))
+        .filter(|store| {
+            matches!(
+                index.dereference(store.pc, &store.value),
+                Some((_, Term::Binary(BinaryOp::Add, _, _)))
+            )
+        })
+        .map(|store| store.key.clone())
+        .collect();
+    crate::candidates::exactly_one(fields, "record counter").ok()
+}
 
 /// Recovers record-envelope fields: creation counter, literal token and input, wrapper status
 /// and message, and completion timestamps and duration.
@@ -23,18 +40,7 @@ pub(super) fn recover(
     literals: &[RecordLiteral],
 ) -> Result<Envelope> {
     let listing = index.listing();
-    let header = index.header();
-    let counter = creation
-        .iter()
-        .filter_map(|pc| listing.instructions.get(pc))
-        .flat_map(|instruction| instruction.effects())
-        .find_map(|effect| match effect {
-            Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => {
-                header.get(&register).cloned()
-            }
-            _ => None,
-        })
-        .context("record counter field not found")?;
+    let counter = counter(index, creation).context("record counter field not found")?;
     let written_from = |matches: &dyn Fn(&Probe, &JsValue) -> bool| {
         literals
             .iter()
@@ -60,7 +66,7 @@ pub(super) fn recover(
     let wrapper_field = |what: &str, wanted: fn(&Known<Term>) -> bool| {
         wrapper
             .iter()
-            .find(|(field, value)| header.values().any(|name| name == field) && wanted(value))
+            .find(|(_, value)| wanted(value))
             .map(|(field, _)| field.clone())
             .with_context(|| format!("record {what} field not found"))
     };

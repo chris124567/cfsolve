@@ -98,6 +98,9 @@ impl Plan {
 
 /// Analyzes a returned checkbox program's listing.
 pub fn recover(listing: &Listing) -> Result<Plan> {
+    let mut normalized = listing.clone();
+    crate::listing::normalize::constants(&mut normalized);
+    let listing = &normalized;
     ensure!(
         listing.failures.is_empty(),
         "checkbox program has undecoded instructions"

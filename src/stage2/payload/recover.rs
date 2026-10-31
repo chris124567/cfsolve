@@ -191,7 +191,20 @@ pub(in crate::stage2) fn recover_unique<'listing>(
     let scan = scan(index, pool);
     let mut layouts = Vec::new();
     let mut failure = None;
-    for counter in index.header().values() {
+    let mut counters: BTreeSet<&String> = index.header().values().collect();
+    counters.extend(
+        index
+            .stores()
+            .iter()
+            .filter(|store| {
+                matches!(
+                    index.dereference(store.pc, &store.value),
+                    Some((_, Term::Binary(BinaryOp::Add, _, _)))
+                )
+            })
+            .map(|store| &store.key),
+    );
+    for counter in counters {
         match scan.layout(counter) {
             Ok(layout) => layouts.push((counter.clone(), layout)),
             Err(error) => failure = Some(error),

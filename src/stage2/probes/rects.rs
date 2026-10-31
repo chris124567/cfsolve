@@ -42,6 +42,22 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     {
         return None;
     }
+    let arrays = probe
+        .index
+        .string_arrays(probe.entry)
+        .into_iter()
+        .filter(|items| {
+            items.len() == 10
+                && items.iter().all(|text| {
+                    !text.is_empty()
+                        && text
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                })
+        });
+    if let Ok(ids) = crate::candidates::exactly_one(arrays, "rectangle IDs") {
+        return Some(Fields { ids });
+    }
     // Match `list.split(separator)`, including lists decoded from percent encoding first.
     (2..strings.len()).find_map(|at| {
         let separator = &strings[at - 1];

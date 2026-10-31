@@ -16,6 +16,7 @@ mod controller;
 mod discovery;
 mod envelope;
 mod outcome;
+mod outputs;
 pub(crate) mod recognize;
 
 pub use analyze::{Analysis, Artifact, ProbeEvidence, analyze};

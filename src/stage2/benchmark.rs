@@ -166,7 +166,12 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     let source = strings
         .iter()
         .find(|text| text.contains("WebAssembly.instantiate"))?;
-    let parsed = ast::parse_javascript("benchmark worker", source).ok()?;
+    let parsed = ast::parse_javascript("benchmark worker", source)
+        .or_else(|_| {
+            let decoded = listing::decode_string(source, "")?;
+            ast::parse_javascript("benchmark worker", &decoded)
+        })
+        .ok()?;
     let mut worker = Worker::default();
     parsed.script.visit_with(&mut worker);
     // Only the kernels the recorded speeds measure are supported. Field names are recovered
@@ -199,8 +204,12 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         .find(|items| items.len() == order.len() && *items != order)?;
     // The worker's source begins `var plan={<order>:[...],<iterations>:[...],`,
     // and the record takes the same two names.
-    let identifier =
-        |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    let identifier = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
     let [order_field, iterations_field]: [String; 2] = strings
         .iter()
         .skip_while(|text| *text != "var plan={")
@@ -398,5 +407,4 @@ mod tests {
             );
         }
     }
-
 }

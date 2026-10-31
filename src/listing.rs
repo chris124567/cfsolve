@@ -7,6 +7,7 @@
 
 pub(crate) mod fold;
 mod index;
+pub(crate) mod normalize;
 pub(crate) mod query;
 mod strings;
 

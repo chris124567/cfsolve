@@ -30,6 +30,13 @@ pub(crate) static REFERENCE: LazyLock<Reference> = LazyLock::new(|| {
     reference
 });
 
+/// Collection strings including uses of names held in header registers. The original
+/// reference remains the stored-answer identity; this supplements its alignment evidence.
+pub(crate) static EXPANDED_REFERENCE: LazyLock<Reference> = LazyLock::new(|| {
+    serde_json::from_str(include_str!("reference-expanded.json"))
+        .expect("the expanded reference is valid JSON")
+});
+
 /// The challenge option (`_cf_chl_opt`) naming the platform segment of a probe's request path.
 pub(crate) const PLATFORM_OPTION: &str = "fDDOx7";
 /// The option holding the session's ray, which the worker fetch requests.
@@ -48,6 +55,13 @@ pub(crate) const DATES_OFFSET: &str = "kCaP5";
 pub(crate) const DATES_ZONE: &str = "vFsge3";
 
 pub(crate) const DOM_MUTATION_RESULT: &str = "yocl1";
+
+pub(crate) const NATIVE_INSPECTION_OUTPUTS: [&str; 5] =
+    ["gOEm7", "rLrku6", "XEUHT5", "hRxVQ2", "vxrRf4"];
+pub(crate) const COMPUTED_STYLE_MAP: &str = "dKjG5";
+pub(crate) const FONT_FACE_OUTPUTS: [&str; 4] = ["IzIpb8", "kxzY1", "EgIt8", "LvRtb9"];
+pub(crate) const FONT_CANVAS_OUTPUTS: [&str; 3] = ["sibaD1", "uoBG2", "jrVX6"];
+pub(crate) const FONT_DOM_OUTPUTS: [&str; 2] = ["SUBTl0", "vqzXM2"];
 
 // Environment and environment-audit names with session-specific replay patches.
 

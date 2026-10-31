@@ -82,7 +82,43 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
     }
     window.extend(profile.window.clone());
 
-    let replay = answers.map(|answers| Replay::new(answers, plan));
+    let replay = answers
+        .map(|answers| Replay::for_session(answers, plan, &session.fetched.source))
+        .transpose()?;
+    let css_override =
+        if let Some(answers) = answers.filter(|answers| !answers.stylesheets.is_empty()) {
+            let probe = plan
+                .probes()
+                .iter()
+                .find(|probe| plan.vocabulary().partner(probe.position()) == Some(34))
+                .context("no stylesheet probe")?;
+            let marker = probe
+                .features
+                .iter()
+                .find(|text| {
+                    text.strip_prefix('.')
+                        .is_some_and(crate::stage2::vocabulary::is_name)
+                })
+                .context("no stylesheet marker")?;
+            let (hash, marker_css) = crate::stage2::probes::stylesheets::measurement(
+                &answers.stylesheets,
+                &session.fetched.iframe.html,
+                marker,
+            )?;
+            Some((
+                probe.index.to_string(),
+                plan.vocabulary()
+                    .to_session(probe.position(), "VukLq9")
+                    .to_owned(),
+                hash,
+                plan.vocabulary()
+                    .to_session(probe.position(), "QqUE6")
+                    .to_owned(),
+                marker_css,
+            ))
+        } else {
+            None
+        };
     let pending_ms = i64::from(profile.pending_ms);
     let schedule = timing::schedule(
         &durations(plan, &profile.durations, &observed, replay.as_ref()),
@@ -132,6 +168,14 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
         &profile.document,
         pending_ms,
     )?;
+    if let Some((probe, field, hash, marker, css)) = css_override {
+        let record = plaintext
+            .get_mut(&probe)
+            .and_then(JsValue::as_object_mut)
+            .context("missing stylesheet record")?;
+        record.insert(field, json!(hash));
+        record.insert(marker, json!(css));
+    }
     ensure!(
         plaintext.len() > plan.probes().len(),
         "the assembled payload holds nothing besides records"

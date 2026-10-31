@@ -40,6 +40,11 @@ struct CapturedPayload {
 }
 
 impl CapturedSession {
+    #[must_use]
+    pub fn iframe_html(&self) -> &str {
+        &self.iframe_html
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         read_json(path)
     }

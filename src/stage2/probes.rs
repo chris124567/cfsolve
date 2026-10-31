@@ -17,6 +17,7 @@ mod platform;
 pub(crate) mod private_token;
 pub(super) mod rects;
 pub(super) mod stack;
+pub(crate) mod stylesheets;
 pub(crate) mod websocket_echo;
 pub(crate) mod worker_fetch;
 pub(super) mod worker_navigator;

@@ -57,8 +57,10 @@ impl<'probe> Strings<'probe> {
     /// Decodes the inline descriptor after the first occurrence of `text` that has one.
     #[must_use]
     pub(crate) fn decoded_after(&self, text: &str) -> Option<String> {
-        let pair = self.features.windows(2).find(|pair| pair[0] == text)?;
-        listing::decode_string(&pair[1], "").ok()
+        self.features
+            .windows(2)
+            .filter(|pair| pair[0] == text && pair[1].starts_with('\0'))
+            .find_map(|pair| listing::decode_string(&pair[1], "").ok())
     }
 
     /// Returns the first inline-decoded string starting with `prefix`.

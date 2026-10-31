@@ -13,11 +13,11 @@ use std::ops::Range;
 
 use rustc_hash::FxHashMap;
 
-use super::reference::REFERENCE;
+use super::reference::{EXPANDED_REFERENCE, REFERENCE};
 use crate::js::{JsObject, JsValue};
 
 /// Session names and the reference names they stand for.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Vocabulary {
     /// One-to-one name mapping for the whole program.
     global: Names,
@@ -39,7 +39,7 @@ pub struct Candidate {
 }
 
 /// A one-to-one map between session and reference names.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Names {
     to_reference: HashMap<String, String>,
     to_session: HashMap<String, String>,
@@ -76,20 +76,102 @@ impl Names {
 }
 
 impl Vocabulary {
+    pub(crate) fn extend_expanded<S: AsRef<[String]>>(&mut self, session: &[S]) {
+        let session = without_common_names(&expand_lists(session));
+        let public: HashSet<&str> = REFERENCE
+            .probes
+            .iter()
+            .flatten()
+            .chain(EXPANDED_REFERENCE.probes.iter().flatten())
+            .map(String::as_str)
+            .collect();
+        let clean: Vec<Vec<String>> = session
+            .iter()
+            .map(|strings| {
+                strings
+                    .iter()
+                    .filter(|text| {
+                        !is_log_message(text)
+                            && !text.contains('\0')
+                            && !text.starts_with("ÿÿ")
+                            && (alignment_name(text) || public.contains(text.as_str()))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        let mut all = Votes::new();
+        for (position, strings) in clean.iter().enumerate() {
+            let Some(partner) = self.partner(position) else {
+                continue;
+            };
+            let reference = &EXPANDED_REFERENCE.probes[partner - 1];
+            if reference.is_empty() {
+                continue;
+            }
+            let mut votes = Votes::new();
+            for pair in aligned_names_with(strings, reference, true) {
+                *votes.entry(pair).or_default() += 1;
+                *all.entry(pair).or_default() += 1;
+            }
+            for (session, reference) in Names::one_to_one(&votes).to_reference {
+                self.probes[position].pair(session, reference);
+            }
+        }
+        for (session, reference) in Names::one_to_one(&all).to_reference {
+            self.global.pair(session, reference);
+        }
+    }
+
     /// Infers name mappings from each probe's collection strings.
     #[must_use]
     pub fn infer<S: AsRef<[String]>>(session: &[S]) -> Self {
         Self::between(session, &REFERENCE.probes)
     }
 
-    fn between<S: AsRef<[String]>>(session: &[S], reference: &[Vec<String>]) -> Self {
-        let (partners, candidates) = pair_probes(session, reference);
+    pub(crate) fn between<S: AsRef<[String]>>(session: &[S], reference: &[Vec<String>]) -> Self {
+        let encoded_names = session
+            .iter()
+            .any(|probe| probe.as_ref().iter().any(|name| hashed_name(name)))
+            || reference.iter().flatten().any(|name| hashed_name(name));
+        let (mut partners, mut candidates) = pair_probes(session, reference);
+        if !encoded_names {
+            let mut all = Votes::new();
+            let mut probes = Vec::with_capacity(session.len());
+            for (index, strings) in session.iter().enumerate() {
+                let mut votes = Votes::new();
+                if let Some(partner) = partners[index] {
+                    for pair in aligned_names(strings.as_ref(), &reference[partner - 1]) {
+                        *votes.entry(pair).or_default() += 1;
+                        *all.entry(pair).or_default() += 1;
+                    }
+                }
+                probes.push(Names::one_to_one(&votes));
+            }
+            return Self {
+                global: Names::one_to_one(&all),
+                probes,
+                partners,
+                candidates,
+            };
+        }
+        let session = expand_lists(session);
+        let reference = expand_lists(reference);
+        let (expanded, expanded_candidates) = pair_probes(&session, &reference);
+        for (index, partner) in expanded.into_iter().enumerate() {
+            if partners[index].is_none() && partner.is_some() && !partners.contains(&partner) {
+                partners[index] = partner;
+                candidates[index] = expanded_candidates[index];
+            }
+        }
+        let session = without_common_names(&session);
+        let reference = without_common_names(&reference);
         let mut all = Votes::new();
         let mut probes = Vec::with_capacity(session.len());
         for (index, strings) in session.iter().enumerate() {
             let mut votes = Votes::new();
             if let Some(partner) = partners[index] {
-                for pair in aligned_names(strings.as_ref(), &reference[partner - 1]) {
+                for pair in aligned_names_with(strings.as_slice(), &reference[partner - 1], true) {
                     *votes.entry(pair).or_default() += 1;
                     *all.entry(pair).or_default() += 1;
                 }
@@ -118,6 +200,76 @@ impl Vocabulary {
         for (session, reference) in pairs {
             // Identical names are kept too, so the program-wide map cannot rename them.
             names.pair(session, reference.to_owned());
+        }
+    }
+
+    pub(crate) fn refine_outputs(
+        &mut self,
+        position: usize,
+        features: &[String],
+        writes: &[String],
+        internal: &[String],
+        common: &HashSet<&str>,
+        wanted: &[String],
+    ) {
+        let Some(partner) = self.partner(position) else {
+            return;
+        };
+        if !writes.iter().any(|name| hashed_name(name)) {
+            return;
+        }
+        let candidates: Vec<String> = writes
+            .iter()
+            .filter(|name| {
+                let reference = self.to_reference(position, name);
+                if !hashed_name(name)
+                    || common.contains(name.as_str())
+                    || (internal.contains(name) && !wanted.iter().any(|field| field == reference))
+                {
+                    return false;
+                }
+                reference == name.as_str() || wanted.iter().any(|field| field == reference)
+            })
+            .cloned()
+            .collect();
+        if candidates.len() == wanted.len()
+            && wanted.iter().zip(&candidates).all(|(name, candidate)| {
+                let mapped = self.to_session(position, name);
+                mapped == name || mapped == candidate
+            })
+        {
+            self.pin(
+                position,
+                candidates
+                    .iter()
+                    .cloned()
+                    .zip(wanted.iter().map(String::as_str)),
+            );
+        }
+        let keep = |text: &String, names: &[String]| !alignment_name(text) || names.contains(text);
+        let session: Vec<String> = features
+            .iter()
+            .filter(|text| keep(text, &candidates))
+            .cloned()
+            .collect();
+        let reference: Vec<String> = REFERENCE.probes[partner - 1]
+            .iter()
+            .filter(|text| keep(text, wanted))
+            .cloned()
+            .collect();
+        let mut votes = Votes::new();
+        for pair in aligned_names_with(&session, &reference, true) {
+            if candidates.iter().any(|name| name == pair.0)
+                && wanted.iter().any(|name| name == pair.1)
+            {
+                *votes.entry(pair).or_default() += 1;
+            }
+        }
+        for (session, reference) in Names::one_to_one(&votes).to_reference {
+            let mapped = self.to_session(position, &reference);
+            if mapped == reference || !writes.iter().any(|name| name == mapped) {
+                self.pin(position, [(session, reference.as_str())]);
+            }
         }
     }
 
@@ -176,13 +328,100 @@ impl Vocabulary {
     }
 }
 
+fn expand_lists<S: AsRef<[String]>>(probes: &[S]) -> Vec<Vec<String>> {
+    probes
+        .iter()
+        .map(|probe| {
+            let decoded: HashMap<&str, String> = probe
+                .as_ref()
+                .windows(2)
+                .filter_map(|pair| {
+                    let text = if pair[1] == "decodeURIComponent" {
+                        &pair[0]
+                    } else if pair[0] == "decodeURIComponent" {
+                        &pair[1]
+                    } else {
+                        return None;
+                    };
+                    let bytes = text.as_bytes();
+                    if bytes.iter().enumerate().any(|(at, byte)| {
+                        *byte == b'%'
+                            && !bytes
+                                .get(at + 1..at + 3)
+                                .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                    }) {
+                        return None;
+                    }
+                    let decoded = percent_encoding::percent_decode_str(text)
+                        .decode_utf8()
+                        .ok()?;
+                    (decoded != text.as_str()).then(|| (text.as_str(), decoded.into_owned()))
+                })
+                .collect();
+            let prepared: Vec<_> = probe
+                .as_ref()
+                .iter()
+                .map(|text| decoded.get(text.as_str()).unwrap_or(text).clone())
+                .collect();
+            let mut strings = prepared.as_slice();
+            let mut expanded = Vec::new();
+            while !strings.is_empty() {
+                if let [list, separator, method, ..] = strings
+                    && method == "split"
+                    && separator.chars().count() == 1
+                {
+                    let parts: Vec<_> = list.split(separator).collect();
+                    if parts.len() >= 3
+                        && parts.iter().all(|part| !part.is_empty())
+                        && (list.len() > 32 || parts.iter().all(|part| is_name(part)))
+                    {
+                        expanded.extend(parts.into_iter().map(str::to_owned));
+                        strings = &strings[3..];
+                        continue;
+                    }
+                }
+                expanded.push(strings[0].clone());
+                strings = &strings[1..];
+            }
+            expanded
+        })
+        .collect()
+}
+
+/// Inline decoders expose wrapper names previously held only in header registers.
+/// Those names belong to the common envelope and cannot align probe-specific fields.
+fn without_common_names<S: AsRef<[String]>>(probes: &[S]) -> Vec<Vec<String>> {
+    let mut common: HashSet<&str> = probes
+        .first()
+        .into_iter()
+        .flat_map(|probe| probe.as_ref())
+        .map(String::as_str)
+        .filter(|text| is_name(text))
+        .collect();
+    if probes.len() < 3 {
+        common.clear();
+    }
+    for probe in probes.iter().skip(1) {
+        common.retain(|name| probe.as_ref().iter().any(|text| text == name));
+    }
+    probes
+        .iter()
+        .map(|probe| {
+            probe
+                .as_ref()
+                .iter()
+                .filter(|text| !common.contains(text.as_str()))
+                .cloned()
+                .collect()
+        })
+        .collect()
+}
+
 /// Renames strings and object keys using `rename`.
 fn rewrite<'a>(value: &mut JsValue, rename: &impl Fn(&str) -> Option<&'a String>) {
     match value {
         JsValue::String(text) => {
-            if let Some(name) = rename(text) {
-                *text = name.clone();
-            }
+            rewrite_text(text, rename);
         }
         JsValue::Array(items) => {
             for item in items {
@@ -195,10 +434,47 @@ fn rewrite<'a>(value: &mut JsValue, rename: &impl Fn(&str) -> Option<&'a String>
 }
 
 fn rewrite_object<'a>(object: &mut JsObject, rename: &impl Fn(&str) -> Option<&'a String>) {
-    for (key, mut item) in mem::take(object) {
+    for (mut key, mut item) in mem::take(object) {
         rewrite(&mut item, rename);
-        object.insert(rename(&key).cloned().unwrap_or(key), item);
+        rewrite_text(&mut key, rename);
+        object.insert(key, item);
     }
+}
+
+/// Session names also occur inside error messages, markup, property paths and digest inputs.
+/// Read replacements from the original string so a replacement is never renamed twice.
+fn rewrite_text<'a>(text: &mut String, rename: &impl Fn(&str) -> Option<&'a String>) {
+    if let Some(name) = rename(text) {
+        *text = name.clone();
+        return;
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        let found = [25, 9, 8, 7, 6, 5, 4].into_iter().find_map(|length| {
+            let name = rest.get(..length)?;
+            let before = at == 0 || !text.as_bytes()[at - 1].is_ascii_alphanumeric();
+            let after =
+                at + length == text.len() || !text.as_bytes()[at + length].is_ascii_alphanumeric();
+            if !hashed_name(name) && at != 0 && at + length != text.len() && !(before && after) {
+                return None;
+            }
+            is_name(name)
+                .then(|| rename(name))
+                .flatten()
+                .map(|replacement| (length, replacement))
+        });
+        if let Some((length, replacement)) = found {
+            result.push_str(replacement);
+            at += length;
+        } else {
+            let character = rest.chars().next().unwrap();
+            result.push(character);
+            at += character.len_utf8();
+        }
+    }
+    *text = result;
 }
 
 /// Chooses each name's pair with the most votes. Breaks ties by pair ordering so results are
@@ -312,6 +588,14 @@ fn is_log_message(text: &str) -> bool {
 /// on both sides. Also compares differing strings at matching positions to recover embedded
 /// names.
 fn aligned_names<'a>(session: &'a [String], reference: &'a [String]) -> Vec<(&'a str, &'a str)> {
+    aligned_names_with(session, reference, false)
+}
+
+fn aligned_names_with<'a>(
+    session: &'a [String],
+    reference: &'a [String],
+    encoded: bool,
+) -> Vec<(&'a str, &'a str)> {
     // Collapse repeated API loads so duplicate reads for one call do not split runs used to
     // align neighboring output names.
     let mut session: Vec<&str> = session.iter().map(String::as_str).collect();
@@ -328,14 +612,24 @@ fn aligned_names<'a>(session: &'a [String], reference: &'a [String]) -> Vec<(&'a
     let mut pairs = Vec::new();
     let (mut i, mut j) = (0, 0);
     for run in matching_runs(&session, &reference) {
-        let (mut left_names, left_texts): (Vec<_>, Vec<_>) = session[i..run.session]
-            .iter()
-            .copied()
-            .partition(|text| is_name(text));
+        let (mut left_names, left_texts): (Vec<_>, Vec<_>) =
+            session[i..run.session].iter().copied().partition(|text| {
+                if encoded {
+                    alignment_name(text)
+                } else {
+                    is_name(text)
+                }
+            });
         let (mut right_names, right_texts): (Vec<_>, Vec<_>) = reference[j..run.reference]
             .iter()
             .copied()
-            .partition(|text| is_name(text));
+            .partition(|text| {
+                if encoded {
+                    alignment_name(text)
+                } else {
+                    is_name(text)
+                }
+            });
         // Repeats of a name in a row count once, even across non-name text.
         left_names.dedup();
         right_names.dedup();
@@ -378,7 +672,10 @@ fn embedded_names<'a>(session: &'a str, reference: &'a str) -> Vec<(&'a str, &'a
 /// Splits a string into alternating runs of ASCII letters and digits, and other characters.
 fn tokens(text: &str) -> Vec<&str> {
     text.as_bytes()
-        .chunk_by(|left, right| left.is_ascii_alphanumeric() == right.is_ascii_alphanumeric())
+        .chunk_by(|left, right| {
+            (left.is_ascii_alphanumeric() || *left == b'_')
+                == (right.is_ascii_alphanumeric() || *right == b'_')
+        })
         // Boundaries fall only beside ASCII, never inside a UTF-8 character.
         .map(|part| std::str::from_utf8(part).expect("runs split only beside ASCII bytes"))
         .collect()
@@ -468,7 +765,37 @@ fn longest_run(
 }
 
 /// Whether a string could be one of the program's randomized names.
-fn is_name(text: &str) -> bool {
+fn alignment_name(text: &str) -> bool {
+    if matches!(
+        text,
+        "Array"
+            | "Boolean"
+            | "Date"
+            | "Error"
+            | "Function"
+            | "JSON"
+            | "Math"
+            | "Number"
+            | "Object"
+            | "Promise"
+            | "Reflect"
+            | "String"
+            | "Symbol"
+    ) {
+        return false;
+    }
+    is_name(text)
+}
+
+fn hashed_name(text: &str) -> bool {
+    text.strip_prefix('_')
+        .is_some_and(|hex| hex.len() == 24 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+pub(crate) fn is_name(text: &str) -> bool {
+    if hashed_name(text) {
+        return true;
+    }
     (4..=9).contains(&text.len())
         && text.starts_with(|c: char| c.is_ascii_alphabetic())
         && text.chars().all(|c| c.is_ascii_alphanumeric())
@@ -483,12 +810,66 @@ mod tests {
     use crate::js::json;
 
     #[test]
+    fn rewrites_embedded_names_once_and_preserves_unicode() {
+        let names = HashMap::from([
+            ("_0123456789abcdef01234567".to_owned(), "Abcd1".to_owned()),
+            ("Abcd1".to_owned(), "Efgh2".to_owned()),
+        ]);
+        let mut text = "é😀<p>_0123456789abcdef01234567</p>o.Abcd1".to_owned();
+        rewrite_text(&mut text, &|name| names.get(name));
+        assert_eq!(text, "é😀<p>Abcd1</p>o.Efgh2");
+        let mut opaque = "abcAbcd1xyz".to_owned();
+        rewrite_text(&mut opaque, &|name| names.get(name));
+        assert_eq!(opaque, "abcAbcd1xyz");
+    }
+
+    #[test]
     fn token_boundaries_preserve_non_ascii_markup() {
-        assert_eq!(tokens("é😀Aa12-中_foo"), ["é😀", "Aa12", "-中_", "foo"]);
+        assert_eq!(tokens("é😀Aa12-中_foo"), ["é😀", "Aa12", "-中", "_foo"]);
     }
 
     fn strings(text: &str) -> Vec<String> {
         text.split(' ').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn packed_names_align_in_both_directions_across_identifier_formats() {
+        let packed = "%41%61%61%61%31%7c%42%62%62%62%32%7c%43%63%63%63%33";
+        let short = [strings(&format!(
+            "Intl ListFormat style long type disjunction format {packed} decodeURIComponent {packed} | split | format Result1"
+        ))];
+        let hashed = [strings(
+            "Intl ListFormat style long type disjunction format _111111111111111111111111 _222222222222222222222222 _333333333333333333333333 format _444444444444444444444444",
+        )];
+        for (session, reference, expected) in [
+            (&short, &hashed, ("Aaaa1", "_111111111111111111111111")),
+            (&hashed, &short, ("_111111111111111111111111", "Aaaa1")),
+        ] {
+            let vocabulary = Vocabulary::between(session, reference);
+            assert_eq!(vocabulary.to_reference(0, expected.0), expected.1);
+            assert_eq!(vocabulary.to_session(0, expected.1), expected.0);
+        }
+    }
+
+    #[test]
+    fn expands_only_valid_decoded_name_lists() {
+        let valid = "%41%61%61%61%31%7c%42%62%62%62%32%7c%43%63%63%63%33";
+        let features = strings(&format!("{valid} decodeURIComponent {valid} | split"));
+        let expanded = expand_lists(&[features]);
+        assert_eq!(&expanded[0][2..], ["Aaaa1", "Bbbb2", "Cccc3"]);
+        let fonts = vec![
+            strings("Sample Sans|Sample Serif|Sample Monospace").join(" "),
+            "|".into(),
+            "split".into(),
+        ];
+        assert_eq!(
+            expand_lists(&[fonts])[0],
+            ["Sample Sans", "Sample Serif", "Sample Monospace"]
+        );
+        for text in ["%41%", "%41%xx", "%FF", "Aaaa1|Bbbb2", "Aaaa1||Cccc3"] {
+            let features = strings(&format!("{text} decodeURIComponent {text} | split"));
+            assert_eq!(expand_lists(std::slice::from_ref(&features))[0], features);
+        }
     }
 
     #[test]

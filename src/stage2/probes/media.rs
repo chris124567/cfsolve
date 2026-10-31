@@ -515,6 +515,25 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Box<Fields>> {
             .find(|text| text.starts_with(prefix) && text.contains(codec))
     };
     let audio = find("audio/mp4;", "mp4a.40.2")?;
+    if !audio.contains('A') {
+        let arrays = probe.index.string_arrays(probe.entry);
+        let list = |prefix: &str, codec: &str| {
+            crate::candidates::exactly_one(
+                arrays.iter().filter(|items| {
+                    items.first().is_some_and(|text| text.starts_with(prefix))
+                        && items.iter().any(|text| text.contains(codec))
+                }),
+                "media list",
+            )
+            .ok()
+            .cloned()
+        };
+        return Some(Box::new(Fields {
+            audio_types: list("audio/mp4;", "mp4a.40.2")?,
+            video_types: list("video/mp4;", "avc1.42E01E")?,
+            excluded_types: list("audio/mp4;", "theora")?,
+        }));
+    }
     let video = find("video/mp4;", "avc1.42E01E")?;
     let excluded = find("audio/mp4;", "theora")?;
     let types = |list: &str| -> Vec<String> { list.split('A').map(str::to_owned).collect() };

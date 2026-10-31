@@ -9,7 +9,7 @@
 //! plus trace membership and navigation sizes in the environment audit. Live requests, fresh
 //! WebRTC state, benchmark results, and stacks are computed separately.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem;
 use std::ops::Range;
 
@@ -17,6 +17,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use super::analysis;
+pub use super::probes::stylesheets::Snapshot as StylesheetSnapshot;
 use super::probes::worker_navigator;
 use super::records::{ArrangedFields, Probe, ProbePlan};
 use super::reference::{
@@ -25,6 +26,7 @@ use super::reference::{
     WORKER_NAVIGATOR_RESULT,
 };
 use super::registry::{AUDIT_PROBE, Kind, Operation, Treatment};
+pub use super::session_names::CapturedNames;
 use super::trace::Trace;
 use super::vocabulary::Vocabulary;
 use crate::http::ResponseMetrics;
@@ -40,6 +42,12 @@ pub struct Answers {
     pub probes: BTreeMap<usize, Stored>,
     /// The worker navigator, by API property.
     pub navigator: JsObject,
+    /// Captured source/CSSOM pairs for stylesheet revisions this profile supports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stylesheets: Vec<StylesheetSnapshot>,
+    /// Source evidence for names and trace frames that change between sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub names: Option<CapturedNames>,
 }
 
 /// One probe's stored record, without its envelope.
@@ -66,6 +74,7 @@ impl Answers {
         let is_envelope = |name: &String| envelope_names.contains(&name.as_str());
         let mut answers = Self {
             reference: REFERENCE.digest.clone(),
+            names: Some(CapturedNames::capture(source, plan, payload)?),
             ..Self::default()
         };
         for probe in plan.probes() {
@@ -148,17 +157,134 @@ impl Answers {
 /// Stored answers matched to one session's probes.
 pub struct Replay<'answers> {
     answers: &'answers Answers,
-    vocabulary: &'answers Vocabulary,
+    vocabulary: Vocabulary,
+    refresh: Option<super::session_names::Refresh>,
+    context: Option<&'answers ProbePlan>,
 }
 
 impl<'answers> Replay<'answers> {
     /// Matches `answers` to `plan`'s probes using the plan's vocabulary.
     #[must_use]
     pub fn new(answers: &'answers Answers, plan: &'answers ProbePlan) -> Self {
+        let mut vocabulary = plan.vocabulary().clone();
+        let mut common: HashSet<&str> = plan
+            .probes()
+            .first()
+            .into_iter()
+            .flat_map(|probe| probe.features.iter().map(String::as_str))
+            .collect();
+        for probe in plan.probes() {
+            common.retain(|name| probe.features.iter().any(|text| text == name));
+        }
+        for probe in plan.probes() {
+            if let Some(partner) = vocabulary.partner(probe.position())
+                && let Some(stored) = answers.probes.get(&partner)
+            {
+                let wanted: Vec<String> = stored.fields.keys().cloned().collect();
+                vocabulary.refine_outputs(
+                    probe.position(),
+                    &probe.features,
+                    &probe.writes.fields,
+                    &probe.writes.internal,
+                    &common,
+                    &wanted,
+                );
+            }
+        }
         Self {
             answers,
-            vocabulary: plan.vocabulary(),
+            vocabulary,
+            refresh: None,
+            context: None,
         }
+    }
+
+    /// Prepares and validates replay, including names captured from a previous session.
+    pub fn for_session(
+        answers: &'answers Answers,
+        plan: &'answers ProbePlan,
+        source: &Source,
+    ) -> Result<Self> {
+        let mut replay = Self::new(answers, plan);
+        replay.refresh = answers
+            .names
+            .as_ref()
+            .map(|names| super::session_names::Refresh::new(names, source, plan))
+            .transpose()?;
+        replay.context = Some(plan);
+        replay.validate(plan)?;
+        Ok(replay)
+    }
+
+    pub fn validate(&self, plan: &ProbePlan) -> Result<()> {
+        let mut failures = Vec::new();
+        for probe in plan.probes() {
+            let Some(partner) = self.vocabulary.partner(probe.position()) else {
+                continue;
+            };
+            let Some(stored) = self.answers.probes.get(&partner) else {
+                continue;
+            };
+            if probe.writes.fields.is_empty() {
+                continue;
+            }
+            let missing: Vec<&String> =
+                stored
+                    .fields
+                    .keys()
+                    .filter(|name| {
+                        !probe.writes.fields.iter().any(|field| {
+                            field == self.vocabulary.to_session(probe.position(), name)
+                        })
+                    })
+                    .collect();
+            if !missing.is_empty() {
+                failures.push(format!("probe {}: {:?}", probe.index, missing));
+            }
+            if probe
+                .expanded_features
+                .iter()
+                .any(|name| name.starts_with('_') && name.len() == 25)
+            {
+                let mut names = BTreeSet::new();
+                fn collect(value: &JsValue, names: &mut BTreeSet<String>) {
+                    match value {
+                        JsValue::String(text) => {
+                            names.insert(text.clone());
+                        }
+                        JsValue::Object(object) => {
+                            for (key, value) in object {
+                                names.insert(key.clone());
+                                collect(value, names);
+                            }
+                        }
+                        JsValue::Array(array) => {
+                            for value in array {
+                                collect(value, names);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                collect(&JsValue::Object(stored.fields.clone()), &mut names);
+                let reference = &super::reference::EXPANDED_REFERENCE.probes[partner - 1];
+                names.retain(|name| {
+                    super::vocabulary::is_name(name)
+                        && reference.contains(name)
+                        && !probe.expanded_features.contains(name)
+                        && self.vocabulary.to_session(probe.position(), name) == name
+                });
+                if !names.is_empty() {
+                    failures.push(format!("probe {} nested values: {:?}", probe.index, names));
+                }
+            }
+        }
+        ensure!(
+            failures.is_empty(),
+            "unmapped stored result fields: {}",
+            failures.join("; ")
+        );
+        Ok(())
     }
 
     /// Finds environment-audit groups that report window dimensions and position.
@@ -213,6 +339,9 @@ impl<'answers> Replay<'answers> {
         let mut arranged = ArrangedFields::split(fields, &stored.late);
         for fields in [&mut arranged.early, &mut arranged.late] {
             self.vocabulary.rewrite_to_session(position, fields);
+            if let (Some(refresh), Some(plan)) = (&self.refresh, self.context) {
+                refresh.apply(probe, plan, fields)?;
+            }
         }
         Ok(arranged)
     }
@@ -363,7 +492,7 @@ fn refresh_string(text: &mut String, iframe_url: &str, modified: &str) {
 /// Moves the trace global to the audit group matching this session's trace frames. Uses the
 /// recovered controller frame as the second root, or the iframe callback frame if none was
 /// recovered.
-fn refresh_trace(
+pub(crate) fn refresh_trace(
     trace: &Trace,
     groups: &mut JsObject,
     features: &[String],

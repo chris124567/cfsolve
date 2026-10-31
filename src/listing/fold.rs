@@ -163,6 +163,81 @@ impl<X: Clone> Frame<X> {
     }
 }
 
+/// Newer initial programs inline their string decoder: charCodeAt builds a
+/// length and slice removes the descriptor header and padding. Fold only known
+/// values, without executing the script or guessing randomized global names.
+pub(crate) fn constant<X: Clone>(frame: &Frame<X>, value: &Term) -> Option<JsValue> {
+    if let Some(Known::Literal(value) | Known::Decoded(value)) = frame.resolve(value) {
+        return Some(value);
+    }
+    match value {
+        Term::Binary(operator, left, right) => {
+            let left = constant(frame, left)?;
+            let right = constant(frame, right)?;
+            match (operator, left, right) {
+                (BinaryOp::Add, JsValue::String(left), JsValue::String(right)) => {
+                    Some(JsValue::String(left + right.as_str()))
+                }
+                (BinaryOp::Add, JsValue::Number(left), JsValue::Number(right)) => {
+                    Some(JsValue::Number(left + right))
+                }
+                (BinaryOp::Mul, JsValue::Number(left), JsValue::Number(right)) => {
+                    Some(JsValue::Number(left * right))
+                }
+                _ => None,
+            }
+        }
+        Term::Call {
+            callee, arguments, ..
+        } => {
+            let Term::Get(object, method) = &**callee else {
+                return None;
+            };
+            let object = constant(frame, object)?;
+            let units: Vec<u16> = object.as_str()?.encode_utf16().collect();
+            let method = constant(frame, method)?;
+            let arguments: Option<Vec<JsValue>> = arguments
+                .iter()
+                .map(|argument| constant(frame, argument))
+                .collect();
+            let arguments = arguments?;
+            match (method.as_str()?, arguments.as_slice()) {
+                ("charCodeAt", [JsValue::Number(position)]) => {
+                    let position = if position.is_nan() {
+                        0.0
+                    } else {
+                        position.trunc()
+                    };
+                    let code = if position >= 0.0 && position < units.len() as f64 {
+                        f64::from(units[position as usize])
+                    } else {
+                        f64::NAN
+                    };
+                    Some(JsValue::Number(code))
+                }
+                ("slice", [JsValue::Number(start), JsValue::Number(end)]) => {
+                    let index = |value: f64| {
+                        let value = if value.is_nan() { 0.0 } else { value.trunc() };
+                        let value = if value < 0.0 {
+                            units.len() as f64 + value
+                        } else {
+                            value
+                        };
+                        value.clamp(0.0, units.len() as f64) as usize
+                    };
+                    let start = index(*start);
+                    let end = index(*end).max(start);
+                    String::from_utf16(&units[start..end])
+                        .ok()
+                        .map(JsValue::String)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Intersects register facts from incoming paths. Temporaries do not cross instruction boundaries.
 impl<X: Clone + PartialEq> Facts for Frame<X> {
     fn meet(&mut self, other: &Self) -> bool {

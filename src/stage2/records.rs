@@ -124,6 +124,9 @@ pub struct Probe {
     pub operation: Option<Operation>,
     /// The strings the probe's collection function uses, in order.
     pub features: Vec<String>,
+    /// Collection strings including uses of constants held in registers.
+    #[serde(default)]
+    pub expanded_features: Vec<String>,
     /// Recovered write order used to arrange computed fields. Replayed answers retain the
     /// browser's recorded order.
     #[serde(default)]
@@ -141,6 +144,8 @@ impl Probe {
 /// The order in which a probe's collection function writes its record's fields.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct WriteOrder {
+    #[serde(default)]
+    pub internal: Vec<String>,
     /// Stored names in execution order: the synchronous body first, then its callbacks.
     pub fields: Vec<String>,
     /// Fields that only callbacks write after the probe has finished. They follow the clock
@@ -202,7 +207,14 @@ impl ProbePlan {
                 .iter()
                 .map(|probe| probe.features.as_slice())
                 .collect();
-            Vocabulary::infer(&features)
+            let mut vocabulary = Vocabulary::infer(&features);
+            let expanded: Vec<&[String]> = self
+                .probes
+                .iter()
+                .map(|probe| probe.expanded_features.as_slice())
+                .collect();
+            vocabulary.extend_expanded(&expanded);
+            vocabulary
         })
     }
 

@@ -21,6 +21,30 @@ set to the address of a running `capture-proxy`, which records the decoded
 payloads sent to Cloudflare.  Currently only Safari and Chrome(ium) profile
 types are supported.
 
+Newer builds also rename values embedded in probe answers, namespace properties,
+and stylesheet selectors on every session. Rebuild the answers with
+`cargo run --release --example build_profile -- capture.json > answers.json`
+to include the source evidence needed to refresh those values. Existing answer
+files remain readable, but do not contain this additional evidence.
+
+For builds that vary stylesheet selectors, record the profile browser's CSSOM
+formatting once. In the challenge iframe's execution context, save the JSON
+result of:
+
+```javascript
+JSON.stringify(Array.from(document.styleSheets, sheet =>
+  Array.from(sheet.cssRules, rule => rule.cssText)))
+```
+
+Pass that file as the second argument to `build_profile`. The answers then store
+the stylesheet source alongside its browser formatting. At solve time cfsolve
+checks that only randomized names have changed, substitutes the current names,
+and recomputes the stylesheet measurements without a browser. If the stylesheet
+structure changes, capture the new revision; the solver rejects an unmatched
+revision instead of sending an obsolete digest. The `stylesheets` array can hold
+multiple captured revisions for the same browser profile. Keep captures and
+device profiles private; they are not needed in bug reports or pull requests.
+
 ## Building
 
 You need the Rust version pinned in `rust-toolchain.toml`, plus CMake, a C/C++
