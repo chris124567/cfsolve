@@ -1,6 +1,7 @@
 //! Computes `performance.now()` using browser clock rules.
 //!
-//! On Linux, Chrome reads `CLOCK_MONOTONIC` through `base::TimeTicks`. It clamps the reading
+//! On Linux, Chrome reads `CLOCK_MONOTONIC` through `base::TimeTicks`, and on Windows
+//! `QueryPerformanceCounter`. It clamps the reading
 //! and time origin to 100 µs using jitter at each interval boundary, converts both to
 //! floating-point milliseconds, and subtracts. Conversion loses precision as uptime grows,
 //! producing values such as `23.300000000745058`. Use this module for all reported readings and
@@ -152,6 +153,7 @@ fn murmur3_fmix64(mut value: u64) -> u64 {
     value ^ (value >> 33)
 }
 
+#[cfg(unix)]
 fn monotonic_us() -> i64 {
     let mut time = libc::timespec {
         tv_sec: 0,
@@ -165,6 +167,23 @@ fn monotonic_us() -> i64 {
     let status = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     assert_eq!(status, 0, "CLOCK_MONOTONIC is unavailable");
     time.tv_sec * 1_000_000 + time.tv_nsec / 1000
+}
+
+#[cfg(windows)]
+fn monotonic_us() -> i64 {
+    use windows_sys::Win32::System::Performance::{
+        QueryPerformanceCounter, QueryPerformanceFrequency,
+    };
+
+    let (mut count, mut frequency) = (0, 0);
+    // SAFETY: both pointers are to live, writable, aligned `i64`s, which the calls only write
+    // through. Neither call fails on Windows XP or later.
+    unsafe {
+        QueryPerformanceCounter(&mut count);
+        QueryPerformanceFrequency(&mut frequency);
+    }
+    // As `base::TimeTicks` converts it, without overflowing at high frequencies.
+    (i128::from(count) * 1_000_000 / i128::from(frequency)) as i64
 }
 
 #[cfg(test)]

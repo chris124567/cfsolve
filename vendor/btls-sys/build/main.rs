@@ -593,6 +593,10 @@ fn get_cpp_runtime_lib(config: &Config) -> Option<String> {
 
     match &*config.target_os {
         "macos" | "ios" | "freebsd" | "openbsd" | "android" => Some("c++".into()),
+        // MinGW's C++ runtime is not part of Windows, so link it in rather than
+        // need libstdc++-6.dll beside the executable. Unbundled, the linker finds
+        // it on its own search path. (cfsolve patch)
+        "windows" if config.target_env == "gnu" => Some("static:-bundle=stdc++".into()),
         _ if config.unix || config.target_env == "gnu" => Some("stdc++".into()),
         // TODO(rmehra): figure out how to do this for windows
         _ => None,
