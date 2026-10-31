@@ -77,6 +77,9 @@ impl ObjectProperties {
             Expr::Lit(literal) if !matches!(literal, Lit::Regex(_)) => {
                 self.literals.insert(name, Expr::Lit(literal.clone()));
             }
+            Expr::Tpl(template) if template.exprs.is_empty() => {
+                self.literals.insert(name, value.clone());
+            }
             _ => {}
         }
     }
@@ -771,6 +774,26 @@ mod tests {
         let expected = ["(0, eval)(\"typeof local\")", "Number(obj.value);"];
         testing::assert_contains(&output, &expected, &[]);
         assert!(!output.contains("(0, plain)"), "{output}");
+    }
+
+    #[test]
+    fn inlines_static_template_properties_without_evaluating_interpolation() {
+        let output = transform(
+            "function f() { var helper; helper = { first: `fixed` }; \
+             helper.second = `line\\n\\u{1f600}`; \
+             helper.dynamic = `value:${read()}`; \
+             return function() { return [helper.first, helper.second, helper.dynamic]; }; }",
+        );
+        testing::assert_contains(
+            &output,
+            &[],
+            &["return [`fixed`, `line\\n\\u{1f600}`, helper.dynamic]"],
+        );
+        let output = transform(
+            "function f() { var helper; helper = { name: `before` }; \
+             helper.name = `after`; return helper.name; }",
+        );
+        assert!(output.contains("return helper.name;"), "{output}");
     }
 
     #[test]
