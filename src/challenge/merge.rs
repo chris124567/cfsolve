@@ -3,7 +3,8 @@
 
 use anyhow::{Context, Result};
 use swc_core::ecma::ast::{
-    AssignTarget, BinaryOp, CallExpr, Callee, Expr, FnDecl, SimpleAssignTarget, Stmt, UnaryOp,
+    AssignTarget, BinaryOp, CallExpr, Callee, Decl, Expr, FnDecl, Pat, SimpleAssignTarget, Stmt,
+    UnaryOp,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
@@ -284,6 +285,16 @@ fn writes(function: &FnDecl) -> Vec<OptionWrite> {
     let mut staged: Vec<(&str, &str)> = Vec::new();
     let mut writes = Vec::new();
     for statement in &body.stmts {
+        if let Stmt::Decl(Decl::Var(declaration)) = statement {
+            for binding in &declaration.decls {
+                if let Pat::Ident(local) = &binding.name
+                    && let Some(value) = &binding.init
+                    && let Some(option) = expression::option_key(value)
+                {
+                    staged.push((&local.id.sym, option));
+                }
+            }
+        }
         if let Some(write) = sampled(statement, &parameters) {
             writes.push(write);
             continue;
@@ -460,6 +471,42 @@ mod tests {
         ] {
             let source = format!("{SOURCE}\n{caller}");
             assert!(Mapping::from_javascript(&source).is_ok(), "{caller}");
+        }
+    }
+
+    #[test]
+    fn copies_bootstrap_values_staged_by_a_declaration_or_assignment() {
+        for initial in [
+            "var saved = e._cf_chl_opt.seed;",
+            "saved = e._cf_chl_opt.seed;",
+        ] {
+            let source = SOURCE.replace(
+                "e._cf_chl_opt.WbdgY0 = z2;",
+                &format!(
+                    r#"
+                {initial}
+                try {{
+                    var cached = localStorage.getItem("visitor");
+                    if (cached) {{ saved = cached; }}
+                }} catch (error) {{}}
+                e._cf_chl_opt.WbdgY0 = saved;
+            "#
+                ),
+            );
+            let mapping = Mapping::from_javascript(&source).unwrap();
+            let entry = mapping
+                .0
+                .iter()
+                .find(|entry| entry.option == "WbdgY0")
+                .unwrap();
+            assert_eq!(entry.source, OptionSource::Copied("seed".into()));
+            let mut options = Options::from_iter([("seed".into(), json!("synthetic-visitor"))]);
+            assert!(
+                mapping
+                    .merge(&mut options, &json!({}), "https://example.com", 1)
+                    .is_empty()
+            );
+            assert_eq!(options["WbdgY0"], json!("synthetic-visitor"));
         }
     }
 

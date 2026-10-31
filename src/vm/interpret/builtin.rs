@@ -216,6 +216,16 @@ impl<'ast> Run<'ast, '_> {
                 let Value::Array(elements) = &this else {
                     return self.apply(Value::symbolic(global()), this, arguments);
                 };
+                // Constructor-created VM stacks are concrete during handler decoding. Keep
+                // installed exception frames visible even when pushing them is evaluated here.
+                for value in &arguments {
+                    if let Value::Array(frame) = value {
+                        let frame: Vec<_> = frame.borrow().iter().map(Value::expr).collect();
+                        if crate::vm::catch_frame(&frame).is_some() {
+                            self.temp(Term::Array(frame));
+                        }
+                    }
+                }
                 let mut elements = elements.borrow_mut();
                 elements.extend(arguments);
                 Ok(Value::Number(elements.len() as f64))
@@ -595,6 +605,34 @@ mod tests {
         assert!(call(Builtin::Pow, &[1.0, f64::INFINITY]).is_nan());
         assert!(call(Builtin::Pow, &[2.0]).is_nan());
         assert!(call(Builtin::Floor, &[]).is_nan());
+    }
+
+    #[test]
+    fn concrete_stack_pushes_expose_exception_frames_to_disassembly() {
+        let session = Session::empty();
+        let mut run = Run::method(&session);
+        let stack = Value::array(vec![]);
+        let frame = Value::array(vec![
+            Value::Number(42.0),
+            Value::Number(7.0),
+            Value::Cells,
+            Value::Number(0.0),
+        ]);
+        let expected = frame.expr();
+        assert_eq!(
+            number(run.builtin(Builtin::Push, stack.clone(), vec![frame])),
+            1.0
+        );
+        assert_eq!(
+            run.effects,
+            vec![crate::vm::Effect::Let(0, expected.clone())]
+        );
+        assert_eq!(stack.expr(), Term::Array(vec![expected]));
+        assert_eq!(
+            number(run.builtin(Builtin::Push, stack, vec![Value::Number(9.0)])),
+            2.0
+        );
+        assert_eq!(run.effects.len(), 1);
     }
 
     /// Checks `SameValueZero` membership: the set contains 1, "1", NaN, and 0 after duplicate
