@@ -1,15 +1,13 @@
 //! Builds worker CORS fetch results, including status and the first challenge token header.
 
-use std::collections::BTreeSet;
-
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::js::{self, JsObject, Options, json};
-use crate::listing;
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::reference;
+use crate::{candidates, listing};
 
 pub(crate) const OUTPUTS: [&str; 2] = [
     reference::WORKER_FETCH_STATUS,
@@ -22,7 +20,7 @@ const HEADER: &str = "cf-chl-peek";
 /// Cloudflare rotates it independently of the iframe's host.
 const PATH: &str = "/cdn-cgi/challenge-platform/h/";
 
-/// The session's options naming the request path's platform segment, ray and nonce.
+/// The worker's host and session options naming its platform segment, ray and nonce.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Fields {
     pub host: String,
@@ -96,56 +94,55 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         return None;
     }
     Some(Fields {
-        host: request_host(strings.features(), probe.pool)?,
+        host: request_host(probe.session_features, probe.pool)?,
         platform_property: probe.session_name(reference::PLATFORM_OPTION),
         ray_property: probe.session_name(reference::RAY_OPTION),
         nonce_property: probe.session_name(reference::NONCE_OPTION),
     })
 }
 
-/// Reads literal or encoded URL fragments in program order. Accepts a unique
-/// Cloudflare endpoint; an unrelated URL or an ambiguous program is not a match.
+/// Recovers a unique endpoint from a complete URL or adjacent scheme, host and path
+/// fragments. Malformed descriptors remain in place so they cannot join unrelated fragments.
 fn request_host(features: &[String], pool: &str) -> Option<String> {
     let strings: Vec<String> = features
         .iter()
         .map(|text| {
             if text.starts_with('\0') || text.starts_with("ÿÿ") {
-                listing::decode_string(text, pool).unwrap_or_default()
+                listing::decode_string(text, pool).unwrap_or_else(|_| text.clone())
             } else {
                 text.clone()
             }
         })
         .collect();
-    let mut hosts = BTreeSet::new();
-    for start in 0..strings.len() {
-        if !strings[start].starts_with("https://") {
-            continue;
+    let hosts = strings.iter().enumerate().filter_map(|(start, text)| {
+        if !text.starts_with("https://") {
+            return None;
         }
         let mut candidate = String::new();
-        for part in strings[start..].iter().take(3) {
+        strings[start..].iter().take(3).find_map(|part| {
             candidate.push_str(part);
-            let Ok(url) = Url::parse(&candidate) else {
-                continue;
-            };
-            if url.path() == PATH
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.port().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-                && let Some(host) = url.host_str()
-                && host.ends_with(".challenges.cloudflare.com")
-            {
-                hosts.insert(host.to_owned());
-            }
-        }
-    }
-    (hosts.len() == 1).then(|| hosts.pop_first()).flatten()
+            let url = Url::parse(&candidate).ok()?;
+            let host = url.host_str()?;
+            // Require the bare HTTPS endpoint, without credentials or extra URL components.
+            (host.ends_with(".challenges.cloudflare.com")
+                && url.as_str() == format!("https://{host}{PATH}"))
+            .then(|| host.to_owned())
+        })
+    });
+    candidates::at_most_one_distinct(hosts, "worker fetch host").ok()?
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::listing::Index;
+    use crate::stage2::analysis::recognize::Strings;
+    use crate::stage2::records::WriteOrder;
+    use crate::stage2::registry::Kind;
+    use crate::stage2::vocabulary::Vocabulary;
+    use crate::vm::Listing;
 
     fn strings(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_owned()).collect()
@@ -159,13 +156,43 @@ mod tests {
             let encoded = format!("\0{}{host}\0padding", char::from(host.len() as u8));
             for features in [
                 strings(&[&full]),
+                strings(&[&full, &full]),
                 strings(&["https://", &host, PATH]),
+                strings(&["https://", &format!("{host}{PATH}")]),
                 strings(&["https://", &encoded, PATH]),
                 strings(&[&format!("https://{host}"), PATH]),
             ] {
                 assert_eq!(request_host(&features, ""), Some(host.clone()));
             }
         }
+    }
+
+    #[test]
+    fn recognizes_the_session_host_without_rewriting_it_to_the_reference() {
+        let reference = &reference::REFERENCE.probes[Kind::WorkerFetch.references()[0] - 1];
+        let session: Vec<String> = reference
+            .iter()
+            .map(|text| text.replace("brunhild.", "current-worker."))
+            .collect();
+        let listing = Listing::default();
+        let index = Index::new(&listing);
+        let vocabulary = Vocabulary::infer(&[&session]);
+        let empty = BTreeSet::new();
+        let outputs = OUTPUTS.map(str::to_owned).into_iter().collect();
+        let fields = recognize(&ProbeView {
+            index: &index,
+            vocabulary: &vocabulary,
+            position: 0,
+            header: &empty,
+            wrapper: &empty,
+            pool: "",
+            entry: 0,
+            session_features: &session,
+            writes: &WriteOrder::default(),
+            strings: Strings::new(reference, &outputs),
+        })
+        .unwrap();
+        assert_eq!(fields.host, "current-worker.challenges.cloudflare.com");
     }
 
     #[test]
@@ -192,6 +219,8 @@ mod tests {
     #[test]
     fn rejects_missing_ambiguous_and_unrelated_endpoints() {
         for parts in [
+            vec![],
+            vec!["http://hagen.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/"],
             vec!["https://hagen.challenges.cloudflare.com/other/"],
             vec![
                 "https://hagen.challenges.cloudflare.com.evil.example/cdn-cgi/challenge-platform/h/",
@@ -199,12 +228,16 @@ mod tests {
             vec!["https://user@hagen.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/"],
             vec!["https://hagen.challenges.cloudflare.com:8443/cdn-cgi/challenge-platform/h/"],
             vec!["https://", "\0", PATH],
+            vec!["https://hagen.challenges.cloudflare.com", "\0", PATH],
+            vec!["https://hagen.challenges.cloudflare.com", "ÿÿ\0", PATH],
+            vec!["https://hagen.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/?extra"],
+            vec!["https://hagen.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/#extra"],
             vec![
                 "https://hagen.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/",
                 "https://brunhild.challenges.cloudflare.com/cdn-cgi/challenge-platform/h/",
             ],
         ] {
-            assert_eq!(request_host(&strings(&parts), ""), None);
+            assert_eq!(request_host(&strings(&parts), ""), None, "{parts:?}");
         }
     }
 }

@@ -1,10 +1,12 @@
 //! Recovers how the iframe copies the embedding page's `extraParams` message fields into
 //! randomly named `_cf_chl_opt` options.
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 use swc_core::ecma::ast::{
-    AssignTarget, BinaryOp, CallExpr, Callee, Decl, Expr, FnDecl, Pat, SimpleAssignTarget, Stmt,
-    UnaryOp,
+    AssignOp, AssignTarget, BinaryOp, CallExpr, Callee, Decl, Expr, FnDecl, Pat,
+    SimpleAssignTarget, Stmt, UnaryOp,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
@@ -281,17 +283,16 @@ fn writes(function: &FnDecl) -> Vec<OptionWrite> {
         return Vec::new();
     };
     // Some options pass through a local so stored browser state can override them before they
-    // are written back.
-    let mut staged: Vec<(&str, &str)> = Vec::new();
+    // are written back. Keep only the latest straight-line value; `None` invalidates a copy.
+    let mut staged: HashMap<&str, Option<&str>> = HashMap::new();
     let mut writes = Vec::new();
     for statement in &body.stmts {
         if let Stmt::Decl(Decl::Var(declaration)) = statement {
             for binding in &declaration.decls {
                 if let Pat::Ident(local) = &binding.name
                     && let Some(value) = &binding.init
-                    && let Some(option) = expression::option_key(value)
                 {
-                    staged.push((&local.id.sym, option));
+                    staged.insert(&local.id.sym, expression::option_key(value.unwrap_parens()));
                 }
             }
         }
@@ -302,19 +303,20 @@ fn writes(function: &FnDecl) -> Vec<OptionWrite> {
         let Some(assignment) = expression::assignment(statement) else {
             continue;
         };
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(local)) = &assignment.left
-            && let Some(option) = expression::option_key(&assignment.right)
-        {
-            staged.push((&local.id.sym, option));
+        let assigned =
+            (assignment.op == AssignOp::Assign).then_some(assignment.right.unwrap_parens());
+        if let AssignTarget::Simple(SimpleAssignTarget::Ident(local)) = &assignment.left {
+            staged.insert(&local.id.sym, assigned.and_then(expression::option_key));
             continue;
         }
         let Some(option) = expression::option_assignment(&assignment.left).map(str::to_owned)
         else {
             continue;
         };
-        let (mut value, default) = read(&assignment.right, &parameters);
-        if let (Written::Other, Expr::Ident(ident)) = (&value, &*assignment.right)
-            && let Some((_, from)) = staged.iter().rfind(|(local, _)| *local == &*ident.sym)
+        let (mut value, default) =
+            assigned.map_or((Written::Other, None), |value| read(value, &parameters));
+        if let (Written::Other, Some(Expr::Ident(ident))) = (&value, assigned)
+            && let Some(Some(from)) = staged.get(&*ident.sym)
         {
             value = Written::Copied((*from).to_owned());
         }
@@ -478,7 +480,14 @@ mod tests {
     fn copies_bootstrap_values_staged_by_a_declaration_or_assignment() {
         for initial in [
             "var saved = e._cf_chl_opt.seed;",
+            "let saved = e._cf_chl_opt.seed;",
+            "const saved = e._cf_chl_opt.seed;",
+            "var unused, saved = (e._cf_chl_opt.seed);",
             "saved = e._cf_chl_opt.seed;",
+            "saved = (e._cf_chl_opt.seed);",
+            "var saved = e._cf_chl_opt.other; saved = e._cf_chl_opt.seed;",
+            "saved = e._cf_chl_opt.other; var saved = e._cf_chl_opt.seed;",
+            "var saved = e._cf_chl_opt.seed; var saved;",
         ] {
             let source = SOURCE.replace(
                 "e._cf_chl_opt.WbdgY0 = z2;",
@@ -489,7 +498,7 @@ mod tests {
                     var cached = localStorage.getItem("visitor");
                     if (cached) {{ saved = cached; }}
                 }} catch (error) {{}}
-                e._cf_chl_opt.WbdgY0 = saved;
+                e._cf_chl_opt.WbdgY0 = (saved);
             "#
                 ),
             );
@@ -499,7 +508,11 @@ mod tests {
                 .iter()
                 .find(|entry| entry.option == "WbdgY0")
                 .unwrap();
-            assert_eq!(entry.source, OptionSource::Copied("seed".into()));
+            assert_eq!(
+                entry.source,
+                OptionSource::Copied("seed".into()),
+                "{initial}"
+            );
             let mut options = Options::from_iter([("seed".into(), json!("synthetic-visitor"))]);
             assert!(
                 mapping
@@ -507,6 +520,34 @@ mod tests {
                     .is_empty()
             );
             assert_eq!(options["WbdgY0"], json!("synthetic-visitor"));
+        }
+    }
+
+    #[test]
+    fn does_not_reuse_copies_after_overwrites_or_compound_assignments() {
+        for body in [
+            "saved = undefined; e._cf_chl_opt.WbdgY0 = saved;",
+            "var saved = undefined; e._cf_chl_opt.WbdgY0 = saved;",
+            "saved += e._cf_chl_opt.other; e._cf_chl_opt.WbdgY0 = saved;",
+            "e._cf_chl_opt.WbdgY0 += saved;",
+        ] {
+            let source = SOURCE.replace(
+                "e._cf_chl_opt.WbdgY0 = z2;",
+                &format!("var saved = e._cf_chl_opt.seed; {body}"),
+            );
+            let mapping = Mapping::from_javascript(&source).unwrap();
+            assert_eq!(
+                mapping.0.last().unwrap().source,
+                OptionSource::Runtime,
+                "{body}"
+            );
+            let mut options = Options::from_iter([("seed".into(), json!("synthetic-visitor"))]);
+            assert_eq!(
+                mapping.merge(&mut options, &json!({}), "https://example.com", 1),
+                ["WbdgY0"],
+                "{body}",
+            );
+            assert!(!options.contains_key("WbdgY0"), "{body}");
         }
     }
 

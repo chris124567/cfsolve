@@ -216,14 +216,15 @@ impl<'ast> Run<'ast, '_> {
                 let Value::Array(elements) = &this else {
                     return self.apply(Value::symbolic(global()), this, arguments);
                 };
-                // Constructor-created VM stacks are concrete during handler decoding. Keep
-                // installed exception frames visible even when pushing them is evaluated here.
+                // Preserve [pc, key, cells, depth] frames for disassembly even when the
+                // constructor-created stack is concrete. Other pushes need no symbolic effect.
                 for value in &arguments {
-                    if let Value::Array(frame) = value {
-                        let frame: Vec<_> = frame.borrow().iter().map(Value::expr).collect();
-                        if crate::vm::catch_frame(&frame).is_some() {
-                            self.temp(Term::Array(frame));
-                        }
+                    if let Value::Array(frame) = value
+                        && frame.borrow().len() == 4
+                        && let Term::Array(frame) = value.expr()
+                        && crate::vm::catch_frame(&frame).is_some()
+                    {
+                        self.temp(Term::Array(frame));
                     }
                 }
                 let mut elements = elements.borrow_mut();
@@ -628,11 +629,25 @@ mod tests {
             vec![crate::vm::Effect::Let(0, expected.clone())]
         );
         assert_eq!(stack.expr(), Term::Array(vec![expected]));
-        assert_eq!(
-            number(run.builtin(Builtin::Push, stack, vec![Value::Number(9.0)])),
-            2.0
-        );
-        assert_eq!(run.effects.len(), 1);
+        for (length, value) in [
+            (2.0, Value::Number(9.0)),
+            (3.0, Value::array(vec![Value::Number(42.0)])),
+            (
+                4.0,
+                Value::array(vec![
+                    Value::Number(42.0),
+                    Value::Number(256.0),
+                    Value::Cells,
+                    Value::Number(0.0),
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                number(run.builtin(Builtin::Push, stack.clone(), vec![value])),
+                length
+            );
+            assert_eq!(run.effects.len(), 1);
+        }
     }
 
     /// Checks `SameValueZero` membership: the set contains 1, "1", NaN, and 0 after duplicate
