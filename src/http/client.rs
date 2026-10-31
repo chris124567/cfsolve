@@ -109,7 +109,10 @@ impl BrowserClient {
             .default_headers(headers)
             .cookie_provider(Arc::clone(&jar))
             .redirect(Policy::limited(5))
-            .timeout(Duration::from_secs(30));
+            .timeout(Duration::from_secs(30))
+            // Without a proxy, connect directly. A system proxy would send the solve out from
+            // another address than the caller's own requests, and the clearance is bound to it.
+            .no_proxy();
         if let Some(proxy) = proxy {
             builder = builder.proxy(Proxy::all(proxy)?);
         }
