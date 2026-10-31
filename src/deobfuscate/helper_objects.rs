@@ -75,7 +75,7 @@ impl ObjectProperties {
             // A regular expression carries state and identity, so it cannot
             // stand in for every read.
             Expr::Lit(literal) if !matches!(literal, Lit::Regex(_)) => {
-                self.literals.insert(name, Expr::Lit(literal.clone()));
+                self.literals.insert(name, value.clone());
             }
             Expr::Tpl(template) if template.exprs.is_empty() => {
                 self.literals.insert(name, value.clone());
@@ -779,19 +779,26 @@ mod tests {
     #[test]
     fn inlines_static_template_properties_without_evaluating_interpolation() {
         let output = transform(
-            "function f() { var helper; helper = { first: `fixed` }; \
-             helper.second = `line\\n\\u{1f600}`; \
-             helper.dynamic = `value:${read()}`; \
-             return function() { return [helper.first, helper.second, helper.dynamic]; }; }",
+            r"function f() {
+                var helper;
+                helper = { first: `fixed` };
+                helper.second = `line\n\u{1f600}\ud800`;
+                helper.dynamic = `value:${read()}`;
+                return function() { return [helper.first, helper.second, helper.dynamic]; };
+            }",
         );
         testing::assert_contains(
             &output,
             &[],
-            &["return [`fixed`, `line\\n\\u{1f600}`, helper.dynamic]"],
+            &[r"return [`fixed`, `line\n\u{1f600}\ud800`, helper.dynamic]"],
         );
         let output = transform(
-            "function f() { var helper; helper = { name: `before` }; \
-             helper.name = `after`; return helper.name; }",
+            r"function f() {
+                var helper;
+                helper = { name: `before` };
+                helper.name = `after`;
+                return helper.name;
+            }",
         );
         assert!(output.contains("return helper.name;"), "{output}");
     }
