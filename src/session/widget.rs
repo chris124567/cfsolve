@@ -11,6 +11,7 @@ use super::initial::{self, EmbeddingPage, Fetched, Merged};
 use super::timing::Timer;
 use super::{Sink, interaction, probes};
 use crate::browser::{Page, Solve};
+use crate::challenge::installed::Installed;
 use crate::challenge::orchestrator::ChallengePage;
 use crate::challenge::program::{ExtractedProgram, PreparedSession, SessionEncoder};
 use crate::challenge::source::InitialRequest;
@@ -211,6 +212,7 @@ async fn start_widget<'caller>(
         sink,
         fetched,
         request: program.request,
+        installed: program.installed,
         encoder,
         embedding: embedding_page.embedding,
         merged,
@@ -314,6 +316,8 @@ pub(crate) struct WidgetSession<'caller> {
     pub fetched: Fetched,
     /// POST destination and options reported by the first payload.
     pub request: InitialRequest,
+    /// Initial-program facts reused when refreshing captured probe answers.
+    pub installed: Installed,
     pub encoder: SessionEncoder,
     pub embedding: Embedding,
     pub merged: Merged,

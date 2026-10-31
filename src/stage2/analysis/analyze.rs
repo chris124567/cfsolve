@@ -167,12 +167,7 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     for (position, raw) in discovery.probes.into_iter().enumerate() {
         let to_reference = |text: &String| vocabulary.to_reference(position, text).to_owned();
         let features: Vec<String> = raw.features.iter().map(to_reference).collect();
-        let outputs: BTreeSet<String> = raw
-            .outputs
-            .iter()
-            .filter(|name| raw.writes.fields.contains(name))
-            .map(to_reference)
-            .collect();
+        let outputs: BTreeSet<String> = raw.writes.fields.iter().map(to_reference).collect();
         let reference = vocabulary.partner(position);
         // Treat an unrecognized computed probe as a device fact and replay its paired reference
         // answer.

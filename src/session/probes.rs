@@ -83,42 +83,8 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
     window.extend(profile.window.clone());
 
     let replay = answers
-        .map(|answers| Replay::for_session(answers, plan, &session.fetched.source))
+        .map(|answers| Replay::new(answers, plan, &session.fetched.source, &session.installed))
         .transpose()?;
-    let css_override =
-        if let Some(answers) = answers.filter(|answers| !answers.stylesheets.is_empty()) {
-            let probe = plan
-                .probes()
-                .iter()
-                .find(|probe| plan.vocabulary().partner(probe.position()) == Some(34))
-                .context("no stylesheet probe")?;
-            let marker = probe
-                .features
-                .iter()
-                .find(|text| {
-                    text.strip_prefix('.')
-                        .is_some_and(crate::stage2::vocabulary::is_name)
-                })
-                .context("no stylesheet marker")?;
-            let (hash, marker_css) = crate::stage2::probes::stylesheets::measurement(
-                &answers.stylesheets,
-                &session.fetched.iframe.html,
-                marker,
-            )?;
-            Some((
-                probe.index.to_string(),
-                plan.vocabulary()
-                    .to_session(probe.position(), "VukLq9")
-                    .to_owned(),
-                hash,
-                plan.vocabulary()
-                    .to_session(probe.position(), "QqUE6")
-                    .to_owned(),
-                marker_css,
-            ))
-        } else {
-            None
-        };
     let pending_ms = i64::from(profile.pending_ms);
     let schedule = timing::schedule(
         &durations(plan, &profile.durations, &observed, replay.as_ref()),
@@ -143,6 +109,7 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
     }
     let stored = replay::Session {
         iframe_url: session.fetched.iframe.url.as_str(),
+        iframe_html: &session.fetched.iframe.html,
         modified: Local::now().format("%m/%d/%Y %H:%M:%S").to_string(),
         referrer: session.fetched.referrer.as_deref().unwrap_or_default(),
         navigation: &session.fetched.iframe.navigation,
@@ -168,20 +135,12 @@ pub(crate) async fn prepare(session: &WidgetSession<'_>, solve: &Solve) -> Resul
         &profile.document,
         pending_ms,
     )?;
-    if let Some((probe, field, hash, marker, css)) = css_override {
-        let record = plaintext
-            .get_mut(&probe)
-            .and_then(JsValue::as_object_mut)
-            .context("missing stylesheet record")?;
-        record.insert(field, json!(hash));
-        record.insert(marker, json!(css));
-    }
     ensure!(
         plaintext.len() > plan.probes().len(),
         "the assembled payload holds nothing besides records"
     );
     payload::append_send_time_at(&mut plaintext, &merged.state, &options, schedule.send_at);
-    let geometry = window_geometry(plan, replay.as_ref(), &plaintext);
+    let geometry = window_geometry(replay.as_ref(), &plaintext);
     Ok(ProbeSubmission {
         payload: Submission {
             plaintext,
@@ -505,13 +464,9 @@ fn records(
 }
 
 /// Window dimensions and position already reported by the environment audit.
-fn window_geometry(
-    plan: &ProbePlan,
-    replay: Option<&Replay<'_>>,
-    payload: &Payload,
-) -> BTreeMap<String, f64> {
+fn window_geometry(replay: Option<&Replay<'_>>, payload: &Payload) -> BTreeMap<String, f64> {
     let groups = replay
-        .and_then(|replay| replay.audit_groups(plan, payload))
+        .and_then(|replay| replay.audit_groups(payload))
         .into_iter()
         .flatten();
     let mut geometry = BTreeMap::new();

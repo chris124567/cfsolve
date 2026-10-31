@@ -7,6 +7,16 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+use crate::stage2::{
+    records::Probe,
+    reference::{STYLESHEET_DIGEST, STYLESHEET_MARKER},
+    vocabulary,
+};
+use crate::{
+    candidates,
+    js::{JsObject, json},
+};
+
 static SESSION_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"_[0-9a-fA-F]{24}|[A-Za-z]{3,5}[0-9]").unwrap());
 
@@ -107,11 +117,29 @@ pub(crate) fn sources(html: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn measurement(
+/// Updates the stored fields before replay translates reference names and arranges the record.
+pub(crate) fn refresh(
     snapshots: &[Snapshot],
+    probe: &Probe,
     html: &str,
-    marker: &str,
-) -> Result<(String, String)> {
+    fields: &mut JsObject,
+) -> Result<()> {
+    let markers = probe
+        .features
+        .iter()
+        .filter(|text| text.strip_prefix('.').is_some_and(vocabulary::is_name));
+    let marker = candidates::at_most_one_distinct(markers, "stylesheet marker")?
+        .context("no stylesheet marker")?;
+    let (digest, marker_css) = measurement(snapshots, html, marker)?;
+    for (field, value) in [(STYLESHEET_DIGEST, digest), (STYLESHEET_MARKER, marker_css)] {
+        *fields
+            .get_mut(field)
+            .with_context(|| format!("missing stylesheet field {field}"))? = json!(value);
+    }
+    Ok(())
+}
+
+fn measurement(snapshots: &[Snapshot], html: &str, marker: &str) -> Result<(String, String)> {
     let sources = sources(html);
     for snapshot in snapshots {
         let Ok(sheets) = snapshot.replay(&sources) else {
@@ -123,7 +151,10 @@ pub(crate) fn measurement(
             let text = rules.join("|");
             let indexed = format!("{text}{index}");
             if text.contains(marker) {
-                marker_text = Some(indexed);
+                ensure!(
+                    marker_text.replace(indexed).is_none(),
+                    "multiple marker stylesheets"
+                );
             } else {
                 measured.push(indexed);
             }
@@ -198,5 +229,21 @@ mod tests {
         assert!(measurement(&[snapshot], fresh, ".Missing5").is_err());
         assert!(measurement(&[], fresh, ".Mnop4").is_err());
         assert!(Snapshot::capture(html, vec![]).is_err());
+        let duplicate = Snapshot::capture(
+            "<style>.Abcd1{color:red}</style><style>.Abcd1{margin:0}</style>",
+            vec![
+                vec![".Abcd1 { color: red; }".into()],
+                vec![".Abcd1 { margin: 0px; }".into()],
+            ],
+        )
+        .unwrap();
+        assert!(
+            measurement(
+                &[duplicate],
+                "<style>.Abcd1{color:red}</style><style>.Abcd1{margin:0}</style>",
+                ".Abcd1"
+            )
+            .is_err()
+        );
     }
 }

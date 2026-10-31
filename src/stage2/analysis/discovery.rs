@@ -41,8 +41,6 @@ pub(super) struct RawProbe {
     /// Collection-function strings in order, including duplicates.
     pub features: Vec<String>,
     pub expanded_features: Vec<String>,
-    /// The names it stores into registers or properties.
-    pub outputs: BTreeSet<String>,
     pub writes: WriteOrder,
 }
 
@@ -130,7 +128,7 @@ pub(super) fn discover(index: &Index<'_>, pool: &str) -> Result<ProbeDiscovery> 
                 _ => None,
             })
             .context("probe has no collection function")?;
-        let (features, outputs, expanded_features) =
+        let (features, expanded_features) =
             collection_strings(index, function.pc, &dispatcher, pool);
         traced.push(trace_writes(index, function.pc, &dispatcher));
         probes.push(RawProbe {
@@ -141,7 +139,6 @@ pub(super) fn discover(index: &Index<'_>, pool: &str) -> Result<ProbeDiscovery> 
             function,
             features,
             expanded_features,
-            outputs,
             writes: WriteOrder::default(),
         });
     }
@@ -248,10 +245,9 @@ fn collection_strings(
     entry: u32,
     dispatcher: &RangeInclusive<u32>,
     pool: &str,
-) -> (Vec<String>, BTreeSet<String>, Vec<String>) {
+) -> (Vec<String>, Vec<String>) {
     let mut strings: BTreeMap<u32, Vec<String>> = BTreeMap::new();
     let mut expanded: BTreeMap<u32, Vec<String>> = BTreeMap::new();
-    let mut outputs = BTreeSet::new();
     let outside = |pc: u32| !dispatcher.contains(&pc);
     // Keep the original feature sequence stable as newly recovered exception paths add
     // evidence. The expanded sequence includes those paths for cross-build name recovery.
@@ -290,14 +286,6 @@ fn collection_strings(
                             }
                         }
                     });
-                    let output = match effect {
-                        Effect::Set(_, term) => Some(term),
-                        Effect::SetProperty { key, .. } => Some(&**key),
-                        _ => None,
-                    };
-                    if let Some(Term::Const(Constant::String(name))) = output {
-                        outputs.insert(name.clone());
-                    }
                     effect.visit_terms(&mut |term| match term {
                         Term::Const(Constant::String(text)) if text.len() <= FEATURE_LENGTH => {
                             let decoded = (text.starts_with('\0') || text.starts_with("ÿÿ"))
@@ -333,7 +321,6 @@ fn collection_strings(
     );
     (
         strings.into_values().flatten().collect(),
-        outputs,
         expanded.into_values().flatten().collect(),
     )
 }

@@ -62,6 +62,8 @@ pub(crate) const COMPUTED_STYLE_MAP: &str = "dKjG5";
 pub(crate) const FONT_FACE_OUTPUTS: [&str; 4] = ["IzIpb8", "kxzY1", "EgIt8", "LvRtb9"];
 pub(crate) const FONT_CANVAS_OUTPUTS: [&str; 3] = ["sibaD1", "uoBG2", "jrVX6"];
 pub(crate) const FONT_DOM_OUTPUTS: [&str; 2] = ["SUBTl0", "vqzXM2"];
+pub(crate) const STYLESHEET_DIGEST: &str = "VukLq9";
+pub(crate) const STYLESHEET_MARKER: &str = "QqUE6";
 
 // Environment and environment-audit names with session-specific replay patches.
 

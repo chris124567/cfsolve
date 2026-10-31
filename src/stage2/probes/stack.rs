@@ -63,10 +63,8 @@ fn construction(index: &Index<'_>, entry: u32) -> Option<u8> {
         })
 }
 
-/// Finds the output field hidden by base64 encoding and a two-byte XOR key. A name that decodes to
-/// `stack` identifies the key. The output field is the remaining name after excluding `stack` and
-/// the record counter from the header.
-fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Option<String> {
+/// A two-byte XOR key that spells `stack` identifies the encoded string table.
+fn encoded_names(features: &[String]) -> Option<Vec<String>> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
@@ -84,28 +82,47 @@ fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Optio
         })
         .filter(|bytes| (3..=25).contains(&bytes.len()))
         .collect();
-    for candidate in decoded.iter().filter(|bytes| bytes.len() == "stack".len()) {
-        let key = [candidate[0] ^ b's', candidate[1] ^ b't'];
-        let reveal = |bytes: &Vec<u8>| {
-            let revealed = bytes
+    let keys: BTreeSet<_> = decoded
+        .iter()
+        .filter(|bytes| bytes.len() == 5)
+        .filter_map(|candidate| {
+            let key = [candidate[0] ^ b's', candidate[1] ^ b't'];
+            candidate
                 .iter()
-                .zip(key.iter().cycle())
-                .map(|(byte, mask)| byte ^ mask);
-            String::from_utf8(revealed.collect()).ok()
-        };
-        if reveal(candidate).as_deref() != Some("stack") {
-            continue;
-        }
-        // Plain strings such as `this` can also be valid base64. Restrict candidates to the
-        // four-to-nine-character program names.
-        let names = decoded.iter().filter_map(reveal).filter(|name| {
-            crate::stage2::vocabulary::is_name(name) && name != "stack" && !header.contains(name)
-        });
-        if let Ok(result) = candidates::exactly_one(names, "stack result field") {
-            return Some(result);
-        }
-    }
-    None
+                .zip(b"stack")
+                .enumerate()
+                .all(|(index, (cipher, plain))| cipher ^ key[index % 2] == *plain)
+                .then_some(key)
+        })
+        .collect();
+    let key = candidates::exactly_one(keys, "stack string key").ok()?;
+    Some(
+        decoded
+            .iter()
+            .filter_map(|bytes| {
+                String::from_utf8(
+                    bytes
+                        .iter()
+                        .zip(key.iter().cycle())
+                        .map(|(byte, mask)| byte ^ mask)
+                        .collect(),
+                )
+                .ok()
+            })
+            .collect(),
+    )
+}
+
+/// Ignore ordinary base64-looking words and the record counter when identifying the output.
+fn encoded_result_field(names: &[String], header: &BTreeSet<String>) -> Option<String> {
+    let names = names.iter().filter(|name| {
+        crate::stage2::vocabulary::is_name(name)
+            && name.as_str() != "stack"
+            && !header.contains(*name)
+    });
+    candidates::at_most_one_distinct(names, "stack result field")
+        .ok()?
+        .cloned()
 }
 
 /// Finds the output field in the string table by excluding the header's record-counter name,
@@ -141,26 +158,13 @@ fn result_field(features: &[String], header: &BTreeSet<String>) -> Option<String
 }
 
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
-    result_field(probe.session_features, probe.header)
-        .or_else(|| encoded_result_field(probe.session_features, probe.header))
+    let encoded = encoded_names(probe.session_features);
+    let calls = calls(probe.index, probe.entry);
+    let result = result_field(probe.session_features, probe.header)
+        .or_else(|| encoded_result_field(encoded.as_ref()?, probe.header))
         .or_else(|| {
-            use base64::Engine;
-            use base64::engine::general_purpose::STANDARD;
-            calls(probe.index, probe.entry)?;
-            let encoded_stack = probe.session_features.iter().any(|text| {
-                let Ok(bytes) = STANDARD.decode(text) else {
-                    return false;
-                };
-                bytes.len() == 5
-                    && bytes
-                        .iter()
-                        .zip(b"stack")
-                        .enumerate()
-                        .all(|(i, (byte, plain))| byte ^ plain == bytes[i % 2] ^ b"stack"[i % 2])
-            });
-            if !encoded_stack {
-                return None;
-            }
+            calls.as_ref()?;
+            encoded.as_ref()?;
             let fields = probe.writes.fields.iter().filter(|name| {
                 crate::stage2::vocabulary::is_name(name)
                     && !probe.header.contains(*name)
@@ -169,11 +173,8 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
             candidates::exactly_one(fields, "plain stack result")
                 .ok()
                 .cloned()
-        })
-        .map(|result| Fields {
-            result,
-            calls: calls(probe.index, probe.entry),
-        })
+        })?;
+    Some(Fields { result, calls })
 }
 
 #[cfg(test)]
@@ -214,12 +215,38 @@ mod tests {
             ],
         ] {
             let features = features.map(str::to_owned);
+            let names = encoded_names(&features).unwrap();
             assert_eq!(
-                encoded_result_field(&features, &header).as_deref(),
+                encoded_result_field(&names, &header).as_deref(),
                 Some("CJkad9"),
                 "{features:?}"
             );
-            assert!(encoded_result_field(&features, &BTreeSet::new()).is_none());
+            assert!(encoded_result_field(&names, &BTreeSet::new()).is_none());
         }
+    }
+
+    #[test]
+    fn decodes_inline_tables_and_rejects_conflicting_keys() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let encode = |text: &str, key: [u8; 2]| {
+            STANDARD.encode(
+                text.bytes()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ key[index % 2])
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let key = [17, 44];
+        let field = "_0123456789abcdef01234567";
+        let features = ["stack", field].map(|text| {
+            let encoded = encode(text, key);
+            format!("\0{}{encoded}padding", char::from(encoded.len() as u8))
+        });
+        let names = encoded_names(&features).unwrap();
+        assert_eq!(
+            encoded_result_field(&names, &BTreeSet::new()).as_deref(),
+            Some(field)
+        );
+        assert!(encoded_names(&[encode("stack", key), encode("stack", [18, 45])]).is_none());
     }
 }

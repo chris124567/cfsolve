@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::analysis;
 pub use super::probes::stylesheets::Snapshot as StylesheetSnapshot;
-use super::probes::worker_navigator;
+use super::probes::{stylesheets, worker_navigator};
 use super::records::{ArrangedFields, Probe, ProbePlan};
 use super::reference::{
     ENVIRONMENT_AUDIT_DECODED, ENVIRONMENT_AUDIT_ENCODED, ENVIRONMENT_AUDIT_GROUPS,
@@ -29,6 +29,7 @@ use super::registry::{AUDIT_PROBE, Kind, Operation, Treatment};
 pub use super::session_names::CapturedNames;
 use super::trace::Trace;
 use super::vocabulary::Vocabulary;
+use crate::challenge::installed::Installed;
 use crate::http::ResponseMetrics;
 use crate::js::{JsObject, JsValue, Options, Payload, json};
 use crate::script::Source;
@@ -45,7 +46,7 @@ pub struct Answers {
     /// Captured source/CSSOM pairs for stylesheet revisions this profile supports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stylesheets: Vec<StylesheetSnapshot>,
-    /// Source evidence for names and trace frames that change between sessions.
+    /// Source evidence for names that change between sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub names: Option<CapturedNames>,
 }
@@ -74,7 +75,7 @@ impl Answers {
         let is_envelope = |name: &String| envelope_names.contains(&name.as_str());
         let mut answers = Self {
             reference: REFERENCE.digest.clone(),
-            names: Some(CapturedNames::capture(source, plan, payload)?),
+            names: Some(CapturedNames::capture(source, plan)?),
             ..Self::default()
         };
         for probe in plan.probes() {
@@ -159,13 +160,18 @@ pub struct Replay<'answers> {
     answers: &'answers Answers,
     vocabulary: Vocabulary,
     refresh: Option<super::session_names::Refresh>,
-    context: Option<&'answers ProbePlan>,
+    plan: &'answers ProbePlan,
 }
 
 impl<'answers> Replay<'answers> {
-    /// Matches `answers` to `plan`'s probes using the plan's vocabulary.
-    #[must_use]
-    pub fn new(answers: &'answers Answers, plan: &'answers ProbePlan) -> Self {
+    /// Matches and validates stored answers, preparing names for the current program.
+    pub fn new(
+        answers: &'answers Answers,
+        plan: &'answers ProbePlan,
+        source: &Source,
+        installed: &Installed,
+    ) -> Result<Self> {
+        answers.check()?;
         let mut vocabulary = plan.vocabulary().clone();
         let mut common: HashSet<&str> = plan
             .probes()
@@ -191,34 +197,24 @@ impl<'answers> Replay<'answers> {
                 );
             }
         }
-        Self {
-            answers,
-            vocabulary,
-            refresh: None,
-            context: None,
-        }
-    }
-
-    /// Prepares and validates replay, including names captured from a previous session.
-    pub fn for_session(
-        answers: &'answers Answers,
-        plan: &'answers ProbePlan,
-        source: &Source,
-    ) -> Result<Self> {
-        let mut replay = Self::new(answers, plan);
-        replay.refresh = answers
+        let refresh = answers
             .names
             .as_ref()
-            .map(|names| super::session_names::Refresh::new(names, source, plan))
+            .map(|names| super::session_names::Refresh::new(names, source, plan, installed))
             .transpose()?;
-        replay.context = Some(plan);
-        replay.validate(plan)?;
+        let replay = Self {
+            answers,
+            vocabulary,
+            refresh,
+            plan,
+        };
+        replay.validate()?;
         Ok(replay)
     }
 
-    pub fn validate(&self, plan: &ProbePlan) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         let mut failures = Vec::new();
-        for probe in plan.probes() {
+        for probe in self.plan.probes() {
             let Some(partner) = self.vocabulary.partner(probe.position()) else {
                 continue;
             };
@@ -244,17 +240,17 @@ impl<'answers> Replay<'answers> {
             if probe
                 .expanded_features
                 .iter()
-                .any(|name| name.starts_with('_') && name.len() == 25)
+                .any(|name| super::vocabulary::hashed_name(name))
             {
                 let mut names = BTreeSet::new();
-                fn collect(value: &JsValue, names: &mut BTreeSet<String>) {
+                fn collect<'a>(value: &'a JsValue, names: &mut BTreeSet<&'a str>) {
                     match value {
                         JsValue::String(text) => {
-                            names.insert(text.clone());
+                            names.insert(text);
                         }
                         JsValue::Object(object) => {
                             for (key, value) in object {
-                                names.insert(key.clone());
+                                names.insert(key);
                                 collect(value, names);
                             }
                         }
@@ -266,13 +262,16 @@ impl<'answers> Replay<'answers> {
                         _ => {}
                     }
                 }
-                collect(&JsValue::Object(stored.fields.clone()), &mut names);
+                for (key, value) in &stored.fields {
+                    names.insert(key.as_str());
+                    collect(value, &mut names);
+                }
                 let reference = &super::reference::EXPANDED_REFERENCE.probes[partner - 1];
                 names.retain(|name| {
                     super::vocabulary::is_name(name)
-                        && reference.contains(name)
-                        && !probe.expanded_features.contains(name)
-                        && self.vocabulary.to_session(probe.position(), name) == name
+                        && reference.iter().any(|text| text == name)
+                        && !probe.expanded_features.iter().any(|text| text == name)
+                        && self.vocabulary.to_session(probe.position(), name) == *name
                 });
                 if !names.is_empty() {
                     failures.push(format!("probe {} nested values: {:?}", probe.index, names));
@@ -289,18 +288,14 @@ impl<'answers> Replay<'answers> {
 
     /// Finds environment-audit groups that report window dimensions and position.
     #[must_use]
-    pub fn audit_groups<'r>(
-        &self,
-        plan: &ProbePlan,
-        records: &'r JsObject,
-    ) -> Option<&'r JsObject> {
-        let position = (0..plan.probes().len())
+    pub fn audit_groups<'r>(&self, records: &'r JsObject) -> Option<&'r JsObject> {
+        let position = (0..self.plan.probes().len())
             .find(|&position| self.vocabulary.partner(position) == Some(AUDIT_PROBE))?;
         let groups = self
             .vocabulary
             .to_session(position, ENVIRONMENT_AUDIT_GROUPS);
         records
-            .get(&plan.probes()[position].index.to_string())?
+            .get(&self.plan.probes()[position].index.to_string())?
             .get(groups)?
             .as_object()
     }
@@ -336,11 +331,32 @@ impl<'answers> Replay<'answers> {
         let stored = self.answers.probes.get(&partner).with_context(missing)?;
         let mut fields = stored.fields.clone();
         session.patch(probe, &mut fields)?;
+        if Kind::Stylesheets.references().contains(&partner) && !self.answers.stylesheets.is_empty()
+        {
+            stylesheets::refresh(
+                &self.answers.stylesheets,
+                probe,
+                session.iframe_html,
+                &mut fields,
+            )?;
+        }
+        // Profiles without source evidence retain the original trace-only refresh.
+        if self.refresh.is_none()
+            && let Some(groups) = fields
+                .get_mut(ENVIRONMENT_AUDIT_GROUPS)
+                .and_then(JsValue::as_object_mut)
+        {
+            let trace = session
+                .trace
+                .as_ref()
+                .context("the environment audit needs the iframe's trace")?;
+            refresh_trace(trace, groups, &probe.features, session.controller)?;
+        }
         let mut arranged = ArrangedFields::split(fields, &stored.late);
         for fields in [&mut arranged.early, &mut arranged.late] {
             self.vocabulary.rewrite_to_session(position, fields);
-            if let (Some(refresh), Some(plan)) = (&self.refresh, self.context) {
-                refresh.apply(probe, plan, fields)?;
+            if let Some(refresh) = &self.refresh {
+                refresh.apply(probe, &self.vocabulary, fields)?;
             }
         }
         Ok(arranged)
@@ -351,6 +367,8 @@ impl<'answers> Replay<'answers> {
 pub struct Session<'session> {
     /// The iframe's URL, which records report as the referrer, base URI and stack locations.
     pub iframe_url: &'session str,
+    /// Current iframe stylesheets, used to refresh captured CSSOM measurements.
+    pub iframe_html: &'session str,
     /// `document.lastModified`, as the browser formats it.
     pub modified: String,
     /// Iframe `document.referrer`, set by the embedding page's policy or empty when absent.
@@ -367,23 +385,13 @@ pub struct Session<'session> {
 
 impl Session<'_> {
     /// Patches a stored record while it still uses reference names: document identity, the
-    /// referrer, and the environment audit's trace membership and navigation measurements.
+    /// referrer, and the environment audit's navigation measurements.
     fn patch(&self, probe: &Probe, fields: &mut JsObject) -> Result<()> {
         for value in fields.values_mut() {
             refresh_transplant(value, self.iframe_url, &self.modified);
         }
         if let Some(referrer) = fields.get_mut(ENVIRONMENT_REFERRER) {
             *referrer = json!(self.referrer);
-        }
-        if let Some(groups) = fields
-            .get_mut(ENVIRONMENT_AUDIT_GROUPS)
-            .and_then(JsValue::as_object_mut)
-        {
-            let trace = self
-                .trace
-                .as_ref()
-                .context("the environment audit needs the iframe's trace")?;
-            refresh_trace(trace, groups, &probe.features, self.controller)?;
         }
         if let Some(values) = fields
             .get_mut(ENVIRONMENT_AUDIT_VALUES)
@@ -571,6 +579,93 @@ fn refresh_transplant(value: &mut JsValue, iframe_url: &str, modified: &str) {
 mod tests {
     use super::*;
     use crate::js;
+
+    #[test]
+    fn stylesheet_refresh_preserves_field_order_and_late_callbacks() {
+        use super::super::reference::{STYLESHEET_DIGEST, STYLESHEET_MARKER};
+        let probes: Vec<_> = REFERENCE.probes.iter().enumerate().map(|(position, features)| {
+            json!({"index":position + 1, "token":"test", "input":{}, "features":features})
+        }).collect();
+        let mut plan: ProbePlan = js::from_value(json!({
+            "record_fields":{"counter":"counter", "token":"token", "input":"input",
+                "status":"status", "message":"message", "started":"started",
+                "finished":"finished", "duration":"duration"},
+            "payload":{"template":{"fields":{}}, "published":[], "footer":{}, "pending":null},
+            "probes":probes
+        }))
+        .unwrap();
+        let position = Kind::Stylesheets.references()[0] - 1;
+        // The embedded reference already contains its marker; use that selector in both revisions.
+        let marker = plan.probes[position]
+            .features
+            .iter()
+            .find(|text| text.starts_with('.'))
+            .unwrap()
+            .clone();
+        let html = format!("<style>.Abcd1{{color:red}}</style><style>{marker}{{margin:0}}</style>");
+        let snapshot = StylesheetSnapshot::capture(
+            &html,
+            vec![
+                vec![".Abcd1 { color: red; }".into()],
+                vec![format!("{marker} {{ margin: 0px; }}")],
+            ],
+        )
+        .unwrap();
+        let fields = JsObject::from_iter([
+            ("unchanged".into(), json!(true)),
+            (STYLESHEET_DIGEST.into(), json!("stale")),
+            (STYLESHEET_MARKER.into(), json!("stale")),
+        ]);
+        plan.probes[position].writes.fields = fields.keys().cloned().collect();
+        let mut answers = Answers {
+            reference: REFERENCE.digest.clone(),
+            probes: BTreeMap::from([(
+                position + 1,
+                Stored {
+                    duration: None,
+                    fields,
+                    late: vec![STYLESHEET_MARKER.into()],
+                },
+            )]),
+            stylesheets: vec![snapshot],
+            ..Answers::default()
+        };
+        let source = Source::try_new("var root = this || self;").unwrap();
+        let installed = Installed::default();
+        let replay = Replay::new(&answers, &plan, &source, &installed).unwrap();
+        let navigation = ResponseMetrics::default();
+        let options = Options::new();
+        let mut session = Session {
+            iframe_url: CURRENT,
+            iframe_html: &html,
+            modified: "01/01/2000 00:00:00".into(),
+            referrer: "https://example.com/",
+            navigation: &navigation,
+            options: &options,
+            trace: None,
+            controller: None,
+        };
+        let result = replay.answer(&plan.probes[position], &session).unwrap();
+        assert_eq!(
+            result.early.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["unchanged", STYLESHEET_DIGEST]
+        );
+        assert_eq!(result.late.len(), 1);
+        assert_eq!(
+            result.late[STYLESHEET_MARKER],
+            json!(format!("{marker} {{ margin: 0px; }}1"))
+        );
+        assert_ne!(result.early[STYLESHEET_DIGEST], json!("stale"));
+        assert_eq!(
+            answers.probes[&(position + 1)].fields[STYLESHEET_DIGEST],
+            json!("stale")
+        );
+        session.iframe_html = "<style>changed{color:blue}</style>";
+        assert!(replay.answer(&plan.probes[position], &session).is_err());
+        drop(replay);
+        answers.reference = "wrong-reference".into();
+        assert!(Replay::new(&answers, &plan, &source, &installed).is_err());
+    }
 
     #[test]
     fn the_trace_moves_alone_into_this_sessions_group() {

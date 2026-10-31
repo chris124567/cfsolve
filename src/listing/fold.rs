@@ -188,13 +188,21 @@ pub(crate) fn constant<X: Clone>(frame: &Frame<X>, value: &Term) -> Option<JsVal
             }
         }
         Term::Call {
-            callee, arguments, ..
+            callee,
+            this,
+            arguments,
         } => {
             let Term::Get(object, method) = &**callee else {
                 return None;
             };
             let object = constant(frame, object)?;
-            let units: Vec<u16> = object.as_str()?.encode_utf16().collect();
+            // The method must belong to a known string, but an explicit receiver can differ.
+            object.as_str()?;
+            let receiver = match this {
+                Some(this) => constant(frame, this)?,
+                None => object,
+            };
+            let units: Vec<u16> = receiver.as_str()?.encode_utf16().collect();
             let method = constant(frame, method)?;
             let arguments: Option<Vec<JsValue>> = arguments
                 .iter()

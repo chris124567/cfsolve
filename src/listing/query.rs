@@ -2,7 +2,7 @@
 //! challenge options, and record timestamps.
 //!
 //! [`Index::assignment`] finds the nearest earlier instruction assigning a register and
-//! resolves its writes through their own paths, including path-local temporaries.
+//! returns its first write, resolving temporaries through the path that computed them.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -231,7 +231,9 @@ impl Index<'_> {
                 Term::Binary(op, Box::new(literal(&left)?), Box::new(literal(&right)?))
             }
             Term::Call {
-                callee, arguments, ..
+                callee,
+                this,
+                arguments,
             } => {
                 let (at, Term::Get(object, method)) = self.dereference(pc, &callee)? else {
                     return None;
@@ -243,7 +245,10 @@ impl Index<'_> {
                         Box::new(Term::Const(Constant::String(object))),
                         Box::new(Term::Const(Constant::String(method))),
                     )),
-                    this: None,
+                    this: match this {
+                        Some(this) => Some(Box::new(literal(&this)?)),
+                        None => None,
+                    },
                     arguments: arguments.iter().map(literal).collect::<Option<_>>()?,
                 }
             }
@@ -451,6 +456,23 @@ mod tests {
         let index = Index::new(&listing);
         assert_eq!(index.stores().len(), 1);
         assert_eq!(index.stores()[0].key, "Field7");
+    }
+
+    #[test]
+    fn string_methods_use_the_explicit_receiver() {
+        let mut term = call(text("other"), "slice", vec![number(0.0), number(3.0)]);
+        let Term::Call { this, .. } = &mut term else {
+            unreachable!()
+        };
+        *this = Some(Box::new(text("fresh")));
+        let program = listing(vec![]);
+        let index = Index::new(&program);
+        assert_eq!(index.text(0, &term).as_deref(), Some("fre"));
+        let Term::Call { this, .. } = &mut term else {
+            unreachable!()
+        };
+        *this = Some(Box::new(Term::Reg(99)));
+        assert_eq!(index.text(0, &term), None);
     }
 
     #[test]

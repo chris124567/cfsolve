@@ -45,6 +45,17 @@ revision instead of sending an obsolete digest. The `stylesheets` array can hold
 multiple captured revisions for the same browser profile. Keep captures and
 device profiles private; they are not needed in bug reports or pull requests.
 
+Replay keeps browser measurements while deriving field names, namespace functions
+and trace frames from the current program. Function declaration order and function
+counts may change between builds. Trace frames come from the current program;
+captured frames are not replayed. Unmapped fields and ambiguous stylesheet
+markers are errors, rather than guessed answers.
+
+The internal `Replay::new` constructor now takes the current `Source` and
+`Installed` facts and returns a `Result`. It validates the profile and field
+mapping before use; there is no separate unchecked replay constructor. Stylesheet
+updates use the same replay path, preserving field order and late callback fields.
+
 ## Building
 
 You need the Rust version pinned in `rust-toolchain.toml`, plus CMake, a C/C++

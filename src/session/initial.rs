@@ -1,8 +1,6 @@
 //! Prepares the first payload: renders the embedding page, fetches and parses the iframe, and
 //! merges page parameters with iframe state.
 
-use std::mem;
-
 use anyhow::{Context, Result};
 use url::Url;
 
@@ -96,10 +94,11 @@ impl FirstPayload {
         options_artifact: &str,
         complete: impl FnOnce(&mut Options) -> (Option<&'mark str>, i64),
     ) -> Result<Self> {
-        let installed = mem::take(&mut program.installed);
+        // Keep the extracted facts available to later stages; request state is a separate copy.
+        let installed = &program.installed;
         let fields = &program.payload_fields;
         let options = &mut program.request.options;
-        options.extend(installed.options);
+        options.extend(installed.options.clone());
         if let Some(log) = &state.post_log {
             log.start(options);
         }
@@ -111,7 +110,7 @@ impl FirstPayload {
             intervals,
         ));
         sink.json(options_artifact, options)?;
-        let window = installed.window;
+        let window = installed.window.clone();
         let globals = payload::infer_globals(fields, &state, options, &window);
         let plaintext = payload::build(fields, options, &globals)?;
         Ok(Self {

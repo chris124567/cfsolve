@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
+use indexmap::IndexMap;
 
 use crate::js::{JsObject, JsValue, Options, Window, json};
 use crate::listing::fold::{Frame, Known, constant};
@@ -36,10 +37,8 @@ pub struct Installed {
     pub window: Window,
     /// Window globals created by calls with one string constant, mapped to that constant.
     pub built: BTreeMap<String, String>,
-    /// Global value classes used to match namespace properties between captures and sessions.
-    pub(crate) audit: BTreeMap<String, String>,
-    /// The order in which those properties were installed.
-    pub(crate) audit_order: Vec<String>,
+    /// Global value classes, in installation order, for matching captured namespace properties.
+    pub(crate) audit: IndexMap<String, String>,
     /// Global factories called to create installed functions.
     pub(crate) factories: BTreeSet<String>,
 }
@@ -73,9 +72,6 @@ fn read_listing(listing: &Listing) -> Installed {
                 };
                 let value = evaluate(frame, value);
                 if matches!(object, Known::Ext(Held::Window)) {
-                    if !installed.audit_order.contains(&key) {
-                        installed.audit_order.push(key.clone());
-                    }
                     let group = match &value {
                         Some(Known::Object(_)) => "o".to_owned(),
                         Some(Known::Ext(Held::Function | Held::Built(_))) => "N".to_owned(),
@@ -146,9 +142,6 @@ fn read_listing(listing: &Listing) -> Installed {
             .get(&store.key)
             .is_none_or(|value| value == "?")
         {
-            if !installed.audit_order.contains(&store.key) {
-                installed.audit_order.push(store.key.clone());
-            }
             installed.audit.insert(store.key.clone(), kind.into());
         }
     }

@@ -1,9 +1,6 @@
 //! Refreshes program-specific names and namespace classifications in captured device facts.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    mem,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -23,8 +20,8 @@ use super::{
     vocabulary::Vocabulary,
 };
 use crate::{
-    challenge::program::PreparedSession,
-    js::{JsObject, JsValue, Payload, ast},
+    challenge::{installed::Installed, program::PreparedSession},
+    js::{JsObject, JsValue, ast},
     script::Source,
 };
 
@@ -100,23 +97,19 @@ struct Evidence {
     functions: Vec<String>,
 }
 
-fn names(source: &Source) -> Result<Evidence> {
+fn names(source: &Source, installed: &Installed) -> Evidence {
     let mut groups = source_names(source);
-    let prepared =
-        PreparedSession::try_new(source, &Url::parse("https://challenges.cloudflare.com/")?)?;
-    let installed = &prepared.program().installed;
-    let mut functions = groups.get("source:function").cloned().unwrap_or_default();
+    let mut functions = groups.remove("source:function").unwrap_or_default();
     functions.extend(installed.factories.iter().cloned());
     functions.extend(
         installed
             .audit
             .iter()
-            .filter(|(_, kind)| kind.as_str() == "N")
+            .filter(|(name, kind)| kind.as_str() == "N" && !installed.window.contains_key(*name))
             .map(|(name, _)| name.clone()),
     );
     let mut markers = BTreeMap::new();
-    for name in &installed.audit_order {
-        let kind = &installed.audit[name];
+    for (name, kind) in &installed.audit {
         let kind = if installed
             .window
             .get(name)
@@ -127,6 +120,9 @@ fn names(source: &Source) -> Result<Evidence> {
         } else {
             kind.as_str()
         };
+        if kind == "N" {
+            continue;
+        }
         groups
             .entry(format!("installed:{kind}"))
             .or_default()
@@ -135,11 +131,11 @@ fn names(source: &Source) -> Result<Evidence> {
             markers.insert(name.clone(), installed.audit[name].clone());
         }
     }
-    Ok(Evidence {
+    Evidence {
         groups,
         markers,
         functions,
-    })
+    }
 }
 
 /// The audit gives the iframe's Array constructor a build-specific class marker.
@@ -184,74 +180,27 @@ fn array_class(source: &Source) -> Option<String> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CapturedNames {
     features: Vec<Vec<String>>,
-    references: Vec<Option<usize>>,
-    globals: BTreeMap<String, Vec<String>>,
+    globals: Groups,
     markers: BTreeMap<String, String>,
-    trace: Option<CapturedTrace>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct CapturedTrace {
-    initial_root: String,
-    returned_root: String,
-    controller: Option<String>,
-    frames: Vec<String>,
 }
 
 impl CapturedNames {
-    pub(crate) fn capture(source: &Source, plan: &ProbePlan, payload: &Payload) -> Result<Self> {
+    pub(crate) fn capture(source: &Source, plan: &ProbePlan) -> Result<Self> {
+        let prepared =
+            PreparedSession::try_new(source, &Url::parse("https://challenges.cloudflare.com/")?)?;
         let Evidence {
             groups: globals,
             markers,
             ..
-        } = names(source)?;
-        let trace = if let Some(trace) = Trace::recover(source) {
-            let probe = plan
-                .probes()
-                .iter()
-                .find(|p| plan.vocabulary().partner(p.position()) == Some(2))
-                .context("no captured audit")?;
-            let field = plan
-                .vocabulary()
-                .to_session(probe.position(), ENVIRONMENT_AUDIT_GROUPS);
-            let groups = payload
-                .get(&probe.index.to_string())
-                .and_then(|record| record.get(field))
-                .and_then(JsValue::as_object)
-                .context("no captured groups")?;
-            let member = JsValue::String(format!("o.{}", trace.global));
-            let frames = groups
-                .iter()
-                .find(|(_, names)| {
-                    names
-                        .as_array()
-                        .is_some_and(|names| names.contains(&member))
-                })
-                .map(|(frames, _)| frames.split(',').map(str::to_owned).collect())
-                .context("no captured trace")?;
-            Some(CapturedTrace {
-                initial_root: trace.initial_root,
-                returned_root: trace.returned_root,
-                controller: plan.controller_trace.clone(),
-                frames,
-            })
-        } else {
-            None
-        };
+        } = names(source, &prepared.program().installed);
         Ok(Self {
             features: plan
                 .probes()
                 .iter()
                 .map(|p| p.expanded_features.clone())
                 .collect(),
-            references: plan
-                .probes()
-                .iter()
-                .map(|p| plan.vocabulary().partner(p.position()))
-                .collect(),
             globals,
             markers,
-            trace,
         })
     }
 }
@@ -259,27 +208,37 @@ impl CapturedNames {
 pub(crate) struct Refresh {
     direct: Vocabulary,
     aliases: BTreeMap<String, String>,
-    trace_key: Option<String>,
     functions: Vec<String>,
     array_class: Option<String>,
     trace: Option<Trace>,
+    controller: Option<String>,
 }
 
 impl Refresh {
-    pub(crate) fn new(captured: &CapturedNames, source: &Source, plan: &ProbePlan) -> Result<Self> {
+    pub(crate) fn new(
+        captured: &CapturedNames,
+        source: &Source,
+        plan: &ProbePlan,
+        installed: &Installed,
+    ) -> Result<Self> {
         let current: Vec<_> = plan
             .probes()
             .iter()
-            .map(|p| p.expanded_features.clone())
+            .map(|p| p.expanded_features.as_slice())
             .collect();
         let direct = Vocabulary::between(&current, &captured.features);
         let Evidence {
             groups: new_names,
             markers: new_markers,
             functions,
-        } = names(source)?;
+        } = names(source, installed);
         let mut aliases = BTreeMap::new();
         for (kind, old) in &captured.globals {
+            // Functions are rebuilt from the current program, so neither their order nor
+            // their count needs to match the captured build.
+            if matches!(kind.as_str(), "source:function" | "installed:N") {
+                continue;
+            }
             let new = new_names
                 .get(kind)
                 .with_context(|| format!("missing namespace category {kind}"))?;
@@ -296,105 +255,33 @@ impl Refresh {
                 }
             }
         }
-        let trace = Trace::recover(source);
-        let trace_key = if let (Some(old_trace), Some(new_trace)) = (&captured.trace, &trace) {
-            let mut updated = vec![];
-            for frame in &old_trace.frames {
-                if frame == &old_trace.initial_root {
-                    updated.push(new_trace.initial_root.clone());
-                    continue;
-                }
-                if frame == &old_trace.returned_root {
-                    updated.push(new_trace.returned_root.clone());
-                    continue;
-                }
-                if Some(frame) == old_trace.controller.as_ref()
-                    && let Some(frame) = &plan.controller_trace
-                {
-                    updated.push(frame.clone());
-                    continue;
-                }
-                let mut candidates = BTreeSet::new();
-                for (old, partner) in captured.features.iter().zip(&captured.references) {
-                    if partner.is_none() {
-                        continue;
-                    }
-                    let Some(new_probe) = plan
-                        .probes()
-                        .iter()
-                        .find(|probe| plan.vocabulary().partner(probe.position()) == *partner)
-                    else {
-                        continue;
-                    };
-                    if old.len() != new_probe.expanded_features.len() {
-                        continue;
-                    }
-                    for (old, new) in old.iter().zip(&new_probe.expanded_features) {
-                        if old == frame {
-                            candidates.insert(new.clone());
-                        }
-                    }
-                }
-                if candidates.len() == 1 {
-                    updated.push(candidates.into_iter().next().unwrap());
-                }
-            }
-            (updated.len() == 3).then(|| updated.join(","))
-        } else {
-            None
-        };
         Ok(Self {
             direct,
             aliases,
-            trace_key,
             functions,
             array_class: array_class(source),
-            trace,
+            trace: Trace::recover(source),
+            controller: plan.controller_trace.clone(),
         })
     }
     pub(crate) fn apply(
         &self,
         probe: &Probe,
-        plan: &ProbePlan,
+        vocabulary: &Vocabulary,
         fields: &mut JsObject,
     ) -> Result<()> {
         self.direct.rewrite_to_session(probe.position(), fields);
-        fn rewrite(value: &mut JsValue, names: &BTreeMap<String, String>) {
-            fn text(value: &mut String, names: &BTreeMap<String, String>) {
-                if let Some(new) = names.get(value) {
-                    *value = new.clone();
-                    return;
-                }
-                if let Some(name) = value.strip_prefix("o.").and_then(|name| names.get(name)) {
-                    *value = format!("o.{name}");
-                }
+        super::vocabulary::rewrite_object(fields, &|value| {
+            if let Some(new) = self.aliases.get(value) {
+                *value = new.clone();
+            } else if let Some(name) = value
+                .strip_prefix("o.")
+                .and_then(|name| self.aliases.get(name))
+            {
+                *value = format!("o.{name}");
             }
-            match value {
-                JsValue::String(value) => text(value, names),
-                JsValue::Array(values) => {
-                    for value in values {
-                        rewrite(value, names)
-                    }
-                }
-                JsValue::Object(values) => {
-                    for (mut name, mut value) in mem::take(values) {
-                        text(&mut name, names);
-                        rewrite(&mut value, names);
-                        values.insert(name, value);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut value = JsValue::Object(mem::take(fields));
-        rewrite(&mut value, &self.aliases);
-        let JsValue::Object(refreshed) = value else {
-            unreachable!()
-        };
-        *fields = refreshed;
-        let key = plan
-            .vocabulary()
-            .to_session(probe.position(), ENVIRONMENT_AUDIT_GROUPS);
+        });
+        let key = vocabulary.to_session(probe.position(), ENVIRONMENT_AUDIT_GROUPS);
         if let Some(groups) = fields.get_mut(key).and_then(JsValue::as_object_mut) {
             if let Some(functions) = groups.get_mut("N").and_then(JsValue::as_array_mut) {
                 functions.retain(|name| {
@@ -419,11 +306,8 @@ impl Refresh {
                 trace,
                 groups,
                 &probe.expanded_features,
-                plan.controller_trace.as_deref(),
+                self.controller.as_deref(),
             )?;
-            if let Some(key) = &self.trace_key {
-                move_member(groups, format!("o.{}", trace.global), key)?;
-            }
         }
         Ok(())
     }
@@ -459,6 +343,94 @@ fn move_member(groups: &mut JsObject, member: String, class: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_refresh_uses_the_current_trace_with_or_without_a_controller() {
+        let probe = Probe {
+            index: 1,
+            token: "test".into(),
+            input: JsValue::Null,
+            operation: None,
+            features: vec![],
+            expanded_features: ["entry", "replaceTrace"].map(str::to_owned).to_vec(),
+            writes: Default::default(),
+        };
+        let vocabulary = Vocabulary::infer::<&[String]>(&[]);
+        for controller in [None, Some("controller".to_owned())] {
+            let refresh = Refresh {
+                direct: vocabulary.clone(),
+                aliases: BTreeMap::new(),
+                functions: vec![],
+                array_class: None,
+                trace: Some(Trace {
+                    global: "trace".into(),
+                    replace: "replaceTrace".into(),
+                    push: None,
+                    initial_root: "initial".into(),
+                    returned_root: "callback".into(),
+                }),
+                controller: controller.clone(),
+            };
+            let mut fields = JsObject::from_iter([(
+                ENVIRONMENT_AUDIT_GROUPS.into(),
+                crate::js::json!({
+                    "obsolete-captured-trace": ["o.trace", "other"],
+                }),
+            )]);
+            refresh.apply(&probe, &vocabulary, &mut fields).unwrap();
+            let current = format!(
+                "initial,{},entry",
+                controller.as_deref().unwrap_or("callback")
+            );
+            assert_eq!(
+                fields[ENVIRONMENT_AUDIT_GROUPS][&current],
+                crate::js::json!(["o.trace"])
+            );
+            assert_eq!(
+                fields[ENVIRONMENT_AUDIT_GROUPS]["obsolete-captured-trace"],
+                crate::js::json!(["other"])
+            );
+        }
+    }
+
+    #[test]
+    fn rebuilds_functions_when_their_count_changes_without_positional_aliases() {
+        let source = Source::try_new("var root = this || self; root.a = function() {}; root.b = function() {}; root.state = {};").unwrap();
+        let mut installed = Installed::default();
+        installed.audit.insert("marker".into(), "N".into());
+        installed
+            .window
+            .insert("marker".into(), JsValue::String("N".into()));
+        let evidence = names(&source, &installed);
+        assert_eq!(
+            evidence.functions,
+            ["a", "b"],
+            "a string marker must not become a function"
+        );
+        let plan = crate::js::from_value(crate::js::json!({
+            "record_fields":{"counter":"counter", "token":"token", "input":"input",
+                "status":"status", "message":"message", "started":"started",
+                "finished":"finished", "duration":"duration"},
+            "payload":{"template":{"fields":{}}, "published":[], "footer":{}, "pending":null},
+            "probes":[]
+        }))
+        .unwrap();
+        let captured = CapturedNames {
+            features: vec![],
+            globals: BTreeMap::from([
+                ("source:function".into(), vec!["old_function".into()]),
+                ("installed:N".into(), vec!["old_factory".into()]),
+                ("source:object".into(), vec!["old_state".into()]),
+            ]),
+            markers: BTreeMap::new(),
+        };
+        let refreshed = Refresh::new(&captured, &source, &plan, &installed).unwrap();
+        assert_eq!(refreshed.functions, ["a", "b"]);
+        assert_eq!(
+            refreshed.aliases,
+            BTreeMap::from([("old_state".into(), "state".into())])
+        );
+    }
 
     #[test]
     fn reclassification_preserves_other_members_and_merges_classes() {
