@@ -461,6 +461,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
+ "windows-sys 0.61.2",
  "wreq",
  "wreq-util",
  "zstd 0.13.3",

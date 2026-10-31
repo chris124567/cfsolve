@@ -478,6 +478,7 @@ fn kept(
 }
 
 /// Waits for Ctrl-C or SIGTERM so the proxy can write logs before exiting.
+#[cfg(unix)]
 async fn shutdown_requested() {
     use tokio::signal::unix::{self, SignalKind};
 
@@ -485,6 +486,18 @@ async fn shutdown_requested() {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+    }
+}
+
+/// Waits for Ctrl-C or for its console to close so the proxy can write logs before exiting.
+#[cfg(windows)]
+async fn shutdown_requested() {
+    use tokio::signal::windows;
+
+    let mut close = windows::ctrl_close().expect("watching for the console closing");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = close.recv() => {}
     }
 }
 
