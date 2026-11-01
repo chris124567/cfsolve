@@ -434,20 +434,6 @@ pub(crate) fn widget_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::challenge::reduced_timing::Measure;
-
-    fn page() -> RenderedPage {
-        RenderedPage::render(
-            r#"<html><head><title>t</title>
-            <script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></head>
-            <body><div class="cf-turnstile" data-sitekey="0x4AAA" data-action="login"
-                data-theme="dark" data-size="compact" data-language="de"></div></body></html>"#,
-            Url::parse("https://example.com/login").unwrap(),
-            "j5gbk",
-            None,
-        )
-        .unwrap()
-    }
 
     #[test]
     fn finds_build_hashes_and_routes_only_where_the_loader_keeps_them() {
