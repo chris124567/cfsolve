@@ -324,6 +324,7 @@ name = "btls-sys"
 version = "0.5.6"
 dependencies = [
  "bindgen",
+ "cc",
  "cmake",
  "fs_extra",
  "fslock",

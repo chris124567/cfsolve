@@ -228,6 +228,22 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
         }
     }
 
+    // BoringSSL's CMakeLists.txt makes CMake prefer cl whenever it builds for Windows,
+    // and on a Windows host cmake-rs names no compiler for a GNU target, so a MinGW
+    // build there would get cl. Name the compilers cc resolves for the target, as
+    // cmake-rs does on other hosts. (cfsolve patch)
+    if config.target_os == "windows"
+        && config.target_env == "gnu"
+        && config.host.contains("windows")
+        && !config.features.fips
+    {
+        let cc = cc::Build::new().get_compiler();
+        let cxx = cc::Build::new().cpp(true).get_compiler();
+        boringssl_cmake
+            .define("CMAKE_C_COMPILER", cc.path())
+            .define("CMAKE_CXX_COMPILER", cxx.path());
+    }
+
     if config.host == config.target {
         return boringssl_cmake;
     }
