@@ -1365,7 +1365,11 @@ impl<'script> Scope<'script> {
         let constructor = name.starts_with(char::is_uppercase);
         let mut scope = Self {
             appliers,
-            prefix: constructor.then(|| format!("{name}.")).unwrap_or_default(),
+            prefix: if constructor {
+                format!("{name}.")
+            } else {
+                String::new()
+            },
             forwarders: Forwarders::default(),
             assigned: HashMap::new(),
             aliases: HashMap::new(),

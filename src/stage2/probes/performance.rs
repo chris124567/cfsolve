@@ -57,6 +57,7 @@ impl Measurement {
     /// loads, and this probe's mark at `marked_ms`. Reports times at 0.1 ms resolution relative
     /// to iframe navigation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn observed(
         plan: &ProbePlan,
         index: usize,

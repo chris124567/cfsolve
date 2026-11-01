@@ -127,7 +127,7 @@ enum Landing {
     /// A site's page with a Turnstile widget.
     Site(EmbeddingPage),
     /// A challenge page, whose orchestrator has rendered its widget.
-    ChallengePage(OrchestratorSession, EmbeddingPage),
+    ChallengePage(Box<OrchestratorSession>, EmbeddingPage),
 }
 
 impl Landing {
@@ -176,7 +176,10 @@ async fn land(
         document.referrer_policy,
     )
     .await?;
-    Ok(Landing::ChallengePage(orchestrator, embedding_page))
+    Ok(Landing::ChallengePage(
+        Box::new(orchestrator),
+        embedding_page,
+    ))
 }
 
 /// Starts the session of the widget rendered by `embedding_page` by sending its first payload.

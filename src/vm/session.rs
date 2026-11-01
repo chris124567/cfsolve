@@ -90,7 +90,11 @@ impl<'ast> Session<'ast> {
         };
         (session.bindings, session.unavailable) = interpret::setup(&session, prelude, &body.stmts);
         let constructed = construct(&mut Run::method(&session), constructor);
-        (session.state, session.layout, session.initial) = state(&run, &constructed)?;
+        Recovered {
+            state: session.state,
+            layout: session.layout,
+            initial: session.initial,
+        } = state(&run, &constructed)?;
         session.symbol_fields = constructed.objects;
         session.program_key = match &constructed.programs[..] {
             [] => None,
@@ -345,13 +349,17 @@ fn concrete<'a>(mut fields: HashMap<String, Value<'a>>) -> HashMap<String, Value
     fields
 }
 
+/// The handler state, register layout and initial register stacks [`state`] recovers.
+struct Recovered<'a> {
+    state: HashMap<String, Value<'a>>,
+    layout: Layout,
+    initial: Vec<(u8, Value<'a>)>,
+}
+
 /// Recovers state-field values and register layout. The constructor computes indices as
 /// `this.<mask> ^ <register>` with a random mask per run. Uses zero for the mask during
 /// analysis.
-fn state<'a>(
-    names: &RunMethod<'_>,
-    constructed: &Constructed<'a>,
-) -> Result<(HashMap<String, Value<'a>>, Layout, Vec<(u8, Value<'a>)>)> {
+fn state<'a>(names: &RunMethod<'_>, constructed: &Constructed<'a>) -> Result<Recovered<'a>> {
     let fields = &constructed.fields;
     let pc = constructed
         .pc
@@ -402,7 +410,11 @@ fn state<'a>(
         .map(|write| (write.register, write.value.clone()))
         .collect();
     state.extend(mask.map(|mask| (mask, Value::Number(0.0))));
-    Ok((state, layout, initial))
+    Ok(Recovered {
+        state,
+        layout,
+        initial,
+    })
 }
 
 /// Extracts the register and optional mask field from `this.<mask> ^ <register>` or a bare

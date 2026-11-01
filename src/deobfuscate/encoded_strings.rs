@@ -348,8 +348,9 @@ mod tests {
     fn decodes_escaped_code_units() {
         use base64::Engine;
 
-        // 255 escapes the code unit U+D800, a lone surrogate.
-        let encoded = super::STANDARD.encode([255 ^ 0x05, 0x00 ^ 0xe7, 0xd8 ^ 0x05]);
+        // 255 escapes the code unit U+D800, a lone surrogate. The bytes 255, 0x00, 0xd8 are
+        // XORed with the key 59141 (0xe705), low byte first.
+        let encoded = super::STANDARD.encode([255 ^ 0x05, 0xe7, 0xd8 ^ 0x05]);
         let decoded = super::decode(&encoded, 59141).unwrap();
         assert_eq!(
             decoded.as_wtf8().to_ill_formed_utf16().collect::<Vec<_>>(),

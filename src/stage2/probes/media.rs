@@ -349,6 +349,15 @@ impl Fields {
     }
 
     fn read(&self, record: &JsObject, started_ms: i64) -> Result<Measurement> {
+        /// The four-entry support array, deserialized from a JSON array in field order.
+        #[derive(Deserialize)]
+        struct Support {
+            audio_support: Vec<i8>,
+            video_support: Vec<i8>,
+            audio_decoding: Option<Vec<i32>>,
+            video_decoding: Option<Vec<i32>>,
+        }
+
         let field = |name: &str| {
             record
                 .get(name)
@@ -374,12 +383,12 @@ impl Fields {
             .collect::<Result<_>>()?;
         // Read MediaSource support bits followed by decoding bits or null, for audio first and then
         // video.
-        let (audio_support, video_support, audio_decoding, video_decoding): (
-            Vec<i8>,
-            Vec<i8>,
-            Option<Vec<i32>>,
-            Option<Vec<i32>>,
-        ) = js::from_value(field(MEDIA_SUPPORT)?.clone())
+        let Support {
+            audio_support,
+            video_support,
+            audio_decoding,
+            video_decoding,
+        } = js::from_value(field(MEDIA_SUPPORT)?.clone())
             .context("the media support is not four entries")?;
         let reported = [
             (&self.audio_types, &audio_decoding),
