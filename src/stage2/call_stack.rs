@@ -648,6 +648,8 @@ struct Script {
     /// Array slots containing `Reflect.construct`, indexed by array and slot.
     construct_slots: Vec<(Id, usize)>,
     applies: Vec<Id>,
+    /// Array slots containing `Reflect.apply`, indexed by array and slot.
+    apply_slots: Vec<(Id, usize)>,
     appliers: Appliers,
 }
 
@@ -816,6 +818,7 @@ impl Script {
             constructs: Vec::new(),
             construct_slots: Vec::new(),
             applies: Vec::new(),
+            apply_slots: Vec::new(),
             appliers,
         };
         program.visit_with(&mut script);
@@ -858,9 +861,13 @@ impl Script {
             .target(call)
             .ok()?;
         // Compare bindings so a nested function with the same name as a native apply
-        // alias cannot be mistaken for that alias.
-        let callee = target.callee.as_ref()?;
-        if self.function(callee).is_ok() && !self.applies.iter().any(|alias| alias == callee) {
+        // alias cannot be mistaken for that alias. Some builds keep the alias in an array slot.
+        let native = match (&target.callee, &target.slot) {
+            (Some(callee), _) => self.function(callee).is_err() || self.applies.contains(callee),
+            (None, Some(slot)) => self.apply_slots.contains(slot),
+            (None, None) => false,
+        };
+        if !native {
             return None;
         }
         let [first, second, ..] = handed(call, &target)?[..] else {
@@ -888,13 +895,16 @@ impl Visit for Script {
                 (Some(name), Some("apply")) => self.applies.push(name.to_id()),
                 _ => {}
             }
-            if method == Some("construct")
-                && let AssignTarget::Simple(SimpleAssignTarget::Member(slot)) = &assign.left
+            if let AssignTarget::Simple(SimpleAssignTarget::Member(slot)) = &assign.left
                 && let Some(array) = slot.obj.as_ident()
                 && let Some(index) = slot.prop.as_computed()
                 && let Some(index) = self.appliers.number(&index.expr).and_then(ast::array_index)
             {
-                self.construct_slots.push((array.to_id(), index));
+                match method {
+                    Some("construct") => self.construct_slots.push((array.to_id(), index)),
+                    Some("apply") => self.apply_slots.push((array.to_id(), index)),
+                    _ => {}
+                }
             }
         }
         assign.visit_children_with(self);
@@ -1855,6 +1865,30 @@ mod tests {
         let names: Vec<&str> = frames.iter().map(|call| call.name.v8.as_str()).collect();
         assert_eq!(names, ["PA.o.<computed> [as k]", "PA"]);
         assert!(script.method_forwarder(&binding(&script, "S")).is_none());
+    }
+
+    /// Checks method forwarders that call a `Reflect.apply` alias kept in an array slot, directly
+    /// or through a selector helper. Other slots are not apply aliases.
+    #[test]
+    fn method_forwarders_may_apply_through_an_array_slot() {
+        let source = "var G=[];G[2]=Reflect.apply;G[3]=function(){};\
+            function W(s,f,a,b,c){switch(s^1){case 0:return f(a,b,c)}}\
+            function D(f,r,a){return(0,G[2])(f,r,[a])}\
+            function H(f,r,a,b){return W(1,G[2],f,r,[a,b])}\
+            function O(f,r,a){return(0,G[3])(f,r,[a])}";
+        let (script, _) = script(source);
+        let cases: [(&str, &[&str]); 2] = [("D", &["D"]), ("H", &["W", "H"])];
+        for (forwarder, expected) in cases {
+            let frames = script
+                .method_forwarder(&binding(&script, forwarder))
+                .expect("`G[2]` holds `Reflect.apply`, so the call is a method forwarder");
+            let names: Vec<&str> = frames.iter().map(|call| call.name.v8.as_str()).collect();
+            assert_eq!(names, expected, "frames of forwarder {forwarder}");
+        }
+        assert!(
+            script.method_forwarder(&binding(&script, "O")).is_none(),
+            "`G[3]` holds a plain function, not `Reflect.apply`"
+        );
     }
 
     #[test]
