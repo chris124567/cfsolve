@@ -14,7 +14,9 @@
 //! expression so its side effects still run.
 //!
 //! Undefined slots need no assignment if the literal runs at most once per call, in the
-//! declaring function and outside loops. The replacement locals already start undefined.
+//! declaring function and outside loops. The replacement locals already start undefined. A
+//! `void` element there keeps only its operand, so a constant hidden as `void (k ^ x ^ (k ^ x))`
+//! leaves the slot's later write as its local's only one, which copy propagation can inline.
 
 use swc_core::common::util::take::Take;
 use swc_core::common::{DUMMY_SP, Mark, SyntaxContext};
@@ -394,13 +396,19 @@ impl Split<'_> {
                 let mut assignments: Vec<Box<Expr>> = self
                     .initial(array, literal)
                     .into_iter()
-                    .map(|(local, value)| {
-                        Box::new(Expr::Assign(AssignExpr {
+                    .map(|(local, value)| match *value {
+                        // The local already starts undefined, so only the operand runs.
+                        Expr::Unary(UnaryExpr {
+                            op: UnaryOp::Void,
+                            arg,
+                            ..
+                        }) if !array.assign_undefined => arg,
+                        value => Box::new(Expr::Assign(AssignExpr {
                             span: DUMMY_SP,
                             op: AssignOp::Assign,
                             left: AssignTarget::Simple(SimpleAssignTarget::Ident(local.into())),
-                            right: value,
-                        }))
+                            right: Box::new(value),
+                        })),
                     })
                     .collect();
                 Some(match assignments.len() {
@@ -495,6 +503,11 @@ mod tests {
         );
         testing::assert_contains(&output, &[], &["h(r_0);", "r_0 = i;"]);
         testing::assert_lacks(&output, &["r_0 = void 0", "["]);
+        // A `void` element runs its operand without writing the local.
+        let output =
+            transform("function f() { var r; r = [void (7 ^ k ^ (7 ^ k))]; r[0] = 1; g(r[0]); }");
+        testing::assert_contains(&output, &[], &["7 ^ k ^ (7 ^ k);", "r_0 = 1;", "g(r_0);"]);
+        testing::assert_lacks(&output, &["r_0 = void"]);
         // A creation in a loop resets the slots on every iteration.
         let output =
             transform("function f() { var r; while (g()) { r = [void 0]; h(r[0]); r[0] = 1; } }");

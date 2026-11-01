@@ -13,8 +13,13 @@ use crate::vm::session::Session;
 use crate::vm::value::{Callable, Value};
 
 /// Compares results, exceptions, symbolic effects, branches, and global writes. Each execution
-/// has independent mutable state.
-fn compare(source: &str, arguments: Vec<Value<'static>>, decisions: Vec<bool>, slots: bool) {
+/// has independent mutable state. Returns the shared outcome, starting with the result.
+fn compare(
+    source: &str,
+    arguments: Vec<Value<'static>>,
+    decisions: Vec<bool>,
+    slots: bool,
+) -> String {
     // Leak the script text so arguments can be prepared before parsing it.
     let parsed: &_ = Box::leak(Box::new(ast::parse_iframe_javascript(source).unwrap()));
     let mut session = Session::empty();
@@ -56,7 +61,9 @@ fn compare(source: &str, arguments: Vec<Value<'static>>, decisions: Vec<bool>, s
             run.effects, run.branches.decisions
         )
     };
-    assert_eq!(execute(false), execute(true), "{source}");
+    let outcome = execute(false);
+    assert_eq!(outcome, execute(true), "{source}");
+    outcome
 }
 
 #[test]
@@ -119,6 +126,32 @@ fn branches_and_loops_match() {
                 true,
             );
         }
+    }
+}
+
+#[test]
+fn functions_declared_in_blocks_are_bound_on_entry() {
+    // A function declared after a block's `return` is callable from the start of the block,
+    // including one that reads the enclosing function's locals, which needs a scoped plan.
+    for (source, slots, result) in [
+        (
+            "function f(a) { { return g(a) + 1; function g(x) { return x * 3; } } }",
+            true,
+            "return Const(Number(7.0))",
+        ),
+        (
+            "function f(a) { { var b = 4; return g(1); function g(x) { return a + b + x; } } }",
+            false,
+            "return Const(Number(7.0))",
+        ),
+        (
+            "function f(a) { try { return g(a); function g(x) { return x + 1; } } finally {} }",
+            true,
+            "return Const(Number(3.0))",
+        ),
+    ] {
+        let outcome = compare(source, vec![Value::Number(2.0)], vec![], slots);
+        assert!(outcome.starts_with(result), "{source}: {outcome}");
     }
 }
 

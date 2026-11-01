@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
+use swc_core::ecma::ast::BinaryOp;
 
 use crate::js::{JsObject, JsValue, Options, Window, json};
 use crate::listing::fold::{Frame, Known};
@@ -91,7 +92,8 @@ pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
 }
 
 /// The value an assignment writes. Recognizes calls with one string constant, such as the key
-/// transform `factory(secret)`.
+/// transform `factory(secret)`, and folds the arithmetic and string methods that unpack
+/// length-prefixed names.
 fn evaluate(frame: &Frame<Held>, value: &Term) -> Option<Known<Held>> {
     Some(match value {
         Term::Array(elements) if elements.is_empty() => Known::Ext(Held::EmptyArray),
@@ -100,14 +102,62 @@ fn evaluate(frame: &Frame<Held>, value: &Term) -> Option<Known<Held>> {
             "window" => Known::Ext(Held::Window),
             _ => return None,
         },
-        Term::Call { arguments, .. } => {
+        Term::Call {
+            callee,
+            this,
+            arguments,
+        } => {
+            if this.is_none()
+                && let Some(folded) = string_method(frame, callee, arguments)
+            {
+                return Some(folded);
+            }
             let [argument] = arguments.as_slice() else {
                 return None;
             };
             Known::Ext(Held::Built(frame.resolve(argument)?.text()?.to_owned()))
         }
+        Term::Binary(BinaryOp::Add, left, right) => {
+            Known::Literal(json!(number(frame, left)? + number(frame, right)?))
+        }
+        Term::Binary(BinaryOp::Mul, left, right) => {
+            Known::Literal(json!(number(frame, left)? * number(frame, right)?))
+        }
         value => frame.resolve(value)?,
     })
+}
+
+/// Folds `charCodeAt` and `slice` on a known string. Some programs store names as
+/// length-prefixed constants padded with NULs and unpack them with
+/// `text.slice(2, 2 + 256 * text.charCodeAt(0) + text.charCodeAt(1))`.
+fn string_method(frame: &Frame<Held>, callee: &Term, arguments: &[Term]) -> Option<Known<Held>> {
+    let Term::Get(receiver, method) = callee else {
+        return None;
+    };
+    let text: Vec<u16> = frame.resolve(receiver)?.text()?.encode_utf16().collect();
+    let index = |argument: &Term| {
+        let index = number(frame, argument)?;
+        // Negative indexes count from the end; the unpacking never uses them.
+        (index >= 0.0 && index.fract() == 0.0).then_some(index as usize)
+    };
+    Some(match (frame.resolve(method)?.text()?, arguments) {
+        ("charCodeAt", [position]) => {
+            Known::Literal(json!(f64::from(*text.get(index(position)?)?)))
+        }
+        ("slice", [start, end]) => {
+            let end = index(end)?.min(text.len());
+            let start = index(start)?.min(end);
+            Known::Literal(json!(String::from_utf16(&text[start..end]).ok()?))
+        }
+        _ => return None,
+    })
+}
+
+fn number(frame: &Frame<Held>, term: &Term) -> Option<f64> {
+    match frame.resolve(term)? {
+        Known::Literal(value) => value.as_f64(),
+        _ => None,
+    }
 }
 
 /// Finds startup instructions reachable from the entry, the returned function called by the
@@ -179,4 +229,51 @@ fn return_register(listing: &Listing) -> Option<u8> {
         .into_iter()
         .max_by_key(|&(register, count)| (count, register))
         .map(|(register, _)| register)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::Constant;
+
+    #[test]
+    fn unpacks_length_prefixed_names() {
+        let mut frame: Frame<Held> = Frame::default();
+        frame.set(1, Some(Known::Literal(json!("\0\u{3}abc\0\0\0"))));
+        let register = |register| Box::new(Term::Reg(register));
+        let number = |value| Term::Const(Constant::Number(value));
+        let method = |name: &str, arguments| Term::Call {
+            callee: Box::new(Term::Get(
+                register(1),
+                Box::new(Term::Const(Constant::String(name.into()))),
+            )),
+            this: None,
+            arguments,
+        };
+        let mut set = |target, term: Term| {
+            let value = evaluate(&frame, &term);
+            frame.set(target, value);
+        };
+        // `text.slice(2, 256 * text.charCodeAt(0) + text.charCodeAt(1) + 2)`
+        set(2, method("charCodeAt", vec![number(0.0)]));
+        set(3, method("charCodeAt", vec![number(1.0)]));
+        set(
+            4,
+            Term::Binary(BinaryOp::Mul, Box::new(number(256.0)), register(2)),
+        );
+        set(4, Term::Binary(BinaryOp::Add, register(4), register(3)));
+        set(
+            4,
+            Term::Binary(BinaryOp::Add, register(4), Box::new(number(2.0))),
+        );
+        set(5, method("slice", vec![number(2.0), Term::Reg(4)]));
+        assert_eq!(frame.register(5).and_then(Known::text), Some("abc"));
+
+        // A call with one string argument still builds a global.
+        let built = evaluate(&frame, &method("factory", vec![Term::Reg(5)]));
+        assert!(matches!(built, Some(Known::Ext(Held::Built(secret))) if secret == "abc"));
+        // Out-of-range and negative indexes stay unknown.
+        assert!(evaluate(&frame, &method("charCodeAt", vec![number(9.0)])).is_none());
+        assert!(evaluate(&frame, &method("slice", vec![number(-1.0), number(2.0)])).is_none());
+    }
 }
