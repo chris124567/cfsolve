@@ -308,28 +308,30 @@ impl OrchestratorSession {
             .unwrap_or(&self.challenge.url);
         let cleared = http::submit_form(client, referer, &form.action, &form.fields).await?;
         sink.artifact("cleared.html", cleared.html.as_bytes())?;
-        if !cleared.status.is_success()
-            || ChallengePage::parse(&cleared.html, &cleared.url)?.is_some()
-        {
+        let refused = || {
             let message = format!(
                 "the clearance form returned HTTP {} without the page",
                 cleared.status
             );
-            bail!(Refused::new(Stage::Clearance, message));
+            Refused::new(Stage::Clearance, message)
+        };
+        if ChallengePage::parse(&cleared.html, &cleared.url)?.is_some() {
+            bail!(refused());
         }
+        let cookies = client.cookies(&cleared.url);
+        // The clearance is what the form earns. The page behind the challenge may answer with
+        // any status once it is set: a site's waiting room can queue visitors with HTTP 429.
+        let clearance = match cookies.iter().find(|cookie| cookie.name() == "cf_clearance") {
+            Some(cookie) => cookie.value().to_owned(),
+            None if !cleared.status.is_success() => bail!(refused()),
+            None => bail!("the clearance form set no `cf_clearance` cookie"),
+        };
         sink.progress(&format!(
             "Cleared the challenge: {} answered HTTP {} with the page ({} bytes)",
             cleared.url,
             cleared.status,
             cleared.html.len()
         ));
-        let cookies = client.cookies(&cleared.url);
-        let clearance = cookies
-            .iter()
-            .find(|cookie| cookie.name() == "cf_clearance")
-            .context("the clearance form set no `cf_clearance` cookie")?
-            .value()
-            .to_owned();
         Ok(Clearance {
             clearance,
             cookies,
