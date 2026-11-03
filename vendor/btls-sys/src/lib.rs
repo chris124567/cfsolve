@@ -1,4 +1,7 @@
+// cfsolve patch: vendored code is not ours to lint; keep `cargo clippy` output to cfsolve.
 #![allow(
+    clippy::all,
+    unnecessary_transmutes,
     clippy::missing_safety_doc,
     clippy::redundant_static_lifetimes,
     clippy::too_many_arguments,
