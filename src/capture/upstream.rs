@@ -307,7 +307,7 @@ mod tests {
             auth: None,
             remote_dns: false,
         };
-        let mut tunnel = socks.connect("localhost", 80).await.unwrap();
+        let mut tunnel = socks.connect("127.0.0.1", 80).await.unwrap();
         let request = request_receiver.await.unwrap();
         assert_eq!(
             request[..4],
