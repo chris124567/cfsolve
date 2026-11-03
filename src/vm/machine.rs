@@ -44,7 +44,7 @@ impl Definition {
 
 /// One session's VM, ready to decode instructions.
 pub struct Machine<'definition> {
-    definition: &'definition Definition,
+    pub(super) definition: &'definition Definition,
     pub(super) session: Session<'definition>,
 }
 
