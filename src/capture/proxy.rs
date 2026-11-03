@@ -103,7 +103,9 @@ impl CaptureProxy {
     }
 
     /// Listens until Ctrl-C or SIGTERM, then waits for extraction and writes session and
-    /// traffic logs. A second stop request skips the wait.
+    /// traffic logs. A second stop request skips the wait. When Windows closes the console, the
+    /// proxy skips the wait and writes the logs at once, because Windows ends the process a few
+    /// seconds later.
     pub async fn run(self) -> Result<()> {
         let proxy = Arc::new(self);
         let listener = TcpListener::bind(proxy.config.listen)
@@ -111,7 +113,7 @@ impl CaptureProxy {
             .with_context(|| format!("binding {}", proxy.config.listen))?;
         eprintln!("capture-proxy listening on {}", proxy.config.listen);
         let mut shutdown = pin!(shutdown_requested());
-        loop {
+        let stop = loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, peer)) => {
@@ -124,13 +126,17 @@ impl CaptureProxy {
                     }
                     Err(error) => eprintln!("accepting a client: {error}"),
                 },
-                () = &mut shutdown => break,
+                stop = &mut shutdown => break stop,
             }
-        }
-        eprintln!("shutting down; finishing the session extractions (Ctrl-C again to skip)");
-        tokio::select! {
-            () = proxy.sessions.finish_extractions() => {}
-            () = shutdown_requested() => eprintln!("skipped the unfinished extractions"),
+        };
+        if stop == Stop::Asked {
+            eprintln!("shutting down; finishing the session extractions (Ctrl-C again to skip)");
+            tokio::select! {
+                () = proxy.sessions.finish_extractions() => {}
+                _ = shutdown_requested() => eprintln!("skipped the unfinished extractions"),
+            }
+        } else {
+            eprintln!("the console is closing; skipped the unfinished extractions");
         }
         eprintln!("writing the session logs");
         proxy.sessions.write_all(&proxy.config.out_dir);
@@ -477,9 +483,20 @@ fn kept(
     }
 }
 
+/// Why the proxy is stopping.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// Ctrl-C, or SIGTERM on Unix. The proxy has time to finish its extractions.
+    Asked,
+    /// The console is closing. Windows ends the process about five seconds after it tells the
+    /// proxy, so the proxy only has time to write its logs.
+    #[cfg(windows)]
+    ConsoleClosing,
+}
+
 /// Waits for Ctrl-C or SIGTERM so the proxy can write logs before exiting.
 #[cfg(unix)]
-async fn shutdown_requested() {
+async fn shutdown_requested() -> Stop {
     use tokio::signal::unix::{self, SignalKind};
 
     let mut terminate = unix::signal(SignalKind::terminate()).expect("watching for SIGTERM");
@@ -487,17 +504,18 @@ async fn shutdown_requested() {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
     }
+    Stop::Asked
 }
 
 /// Waits for Ctrl-C or for its console to close so the proxy can write logs before exiting.
 #[cfg(windows)]
-async fn shutdown_requested() {
+async fn shutdown_requested() -> Stop {
     use tokio::signal::windows;
 
     let mut close = windows::ctrl_close().expect("watching for the console closing");
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = close.recv() => {}
+        _ = tokio::signal::ctrl_c() => Stop::Asked,
+        _ = close.recv() => Stop::ConsoleClosing,
     }
 }
 
