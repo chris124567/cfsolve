@@ -18,6 +18,7 @@ use crate::challenge::program::{PreparedSession, SessionEncoder};
 use crate::challenge::reduced_timing::{Entry, ResourceTiming};
 use crate::challenge::source::InitialRequest;
 use crate::challenge::state::{Intervals, ScriptState};
+use crate::deobfuscate::Decoding;
 use crate::embedding_page::challenge_page::WIDGET_HOST;
 use crate::embedding_page::extra_params::{self, ApiScript};
 use crate::embedding_page::page::{Params, RenderedPage};
@@ -95,10 +96,10 @@ pub(crate) fn first_payload(
 /// In Chrome captures, the program calls the callback inside its own exception handler. In iOS
 /// Safari captures, the loader finishes later and its timer calls the callback without a
 /// registered handler.
-pub(super) fn render_sample(
+pub(super) async fn render_sample(
     api: &ApiScript,
     challenge: &ChallengePage,
-    javascript: &str,
+    decoding: &Decoding,
     cases: &CaseOpcodes,
     widget: &WidgetProgram,
     engine: Engine,
@@ -106,7 +107,8 @@ pub(super) fn render_sample(
     // The session script puts the page's inline script before the orchestrator.
     let (inline_lines, _) = engine::line_and_column(&challenge.javascript(""), Lines::Script);
     let guarded = engine == Engine::Chromium;
-    let geometry = call_stack::recover_method_call(javascript, cases, widget.render_call, guarded)?
+    let geometry = call_stack::recover_method_call(decoding, cases, widget.render_call, guarded)
+        .await?
         .rebased(inline_lines);
     let origin = ScriptPosition {
         url: challenge.orchestrator.to_string(),
@@ -142,6 +144,9 @@ pub(crate) async fn begin(
         anyhow::Ok(timer.overall(icon_url.as_str(), icon.encoded_bytes))
     };
     let javascript = challenge.javascript(&script);
+    // The render call's stack is read from the script as decoded, which its own thread decodes
+    // meanwhile.
+    let decoding = Decoding::start(javascript.clone())?;
     sink.progress(&format!(
         "Fetched the {}-byte orchestrator; deobfuscating it with the page's options",
         script.len()
@@ -206,11 +211,13 @@ pub(crate) async fn begin(
     match render_sample(
         &api,
         &challenge,
-        &javascript,
+        &decoding,
         &cases,
         &widget,
         client.engine(),
-    ) {
+    )
+    .await
+    {
         Ok(sample) => api.render_sample = sample,
         Err(error) => sink.progress(&format!(
             "Warning: the orchestrator's render call has no recovered stack, so the loader \

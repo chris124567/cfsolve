@@ -26,7 +26,7 @@ use swc_core::ecma::ast::{
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
-use crate::deobfuscate::{self, Deobfuscated};
+use crate::deobfuscate::{self, Decoding, Deobfuscated};
 use crate::engine::{self, Engine, Lines, StackFrame, V8_STACK_LIMIT};
 use crate::js::ast;
 use crate::{candidates, js};
@@ -174,8 +174,13 @@ pub enum Resumption {
 
 /// Recovers callback frames for a VM function with `arity` parameters and error-construction
 /// opcode `construct`.
-pub fn recover(source: &str, cases: &CaseOpcodes, construct: u8, arity: usize) -> Result<Geometry> {
-    geometry(source, cases, |machine| {
+pub async fn recover(
+    script: &Decoding,
+    cases: &CaseOpcodes,
+    construct: u8,
+    arity: usize,
+) -> Result<Geometry> {
+    geometry(script, cases, move |machine| {
         let mut chain = machine.construction(construct, false)?;
         // A DOM event calls the arity-specific listener directly, when there is one, with the
         // checkbox as receiver.
@@ -186,18 +191,19 @@ pub fn recover(source: &str, cases: &CaseOpcodes, construct: u8, arity: usize) -
         }
         Ok(chain)
     })
+    .await
 }
 
 /// Recovers frames for the stack probe, run after `resumed`. The VM executes closures in its
 /// dispatch loop without JavaScript calls, so frames stop at the listener that resumed it. V8
 /// retains only the innermost ten frames.
-pub fn recover_probe(
-    source: &str,
+pub async fn recover_probe(
+    script: &Decoding,
     cases: &CaseOpcodes,
     calls: ProbeCalls,
     resumed: Resumption,
 ) -> Result<Geometry> {
-    geometry(source, cases, |machine| {
+    geometry(script, cases, move |machine| {
         // The probe registers an exception handler, so its instructions dispatch from the
         // guarded loop.
         let mut chain = machine.construction(calls.construct, true)?;
@@ -209,19 +215,20 @@ pub fn recover_probe(
         chain.frames.truncate(V8_STACK_LIMIT);
         Ok(chain)
     })
+    .await
 }
 
 /// Recovers the stack outside a native method called by a VM function, from the method call to
 /// the listener. Closure-factory listeners are anonymous. Uses the guarded dispatch loop when
 /// an exception handler is registered, including calls made by the program itself under a
 /// handler.
-pub fn recover_method_call(
-    source: &str,
+pub async fn recover_method_call(
+    script: &Decoding,
     cases: &CaseOpcodes,
     call: MethodCall,
     guarded: bool,
 ) -> Result<Geometry> {
-    geometry(source, cases, |machine| {
+    geometry(script, cases, move |machine| {
         let mut frames = machine.method_call(call.opcode, call.passed, guarded)?;
         frames.extend(machine.listener(call.arity, "")?);
         Ok(Chain {
@@ -229,6 +236,7 @@ pub fn recover_method_call(
             reflected: false,
         })
     })
+    .await
 }
 
 /// Dispatch loop called by `run`, with details used to check stack recovery offline.
@@ -282,35 +290,38 @@ pub fn dispatch_summary(source: &str, cases: &CaseOpcodes) -> Result<Vec<Dispatc
     })
 }
 
-/// Parses `source` and places the frames `recover` finds in it as each engine reports them.
-fn geometry(
-    source: &str,
+/// Places the frames `recover` finds in the decoded `script` as each engine reports them.
+async fn geometry(
+    script: &Decoding,
     cases: &CaseOpcodes,
-    mut recover: impl FnMut(&Machine<'_>) -> Result<Chain>,
+    recover: impl FnOnce(&Machine<'_>) -> Result<Chain> + Send + 'static,
 ) -> Result<Geometry> {
-    deobfuscate::read_decoded(source.to_owned(), |program, start| {
-        let Chain { frames, reflected } = recover(&Machine::new(program, start, cases)?)?;
-        let frame = |function: String, at: BytePos| -> Result<Frame> {
-            let offset = (at.0 - start.0) as usize;
-            let prefix = source.get(..offset).context("invalid source byte offset")?;
-            let (line, column) = engine::line_and_column(prefix, Lines::Script);
-            Ok(Frame {
-                function,
-                line,
-                column,
-            })
-        };
-        let mut geometry = Geometry {
-            frames: Vec::new(),
-            jsc_frames: Vec::new(),
-            reflected,
-        };
-        for Call { name, site } in frames {
-            geometry.frames.push(frame(name.v8, site.v8)?);
-            geometry.jsc_frames.push(frame(name.jsc, site.jsc)?);
-        }
-        Ok(geometry)
-    })
+    let cases = cases.clone();
+    script
+        .read(move |program, start, source| {
+            let Chain { frames, reflected } = recover(&Machine::new(program, start, &cases)?)?;
+            let frame = |function: String, at: BytePos| -> Result<Frame> {
+                let offset = (at.0 - start.0) as usize;
+                let prefix = source.get(..offset).context("invalid source byte offset")?;
+                let (line, column) = engine::line_and_column(prefix, Lines::Script);
+                Ok(Frame {
+                    function,
+                    line,
+                    column,
+                })
+            };
+            let mut geometry = Geometry {
+                frames: Vec::new(),
+                jsc_frames: Vec::new(),
+                reflected,
+            };
+            for Call { name, site } in frames {
+                geometry.frames.push(frame(name.v8, site.v8)?);
+                geometry.jsc_frames.push(frame(name.jsc, site.jsc)?);
+            }
+            Ok(geometry)
+        })
+        .await
 }
 
 /// Calls recovered from the innermost frame outward.
