@@ -21,7 +21,7 @@ use super::interpret::Way;
 use super::machine::{Loaded, Machine};
 use super::output::{Constant, Effect, Exit, Hidden, Instruction, Listing, Path, Position, Term};
 use super::value::Value;
-use super::{HashMap, convert, dataflow};
+use super::{HashMap, convert, dataflow, packed_names};
 use crate::candidates;
 
 impl Machine<'_> {
@@ -57,7 +57,7 @@ impl Machine<'_> {
                     Err(failure) => walk.listing.failures.push(failure),
                 }
             }
-            if !walk.retry(self, &loaded)? && !walk.drop_shortcuts() {
+            if !(walk.retry(self, &loaded)? || walk.drop_shortcuts()) {
                 break;
             }
         }
@@ -69,6 +69,7 @@ impl Machine<'_> {
         });
         listing.failures.sort_unstable_by_key(|failure| failure.pc);
         fuse_method_calls(&mut listing);
+        packed_names::fold(&mut listing);
         Ok(listing)
     }
 }
@@ -387,6 +388,23 @@ pub fn catch_frame(elements: &[Term]) -> Option<Position> {
     }
 }
 
+/// Exception continuations enter without the registers known on the normal path.
+pub(super) fn exception_entries(listing: &Listing) -> BTreeSet<u32> {
+    let mut entries = BTreeSet::new();
+    for instruction in listing.instructions.values() {
+        for effect in instruction.effects() {
+            effect.visit_terms(&mut |term| {
+                if let Term::Array(frame) = term
+                    && let Some(position) = catch_frame(frame)
+                {
+                    entries.insert(position.pc);
+                }
+            });
+        }
+    }
+    entries
+}
+
 /// Rewrites method calls to the form listing readers expect. Some builds call `object[key]`
 /// directly; others load the method into a register and later call that register with `object`
 /// as receiver.
@@ -394,15 +412,11 @@ fn fuse_method_calls(listing: &mut Listing) {
     // Unrecorded entries, such as functions and hidden targets, start with no known loads.
     let functions = listing.functions.iter().map(|function| function.pc);
     let hidden = listing.hidden.iter().map(|hidden| hidden.target.pc);
-    let entries = functions.chain(hidden).map(|pc| (pc, Loads::default()));
-    let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
-        for effect in &path.effects {
-            update_loads(loads, effect);
-        }
-        ControlFlow::<Infallible, bool>::Continue(true)
-    });
+    let incoming = incoming_loads(listing, functions.chain(hidden));
+    // Exception continuations also start with no known loads, without erasing the normal path's.
+    let exceptional = incoming_loads(listing, exception_entries(listing));
     for (pc, instruction) in &mut listing.instructions {
-        let Some(entry) = incoming.get(pc) else {
+        let Some(entry) = incoming.get(pc).or_else(|| exceptional.get(pc)) else {
             continue;
         };
         for path in &mut instruction.paths {
@@ -415,6 +429,21 @@ fn fuse_method_calls(listing: &mut Listing) {
             }
         }
     }
+}
+
+/// The loads known on entry to each instruction reachable from `entries`.
+fn incoming_loads(
+    listing: &Listing,
+    entries: impl IntoIterator<Item = u32>,
+) -> BTreeMap<u32, Loads> {
+    let entries = entries.into_iter().map(|pc| (pc, Loads::default()));
+    let ControlFlow::Continue(incoming) = dataflow::forward(listing, entries, |_, path, loads| {
+        for effect in &path.effects {
+            update_loads(loads, effect);
+        }
+        ControlFlow::<Infallible, bool>::Continue(true)
+    });
+    incoming
 }
 
 /// Tracks registers holding `object[key]` while the object and key registers remain unchanged.

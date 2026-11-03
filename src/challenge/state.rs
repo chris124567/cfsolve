@@ -2,14 +2,14 @@
 //! tally ([`super::tally`]), the sender's additions and POST log, and the resource timing
 //! format ([`super::reduced_timing`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail, ensure};
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignTarget, BinaryOp, CallExpr, Expr, Function, IfStmt, ObjectLit,
-    SimpleAssignTarget, Stmt, VarDeclarator,
+    ArrowExpr, AssignExpr, AssignTarget, BinaryOp, CallExpr, Expr, FnDecl, Function, Id, IfStmt,
+    MemberExpr, ObjectLit, SimpleAssignTarget, Stmt, VarDeclarator,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
@@ -36,9 +36,19 @@ pub struct ScriptState {
     /// Options copied into the payload under their original names at send time.
     pub forwarded: Vec<String>,
     pub timing: Option<ResourceTiming>,
-    /// Functions on the script's namespace, mapped to the option each returns.
-    pub getters: BTreeMap<String, String>,
+    /// Functions on the script's namespace, by name.
+    pub getters: BTreeMap<String, Getter>,
     pub post_log: Option<PostLog>,
+}
+
+/// A function on the script's namespace that returns an option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Getter {
+    pub option: String,
+    /// The option holding the page origin, when the getter passes each render sample's stack
+    /// through a helper that replaces URLs on that origin with indices (see
+    /// [`crate::challenge::payload::split_page_urls`]).
+    pub page_origin: Option<String>,
 }
 
 /// Log of challenge POSTs. Each payload includes the log so far. The sender then adds an entry for
@@ -208,7 +218,7 @@ impl ScriptState {
             elapsed: elapsed.map(|(_, elapsed)| elapsed),
             forwarded: forwarded.into_iter().map(|(_, key)| key).collect(),
             timing,
-            getters: distinct_getters(sender.getters)?,
+            getters: distinct_getters(sender.getters, &sender.helpers)?,
             post_log,
         })
     }
@@ -400,16 +410,56 @@ struct Sender {
     scopes: Vec<usize>,
     elapsed: Vec<(usize, Elapsed)>,
     copies: Vec<(usize, String)>,
-    getters: Vec<Getter>,
+    getters: Vec<FoundGetter>,
+    /// The first option each declared function reads, by binding.
+    helpers: HashMap<Id, String>,
     pushes: Vec<Push>,
     entries: Vec<LogEntry>,
     stamps: Vec<Stamp>,
 }
 
-/// A namespace getter named `function` that returns the option `option`.
-struct Getter {
+/// A namespace getter named `function` that returns the option `option`, rewriting each
+/// sample's stack with the declared function `rewrite`, if any.
+struct FoundGetter {
     function: String,
     option: String,
+    rewrite: Option<Id>,
+}
+
+/// Finds `<sample>.s = <helper>(<sample>.s)`.
+#[derive(Default)]
+struct StackRewrite(Option<Id>);
+
+impl Visit for StackRewrite {
+    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+        if let AssignTarget::Simple(SimpleAssignTarget::Member(target)) = &assignment.left
+            && ast::ident_property(target) == Some("s")
+            && let Expr::Call(call) = &*assignment.right
+            && let Some(helper) = call.callee.as_expr().and_then(|callee| callee.as_ident())
+            && let [argument] = &call.args[..]
+            && let Some(read) = argument.expr.as_member()
+            && ast::ident_property(read) == Some("s")
+        {
+            self.0 = Some(helper.to_id());
+        }
+        assignment.visit_children_with(self);
+    }
+}
+
+/// The first option a function reads.
+#[derive(Default)]
+struct OptionRead(Option<String>);
+
+impl Visit for OptionRead {
+    fn visit_member_expr(&mut self, member: &MemberExpr) {
+        if self.0.is_none()
+            && expression::is_options(&member.obj)
+            && let Some(option) = ast::member_str(&member.prop)
+        {
+            self.0 = Some(option.to_owned());
+        }
+        member.visit_children_with(self);
+    }
 }
 
 /// Matches `_cf_chl_opt.<log>.push(<local>)`.
@@ -503,6 +553,15 @@ impl Visit for Sender {
         self.within(function);
     }
 
+    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
+        let mut read = OptionRead::default();
+        declaration.function.visit_with(&mut read);
+        if let Some(option) = read.0 {
+            self.helpers.insert(declaration.ident.to_id(), option);
+        }
+        declaration.visit_children_with(self);
+    }
+
     fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
         self.within(arrow);
     }
@@ -563,9 +622,12 @@ impl Visit for Sender {
                         && let Expr::Assign(first) = &*first.expr
                         && let Some(option) = expression::option_key(&first.right) =>
                 {
-                    self.getters.push(Getter {
+                    let mut rewrite = StackRewrite::default();
+                    getter.function.visit_with(&mut rewrite);
+                    self.getters.push(FoundGetter {
                         function: key.to_owned(),
                         option: option.to_owned(),
+                        rewrite: rewrite.0,
                     });
                 }
                 // `payload.<key> = _cf_chl_opt.<key>`
@@ -589,14 +651,34 @@ impl Visit for Sender {
     }
 }
 
-/// Rejects a getter name that returns different options.
-fn distinct_getters(getters: Vec<Getter>) -> Result<BTreeMap<String, String>> {
+/// Resolves each getter's stack rewrite to the option its helper reads. Rejects a getter name
+/// that returns different options.
+fn distinct_getters(
+    getters: Vec<FoundGetter>,
+    helpers: &HashMap<Id, String>,
+) -> Result<BTreeMap<String, Getter>> {
     let mut distinct = BTreeMap::new();
-    for Getter { function, option } in getters {
-        let previous = distinct.entry(function.clone()).or_insert(option.clone());
+    for found in getters {
+        let function = found.function;
+        let page_origin = found
+            .rewrite
+            .map(|helper| {
+                helpers.get(&helper).cloned().with_context(|| {
+                    format!(
+                        "getter {function} rewrites stacks with unknown helper {}",
+                        helper.0
+                    )
+                })
+            })
+            .transpose()?;
+        let getter = Getter {
+            option: found.option,
+            page_origin,
+        };
+        let previous = distinct.entry(function.clone()).or_insert(getter.clone());
         ensure!(
-            *previous == option,
-            "getter {function} reads both {previous} and {option}"
+            *previous == getter,
+            "getter {function} reads both {previous:?} and {getter:?}"
         );
     }
     Ok(distinct)

@@ -74,8 +74,11 @@ impl ObjectProperties {
             }
             // A regular expression carries state and identity, so it cannot
             // stand in for every read.
-            Expr::Lit(literal) if !matches!(literal, Lit::Regex(_)) => {
-                self.literals.insert(name, Expr::Lit(literal.clone()));
+            Expr::Lit(Lit::Regex(_)) => {}
+            // Decoded strings may print as templates without substitutions.
+            Expr::Tpl(template) if !template.exprs.is_empty() => {}
+            Expr::Lit(_) | Expr::Tpl(_) => {
+                self.literals.insert(name, value.clone());
             }
             _ => {}
         }
@@ -486,7 +489,10 @@ fn commutes(first: &Expr, second: &Expr, globals: Globals) -> bool {
 fn eager_operands(result: &Expr) -> Option<Vec<&Expr>> {
     match result {
         Expr::Paren(paren) => eager_operands(&paren.expr),
-        Expr::Unary(unary) if unary.op != UnaryOp::Delete => eager_operands(&unary.arg),
+        // A unary operator applies to its evaluated operand, as the call would.
+        Expr::Unary(unary) if unary.op != UnaryOp::Delete => {
+            eager_operands(&unary.arg).or_else(|| Some(vec![&unary.arg]))
+        }
         Expr::Bin(binary) if !binary.op.may_short_circuit() => {
             Some(vec![&binary.left, &binary.right])
         }
@@ -781,6 +787,15 @@ mod tests {
         );
         assert!(output.contains("(1) + (2)"), "{output}");
         testing::assert_lacks(&output, &["p.name", "h.name]"]);
+        // Static templates inline into later callbacks, as in a payload built after a delay.
+        let output = transform(
+            "function f(h, g) { h = { key: `_field` }; g(function () { return w[h.key]; }); }",
+        );
+        assert!(output.contains("w[`_field`]"), "{output}");
+        // A unary helper evaluates its argument first either way, even a member read.
+        let output =
+            transform("function f(n) { n = function (a) { return !a; }; if (n(w.x)) g(); }");
+        assert!(output.contains("!(w.x)"), "{output}");
         // Helper functions inline when they name only what callers see.
         let output = transform(
             "function f(add, call, read, g) { add = function(a, b) { return a + b; }; \

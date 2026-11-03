@@ -18,6 +18,7 @@ mod extract;
 mod interpret;
 mod machine;
 mod output;
+mod packed_names;
 mod registers;
 mod session;
 mod value;

@@ -6,7 +6,7 @@ use swc_core::ecma::ast::{BlockStmt, Class, Script, Stmt};
 use super::HashMap;
 use super::dispatch::{Decoded, Dispatch};
 use super::extract::{self, Finder};
-use super::interpret::{self, Invocation, MAXIMUM_PATHS, Way};
+use super::interpret::{self, Decrypted, Invocation, MAXIMUM_PATHS, Way};
 use super::output::{Cause, Failure, Instruction, Position};
 use super::session::Session;
 use super::value::Value;
@@ -48,11 +48,13 @@ pub struct Machine<'definition> {
     pub(super) session: Session<'definition>,
 }
 
-/// A program, with the instance fields the constructor derives from it.
+/// A program, with the instance fields the constructor derives from it and the strings
+/// decrypted from it so far.
 #[derive(Clone)]
 pub(super) struct Loaded<'program, 'definition> {
     program: &'program [u8],
     pub(super) fields: HashMap<String, Value<'definition>>,
+    decrypted: Decrypted<'definition>,
 }
 
 impl<'definition> Machine<'definition> {
@@ -69,6 +71,7 @@ impl<'definition> Machine<'definition> {
         Loaded {
             program,
             fields: self.session.constructed(program),
+            decrypted: Decrypted::default(),
         }
     }
 
@@ -144,6 +147,7 @@ impl<'definition> Machine<'definition> {
             session: &self.session,
             program: loaded.program,
             fields: &loaded.fields,
+            decrypted: &loaded.decrypted,
             pc: pc + 1,
             key: next,
             handler,

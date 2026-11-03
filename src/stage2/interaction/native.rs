@@ -140,7 +140,7 @@ pub(crate) fn measure(
         "bubbles":true, "button":0, "buttons":0, "cancelable":true,
         "clientX":client_x, "clientY":client_y, "composed":true, "ctrlKey":false,
         "defaultPrevented":false, "detail":1, "eventPhase":2, "height":1,
-        "isPrimary":is_primary, "isTrusted":true, "layerX":(client_x-x).round(), "layerY":(client_y-y).round(),
+        "isPrimary":is_primary, "isTrusted":true, "layerX":(client_x-x).floor(), "layerY":(client_y-y).floor(),
     }));
     event.extend(object(json!({
         "movementX":0, "movementY":0, "metaKey":false,
@@ -250,6 +250,7 @@ mod tests {
         assert_eq!(event["screenX"], 101.0);
         assert_eq!(event["screenY"], 145.0);
         assert_eq!(event["offsetY"], 12.0);
+        assert_eq!(event["layerY"], 11.0);
         assert_eq!(raw["sources"]["derived"]["relative_y"], 11.0);
         assert_eq!(event["timeStamp"], 123.0);
         assert_eq!(raw["sources"]["element"]["clientWidth"], 168.0);

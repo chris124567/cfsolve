@@ -5,7 +5,9 @@
 //! globals include a build marker, a selector log, and functions built from constants, such as
 //! the key transform's `window[name] = factory(secret)`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use anyhow::Result;
 use swc_core::ecma::ast::BinaryOp;
@@ -16,6 +18,8 @@ use crate::listing::query;
 use crate::script::Source;
 use crate::vm::{Effect, Exit, Listing, Term};
 
+mod audit;
+
 /// Values tracked beyond literals while recovering installed options.
 #[derive(Clone)]
 enum Held {
@@ -24,6 +28,13 @@ enum Held {
     Window,
     /// The result of a call with one string-constant argument.
     Built(String),
+    /// An array the audit fills by index, holding native function sources where known.
+    AuditArray(Rc<RefCell<BTreeMap<usize, Option<String>>>>),
+    NativeFunction(String),
+    /// The result of a `now()` call.
+    Clock,
+    ClockDelta,
+    GpuPromise,
 }
 
 /// Options and globals left by the initial program.
@@ -36,6 +47,10 @@ pub struct Installed {
     pub window: Window,
     /// Window globals created by calls with one string constant, mapped to that constant.
     pub built: BTreeMap<String, String>,
+    /// Initial global values as classified by the environment audit.
+    pub audit: BTreeMap<String, String>,
+    /// Semantic roles for globals whose values alone do not identify their definitions.
+    pub audit_roles: BTreeMap<String, String>,
 }
 
 /// Recovers values installed by the initial `program`, decoded from its program runner call.
@@ -62,6 +77,20 @@ pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
                 ) else {
                     return;
                 };
+                if matches!(object, Known::Ext(Held::Window)) {
+                    let audit = match &value {
+                        Known::Literal(JsValue::String(text)) => Some(text.clone()),
+                        Known::Literal(JsValue::Number(number)) => Some(number.to_string()),
+                        Known::Literal(JsValue::Bool(true)) => Some("T".into()),
+                        Known::Literal(JsValue::Bool(false)) => Some("F".into()),
+                        Known::Object(_) => Some("o".into()),
+                        Known::Ext(Held::Built(_)) => Some("N".into()),
+                        _ => None,
+                    };
+                    if let Some(audit) = audit {
+                        installed.audit.insert(key.clone(), audit);
+                    }
+                }
                 match (object, value) {
                     // The encoder skips function members, such as `toJSON`.
                     (Known::Object(id), Known::Literal(value)) => {
@@ -88,6 +117,7 @@ pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
             });
         }
     }
+    audit::read(&listing, &mut installed);
     Ok(installed)
 }
 

@@ -216,6 +216,7 @@ impl<'ast> Run<'ast, '_> {
                 let Value::Array(elements) = &this else {
                     return self.apply(Value::symbolic(global()), this, arguments);
                 };
+                self.writable(&this)?;
                 let mut elements = elements.borrow_mut();
                 elements.extend(arguments);
                 Ok(Value::Number(elements.len() as f64))
@@ -227,6 +228,7 @@ impl<'ast> Run<'ast, '_> {
                 let Value::Array(elements) = &this else {
                     return self.apply(Value::symbolic(global()), this, arguments);
                 };
+                self.writable(&this)?;
                 let popped = elements.borrow_mut().pop();
                 match popped {
                     Some(value) => Ok(value),
@@ -366,11 +368,13 @@ impl<'ast> Run<'ast, '_> {
                     },
                     Builtin::Add => {
                         if contains(&members.borrow(), &key) == Some(false) {
+                            self.writable(&this)?;
                             members.borrow_mut().push(key);
                         }
                         Ok(this.clone())
                     }
                     _ => {
+                        self.writable(&this)?;
                         let mut members = members.borrow_mut();
                         let before = members.len();
                         members.retain(|member| {
@@ -403,6 +407,7 @@ impl<'ast> Run<'ast, '_> {
                     Builtin::MapHas => Ok(Value::Bool(position.is_some())),
                     Builtin::MapSet => {
                         let value = argument(1);
+                        self.writable(&this)?;
                         let mut entries = entries.borrow_mut();
                         match position {
                             Some(position) => entries[position].1 = value,
@@ -412,6 +417,7 @@ impl<'ast> Run<'ast, '_> {
                     }
                     _ => {
                         if let Some(position) = position {
+                            self.writable(&this)?;
                             entries.borrow_mut().remove(position);
                         }
                         Ok(Value::Bool(position.is_some()))

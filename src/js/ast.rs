@@ -9,7 +9,8 @@ use anyhow::{Result, ensure};
 use swc_core::atoms::Wtf8Atom;
 use swc_core::common::sync::Lrc;
 use swc_core::common::{
-    BytePos, DUMMY_SP, FileName, SourceFile, SourceMap, Spanned, SyntaxContext,
+    BytePos, DUMMY_SP, FileName, GLOBALS, Globals, Mark, SourceFile, SourceMap, Spanned,
+    SyntaxContext,
 };
 use swc_core::ecma::ast::{
     AssignExpr, AssignOp, BinaryOp, BlockStmt, Expr, ExprOrSpread, ExprStmt, FnDecl, Function, Id,
@@ -17,7 +18,8 @@ use swc_core::ecma::ast::{
     PropOrSpread, Script, Stmt, UnaryOp, VarDeclarator,
 };
 use swc_core::ecma::parser::{Parser, StringInput, Syntax};
-use swc_core::ecma::visit::{Visit, VisitWith};
+use swc_core::ecma::visit::{Visit, VisitMutWith, VisitWith};
+use swc_ecma_transforms::resolver;
 
 use crate::engine::{self, Lines};
 
@@ -53,8 +55,15 @@ impl ParsedScript {
     }
 }
 
+/// Parses the deobfuscated iframe script and resolves its scopes, so a binding's [`Id`]
+/// identifies it even where other scopes reuse its name.
 pub(crate) fn parse_iframe_javascript(source: &str) -> Result<ParsedScript> {
-    parse_javascript("deobfuscated iframe", source)
+    let mut parsed = parse_javascript("deobfuscated iframe", source)?;
+    GLOBALS.set(&Globals::new(), || {
+        let mut resolve = resolver(Mark::new(), Mark::new(), false);
+        parsed.script.visit_mut_with(&mut resolve);
+    });
+    Ok(parsed)
 }
 
 /// Parses `source`, using `what` to identify it in errors.

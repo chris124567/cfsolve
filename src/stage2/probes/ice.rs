@@ -1,13 +1,12 @@
 //! Refreshes recorded ICE connection state while preserving its format and timing.
 //!
-//! Reports recorded host candidates, matching a network that blocks UDP. Does not query STUN
-//! servers, since they would report this machine's address instead of the proxy's.
+//! Reports recorded host candidates only, matching a network that blocks UDP to STUN servers.
 //!
 //! The probe reuses a connection opened earlier. Chrome's recorded startup connection shares
 //! one mDNS name among host candidates; WebKit's uses a separate name for each. Keeps candidate
 //! lines, timing offsets, shared names and foundations, and offer codec and attribute order.
 //! Generates a fresh session ID, credentials, certificate fingerprint, mDNS names, foundations,
-//! and ports.
+//! and host ports.
 
 use std::collections::HashMap;
 
@@ -24,8 +23,9 @@ fn tokens(line: &str) -> Vec<String> {
     line.split(' ').map(str::to_owned).collect()
 }
 
-fn is_host(tokens: &[String]) -> bool {
-    tokens.get(7).is_some_and(|kind| kind == "host")
+/// Whether the candidate `line` has type `host` rather than, say, `srflx` (server-reflexive).
+pub(crate) fn is_host(line: &str) -> bool {
+    line.split(' ').nth(7) == Some("host")
 }
 
 /// Session identity shared by candidates and SDP.
@@ -82,6 +82,7 @@ impl Identity {
 
 /// Replaces `previous`'s connection state with a fresh one, keeping its capabilities and timing.
 /// Candidates that shared an mDNS name or a foundation in the recording share the fresh one.
+/// Candidates other than host candidates are left out.
 pub(crate) fn refresh(previous: Measurement) -> Result<Measurement> {
     let Measurement::Observed {
         preparation,
@@ -109,17 +110,17 @@ pub(crate) fn refresh(previous: Measurement) -> Result<Measurement> {
             .candidate
             .as_str()
             .context("a recorded media candidate is not a line")?;
-        let tokens = tokens(line);
-        if !is_host(&tokens) {
+        if !is_host(line) {
             continue;
         }
-        let address = names
+        let tokens = tokens(line);
+        let name = names
             .entry(tokens[4].clone())
             .or_insert_with(|| format!("{}.local", uuid()));
         let foundation = *foundations
             .entry(tokens[0].clone())
             .or_insert_with(|| u32::from_le_bytes(random()));
-        let candidate = identity.candidate(&tokens, foundation, address, port());
+        let candidate = identity.candidate(&tokens, foundation, name, port());
         let offset = media::delta(recorded_candidate.observed_ms, recorded_started_ms)?;
         candidates.push(Candidate {
             candidate: json!(candidate),
@@ -248,7 +249,7 @@ mod tests {
         assert_eq!(offsets, [-100, -83]);
         assert_eq!(snapshot.finished_ms - snapshot.started_ms, 154);
         for tokens in &lines {
-            assert!(is_host(tokens) && tokens[4].ends_with(".local"));
+            assert!(tokens[7] == "host" && tokens[4].ends_with(".local"));
             assert!(!HOST.contains(&tokens[4]) && !OTHER_HOST.contains(&tokens[4]));
         }
         assert_ne!(lines[0][4], lines[1][4], "WebKit names each host candidate");

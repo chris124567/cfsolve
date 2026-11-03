@@ -176,12 +176,15 @@ impl Vocabulary {
     }
 }
 
-/// Renames strings and object keys using `rename`.
+/// Renames strings and object keys using `rename`, including randomized names inside longer
+/// strings, such as a list of names or a style rule's selector.
 fn rewrite<'a>(value: &mut JsValue, rename: &impl Fn(&str) -> Option<&'a String>) {
     match value {
         JsValue::String(text) => {
             if let Some(name) = rename(text) {
                 *text = name.clone();
+            } else if let Some(renamed) = rename_embedded(text, rename) {
+                *text = renamed;
             }
         }
         JsValue::Array(items) => {
@@ -192,6 +195,29 @@ fn rewrite<'a>(value: &mut JsValue, rename: &impl Fn(&str) -> Option<&'a String>
         JsValue::Object(object) => rewrite_object(object, rename),
         _ => {}
     }
+}
+
+/// Renames each randomized name `text` contains, wherever it starts. Names can adjoin other
+/// hex digits, as in `_<name><hash>_<name>`, so matches need no boundary. Returns `None` if
+/// nothing was renamed.
+fn rename_embedded<'a>(text: &str, rename: &impl Fn(&str) -> Option<&'a String>) -> Option<String> {
+    const LENGTH: usize = 25;
+    let mut renamed = String::with_capacity(text.len());
+    let mut copied = 0;
+    for (at, _) in text.match_indices('_') {
+        let candidate = text.get(at..at + LENGTH).filter(|name| is_hex_name(name));
+        if at >= copied
+            && let Some(name) = candidate.and_then(rename)
+        {
+            renamed.push_str(&text[copied..at]);
+            renamed.push_str(name);
+            copied = at + LENGTH;
+        }
+    }
+    (copied > 0).then(|| {
+        renamed.push_str(&text[copied..]);
+        renamed
+    })
 }
 
 fn rewrite_object<'a>(object: &mut JsObject, rename: &impl Fn(&str) -> Option<&'a String>) {
@@ -375,13 +401,18 @@ fn embedded_names<'a>(session: &'a str, reference: &'a str) -> Vec<(&'a str, &'a
     names
 }
 
-/// Splits a string into alternating runs of ASCII letters and digits, and other characters.
+/// Splits a string into alternating runs of name bytes (see [`is_name_byte`]) and other bytes.
 fn tokens(text: &str) -> Vec<&str> {
     text.as_bytes()
-        .chunk_by(|left, right| left.is_ascii_alphanumeric() == right.is_ascii_alphanumeric())
+        .chunk_by(|left, right| is_name_byte(*left) == is_name_byte(*right))
         // Boundaries fall only beside ASCII, never inside a UTF-8 character.
         .map(|part| std::str::from_utf8(part).expect("runs split only beside ASCII bytes"))
         .collect()
+}
+
+/// Name characters, including the `_` that starts hex names.
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 /// A run of strings the session and reference sequences share.
@@ -467,14 +498,27 @@ fn longest_run(
     best
 }
 
-/// Whether a string could be one of the program's randomized names.
+/// Whether a string could be one of the program's randomized names: four to nine letters and
+/// digits such as `XNWt6`, or a hex name (see [`is_hex_name`]).
 fn is_name(text: &str) -> bool {
-    (4..=9).contains(&text.len())
-        && text.starts_with(|c: char| c.is_ascii_alphabetic())
-        && text.chars().all(|c| c.is_ascii_alphanumeric())
-        && text
-            .chars()
-            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    is_hex_name(text)
+        || ((4..=9).contains(&text.len())
+            && text.starts_with(|c: char| c.is_ascii_alphabetic())
+            && text.chars().all(|c| c.is_ascii_alphanumeric())
+            && text
+                .chars()
+                .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
+}
+
+/// Whether `text` is a randomized name in the form newer builds use: `_` and 24 lowercase hex
+/// digits, such as `_2b78d2cde0fa83bfaec4edae`.
+pub(crate) fn is_hex_name(text: &str) -> bool {
+    text.strip_prefix('_').is_some_and(|hex| {
+        hex.len() == 24
+            && hex
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 #[cfg(test)]
@@ -484,7 +528,36 @@ mod tests {
 
     #[test]
     fn token_boundaries_preserve_non_ascii_markup() {
-        assert_eq!(tokens("é😀Aa12-中_foo"), ["é😀", "Aa12", "-中_", "foo"]);
+        // `_` belongs to names, as in hex names.
+        assert_eq!(tokens("é😀Aa12-中_foo"), ["é😀", "Aa12", "-中", "_foo"]);
+    }
+
+    #[test]
+    fn renames_names_inside_longer_strings() {
+        let name = |digit: &str| format!("_{}", digit.repeat(24));
+        let (a, b, c, x, y) = (name("a"), name("b"), name("c"), name("1"), name("2"));
+        let rename = |name: &str| match name {
+            name if name == a => Some(&x),
+            name if name == b => Some(&y),
+            _ => None,
+        };
+        let mut value = json!({
+            "list": format!("{a}, {b}, or {c}"),
+            "rule": format!(".{a} {{ color: red; }}"),
+            "joined": format!("{a}c52d060a{b}"),
+            "whole": a.clone(),
+        });
+        rewrite(&mut value, &rename);
+        assert_eq!(
+            value,
+            json!({
+                "list": format!("{x}, {y}, or {c}"),
+                "rule": format!(".{x} {{ color: red; }}"),
+                "joined": format!("{x}c52d060a{y}"),
+                "whole": x.clone(),
+            }),
+            "names without a pair stay, and names adjoining hex digits are renamed"
+        );
     }
 
     fn strings(text: &str) -> Vec<String> {

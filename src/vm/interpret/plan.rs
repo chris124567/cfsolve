@@ -1,6 +1,7 @@
 //! Compiles JavaScript into plans run by [`super::evaluate`]. Slot plans store function locals
-//! in numbered slots and cannot support closures capturing those locals. Scoped plans resolve
-//! names through scopes. Unsupported syntax becomes a node that stops evaluation if reached.
+//! in numbered slots, except locals that nested functions mention, which stay in the call's
+//! scope for those functions to capture. Scoped plans resolve all names through scopes.
+//! Unsupported syntax becomes a node that stops evaluation if reached.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -8,15 +9,17 @@ use std::cell::RefCell;
 use std::ptr;
 use std::rc::Rc;
 
+use rustc_hash::FxHashSet as HashSet;
 use swc_core::atoms::{Atom, atom};
 use swc_core::ecma::ast::{
-    ArrowExpr, AssignTarget, BinaryOp, BlockStmtOrExpr, Callee, CatchClause, Class, Decl,
-    DoWhileStmt, Expr, ExprOrSpread, FnDecl, Function, Ident, Lit, MemberExpr, MemberProp, Pat,
-    Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryOp, UpdateOp, VarDecl,
+    ArrowExpr, AssignTarget, BinaryOp, BlockStmt, BlockStmtOrExpr, Callee, CatchClause, Class,
+    Decl, DoWhileStmt, Expr, ExprOrSpread, FnDecl, Function, Ident, Lit, MemberExpr, MemberProp,
+    Pat, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryOp, UpdateOp, VarDecl,
     VarDeclKind, VarDeclOrExpr, VarDeclarator, WhileStmt,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
+use super::compile::{self, Code};
 use super::semantics;
 use crate::vm::HashMap;
 use crate::vm::value::Value;
@@ -65,28 +68,35 @@ impl<'ast> Plans<'ast> {
 }
 
 pub(super) struct FunctionPlan<'ast> {
-    pub(super) parameters: Vec<usize>,
+    /// Where each parameter is bound: a slot, or the call's scope if a nested function
+    /// mentions it.
+    pub(super) parameters: Vec<Name<'ast>>,
     /// The slot of `arguments`, if the body reads it.
     pub(super) arguments: Option<usize>,
     pub(super) locals: usize,
-    pub(super) body: Vec<Statement<'ast>>,
+    /// The body, compiled into closures.
+    pub(super) code: Vec<Code<'ast>>,
 }
 
 impl<'ast> FunctionPlan<'ast> {
     /// Attempts to compile a slot plan. Returns `None` to request a scoped plan for unsupported
     /// syntax, parenthesized callees, computed object keys, logical assignments, parameter
-    /// patterns, variables named `arguments`, or nested functions capturing locals.
+    /// patterns, variables named `arguments`, or arrows reading `arguments`.
     pub(super) fn compile(function: &'ast Function) -> Option<Self> {
-        let mut compiler = PlanCompiler::default();
+        let body = function.body.as_ref()?;
+        let mut compiler = PlanCompiler {
+            captured: captured(body),
+            ..PlanCompiler::default()
+        };
         let mut parameters = Vec::with_capacity(function.params.len());
         for parameter in &function.params {
             let name = &parameter.pat.as_ident()?.sym;
             if name == "arguments" {
                 return None;
             }
-            parameters.push(compiler.slot(name));
+            compiler.local(name);
+            parameters.push(compiler.name(name));
         }
-        let body = function.body.as_ref()?;
         body.visit_with(&mut compiler);
         let body = compiler.body(&body.stmts);
         if compiler.rejected {
@@ -96,7 +106,7 @@ impl<'ast> FunctionPlan<'ast> {
             parameters,
             arguments: compiler.locals.get(&atom!("arguments")).copied(),
             locals: compiler.locals.len(),
-            body,
+            code: compile::statements(&body),
         })
     }
 }
@@ -126,6 +136,8 @@ pub(super) fn scoped_arrow(arrow: &ArrowExpr) -> Vec<Statement<'_>> {
 struct PlanCompiler {
     /// Slots of a slot plan's locals; empty for scoped plans.
     locals: HashMap<Atom, usize>,
+    /// Names nested functions mention. Locals with these names stay in the call's scope.
+    captured: HashSet<Atom>,
     /// Whether compilation needs a scoped plan. Ignored when compiling scoped plans.
     rejected: bool,
 }
@@ -133,32 +145,31 @@ struct PlanCompiler {
 impl Visit for PlanCompiler {
     fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
         if let Pat::Ident(name) = &declaration.name {
-            self.slot(&name.sym);
+            self.local(&name.sym);
         }
         declaration.visit_children_with(self);
     }
 
     fn visit_ident(&mut self, name: &Ident) {
         if name.sym == "arguments" {
-            self.slot(&name.sym);
+            self.local(&name.sym);
         }
     }
 
     /// Treat a nested function declaration as a local binding in the enclosing function.
     fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        self.slot(&declaration.ident.sym);
+        self.local(&declaration.ident.sym);
     }
 
     /// Treat a `catch` parameter as a function local in the execution plan.
     fn visit_catch_clause(&mut self, clause: &CatchClause) {
         if let Some(Pat::Ident(name)) = &clause.param {
-            self.slot(&name.sym);
+            self.local(&name.sym);
         }
         clause.visit_children_with(self);
     }
 
-    // Compile a nested function only if it captures no outer locals (see
-    // [`PlanCompiler::closes_over_nothing`]). Its own locals remain separate.
+    // A nested function's own locals remain separate.
     fn visit_function(&mut self, _: &Function) {}
     fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
     fn visit_class(&mut self, _: &Class) {}
@@ -166,12 +177,36 @@ impl Visit for PlanCompiler {
 
 /// Every name a nested function mentions, at any depth.
 #[derive(Default)]
-struct Names(Vec<Atom>);
+struct Names(HashSet<Atom>);
 
 impl Visit for Names {
     fn visit_ident(&mut self, name: &Ident) {
-        self.0.push(name.sym.clone());
+        self.0.insert(name.sym.clone());
     }
+}
+
+/// The names that functions, arrows, and classes nested in `body` mention, except `arguments`,
+/// which functions shadow and arrows reading it are rejected for.
+fn captured(body: &BlockStmt) -> HashSet<Atom> {
+    struct Nested(Names);
+
+    impl Visit for Nested {
+        fn visit_function(&mut self, function: &Function) {
+            function.visit_with(&mut self.0);
+        }
+        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+            arrow.visit_with(&mut self.0);
+        }
+        fn visit_class(&mut self, class: &Class) {
+            class.visit_with(&mut self.0);
+        }
+    }
+
+    let mut nested = Nested(Names::default());
+    body.visit_with(&mut nested);
+    let Nested(Names(mut names)) = nested;
+    names.remove(&atom!("arguments"));
+    names
 }
 
 pub(super) struct Case<'ast> {
@@ -291,21 +326,12 @@ impl<'ast> Name<'ast> {
 }
 
 impl PlanCompiler {
-    fn slot(&mut self, name: &Atom) -> usize {
-        let next = self.locals.len();
-        *self.locals.entry(name.clone()).or_insert(next)
-    }
-
-    /// Checks that a nested function captures no locals from the function being compiled.
-    /// Slot plans do not put these locals in the scope chain. Ordinary functions shadow
-    /// `arguments`; arrows inherit it and must not read it.
-    fn closes_over_nothing(&self, nested: &impl VisitWith<Names>, arrow: bool) -> bool {
-        let mut names = Names::default();
-        nested.visit_with(&mut names);
-        names
-            .0
-            .iter()
-            .all(|name| !self.locals.contains_key(name) && !(arrow && name == "arguments"))
+    /// Gives local `name` a slot unless a nested function mentions it.
+    fn local(&mut self, name: &Atom) {
+        if !self.captured.contains(name) {
+            let next = self.locals.len();
+            self.locals.entry(name.clone()).or_insert(next);
+        }
     }
 
     /// Plans a function body or block, binding its function declarations before executing
@@ -316,7 +342,6 @@ impl PlanCompiler {
         for statement in statements {
             if let Stmt::Decl(Decl::Fn(declaration)) = statement {
                 let name = &declaration.ident.sym;
-                self.rejected |= !self.closes_over_nothing(&*declaration.function, false);
                 plan.push(Statement::Declare(vec![Declaration {
                     name: self.name(name),
                     init: Some(Expression::Function(Some(name), &declaration.function)),
@@ -665,12 +690,14 @@ impl PlanCompiler {
                     .collect(),
             ),
             Expr::Fn(function) => {
-                self.rejected |= !self.closes_over_nothing(&function.function, false);
                 let name = function.ident.as_ref().map(|ident| &ident.sym);
                 Expression::Function(name, &function.function)
             }
+            // Arrows inherit `arguments`, which slot plans keep out of scopes.
             Expr::Arrow(arrow) => {
-                self.rejected |= !self.closes_over_nothing(arrow, true);
+                let mut names = Names::default();
+                arrow.visit_with(&mut names);
+                self.rejected |= names.0.contains(&atom!("arguments"));
                 Expression::Arrow(arrow)
             }
             expression => self.unsupported(match expression {

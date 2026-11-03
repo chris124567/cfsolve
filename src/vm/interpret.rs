@@ -11,16 +11,21 @@
 mod access;
 mod builtin;
 mod call;
+mod compile;
 mod copies;
 mod evaluate;
 mod explore;
+mod frozen;
+mod intrinsic;
 mod plan;
 mod run;
 mod semantics;
 mod setup;
 
 pub(crate) use builtin::Builtin;
-pub(crate) use explore::{Invocation, MAXIMUM_PATHS, Way, decode, explore};
+pub(crate) use explore::{Branching, Invocation, MAXIMUM_PATHS, Way, decode, explore};
+pub(crate) use frozen::Frozen;
+pub(crate) use intrinsic::{Intrinsics, intrinsics};
 pub(crate) use plan::Plans;
-pub(crate) use run::{Run, Spare};
+pub(crate) use run::{Decrypted, Run, Spare};
 pub(crate) use setup::setup;

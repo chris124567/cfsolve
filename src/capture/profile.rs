@@ -13,7 +13,6 @@
 mod headers;
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -33,6 +32,7 @@ use crate::js::{self, JsObject, JsValue, Payload};
 use crate::script::Source;
 use crate::stage2::analysis;
 use crate::stage2::benchmark::WorkerCosts;
+use crate::stage2::probes::ice;
 use crate::stage2::probes::media::Measurement;
 use crate::stage2::registry::{Kind, Operation};
 
@@ -247,7 +247,7 @@ impl Reported {
                     plan.vocabulary()
                         .rewrite_to_reference(probe.position(), &mut observed);
                     match fields.observed(&observed, started) {
-                        Ok(media) => self.media = Some(without_addresses(media)),
+                        Ok(media) => self.media = Some(host_candidates_only(media)),
                         Err(error) => problems.push(error.context("reading the media probe")),
                     }
                 }
@@ -373,23 +373,12 @@ fn reported<'payload>(
     }
 }
 
-/// Replaces recorded IP addresses with documentation addresses so shared profiles do not reveal the
-/// capture network. These addresses are never sent: [`crate::stage2::probes::ice::refresh`]
-/// generates new names for host candidates.
-fn without_addresses(mut media: Measurement) -> Measurement {
+/// Keeps only host candidates, which name the capture machine by mDNS name, so shared profiles do
+/// not reveal its public address. [`crate::stage2::probes::ice::refresh`] reports only these.
+fn host_candidates_only(mut media: Measurement) -> Measurement {
     if let Measurement::Observed { snapshot, .. } = &mut media {
-        for candidate in &mut snapshot.connection.published_candidates {
-            let Some(line) = candidate.candidate.as_str() else {
-                continue;
-            };
-            let tokens = line.split(' ').map(|token| match token.parse::<IpAddr>() {
-                Ok(address) if address.is_unspecified() => token.to_owned(),
-                Ok(IpAddr::V4(_)) => Ipv4Addr::new(192, 0, 2, 1).to_string(),
-                Ok(IpAddr::V6(_)) => Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).to_string(),
-                Err(_) => token.to_owned(),
-            });
-            candidate.candidate = JsValue::String(tokens.collect::<Vec<String>>().join(" "));
-        }
+        let candidates = &mut snapshot.connection.published_candidates;
+        candidates.retain(|candidate| candidate.candidate.as_str().is_some_and(ice::is_host));
     }
     media
 }

@@ -128,6 +128,9 @@ pub struct Probe {
     /// browser's recorded order.
     #[serde(default)]
     pub writes: WriteOrder,
+    /// Session literals recovered from result writes that cannot be replayed unchanged.
+    #[serde(default)]
+    pub replay_literals: JsObject,
 }
 
 impl Probe {

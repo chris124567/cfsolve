@@ -163,10 +163,11 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
             });
         }
     }
-    let source = strings
+    // Programs that decode strings in place also hold the source as a descriptor.
+    let parsed = strings
         .iter()
-        .find(|text| text.contains("WebAssembly.instantiate"))?;
-    let parsed = ast::parse_javascript("benchmark worker", source).ok()?;
+        .filter(|text| text.contains("WebAssembly.instantiate"))
+        .find_map(|source| ast::parse_javascript("benchmark worker", source).ok())?;
     let mut worker = Worker::default();
     parsed.script.visit_with(&mut worker);
     // Only the kernels the recorded speeds measure are supported. Field names are recovered
@@ -199,8 +200,13 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         .find(|items| items.len() == order.len() && *items != order)?;
     // The worker's source begins `var plan={<order>:[...],<iterations>:[...],`,
     // and the record takes the same two names.
-    let identifier =
-        |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_alphanumeric());
+    // Hex names start with `_`.
+    let identifier = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
     let [order_field, iterations_field]: [String; 2] = strings
         .iter()
         .skip_while(|text| *text != "var plan={")

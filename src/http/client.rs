@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
+use std::{env, fs};
 
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "internals")]
@@ -13,6 +14,7 @@ use wreq::cookie::{Cookie, Jar};
 use wreq::header::HeaderMap;
 use wreq::http2::{StreamDependency, StreamId};
 use wreq::redirect::Policy;
+use wreq::tls::trust::CertStore;
 use wreq::ws::{WebSocket, WebSocketRequestBuilder};
 use wreq::{Client, Proxy, RequestBuilder, Response};
 #[cfg(feature = "internals")]
@@ -23,6 +25,10 @@ use wreq_util::{Emulation, Platform, Profile};
 use super::decode;
 use super::header_order::{HeaderOrder, RequestKind, Slot};
 use crate::engine::Engine;
+
+/// Environment variable naming a PEM certificate to trust instead of the built-in roots, such as
+/// `capture-proxy`'s CA, so a solve can be recorded in the same format as a browser session.
+const PROXY_CA: &str = "CFSOLVE_PROXY_CA";
 
 /// HTTP client configured from the browser fingerprint. Shared by all session requests to
 /// preserve cookies and transport settings.
@@ -112,6 +118,11 @@ impl BrowserClient {
             .timeout(Duration::from_secs(30));
         if let Some(proxy) = proxy {
             builder = builder.proxy(Proxy::all(proxy)?);
+        }
+        if let Some(path) = env::var_os(PROXY_CA) {
+            let pem = fs::read(&path)
+                .with_context(|| format!("reading {PROXY_CA} {}", path.to_string_lossy()))?;
+            builder = builder.tls_cert_store(CertStore::from_pem_certs([&pem[..]])?);
         }
         Ok(Self {
             http: builder.build()?,

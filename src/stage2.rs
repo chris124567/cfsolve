@@ -9,6 +9,7 @@
 //! are assembled from recovered [`payload::Layout`] data.
 
 pub mod analysis;
+mod audit_globals;
 pub(crate) mod benchmark;
 pub mod call_stack;
 pub(crate) mod challenge_page;
@@ -20,6 +21,7 @@ pub mod records;
 pub(crate) mod reference;
 pub mod registry;
 pub mod replay;
+mod stylesheets;
 pub mod trace;
 pub mod vocabulary;
 mod worker_timing;

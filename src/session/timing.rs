@@ -79,32 +79,43 @@ pub(crate) struct Schedule {
     pub send_at: i64,
 }
 
-/// Schedules probes at least `startup_ms` after `arrived_ms`. Reserves one millisecond after
-/// each probe, then `pending_ms` before sending. The send time is no earlier than `now_ms`.
-/// Programs without probes wait only for startup. Uses signed durations to match record
-/// timestamp differences.
-pub(crate) fn schedule(
-    durations: &[i64],
-    startup_ms: i64,
-    pending_ms: i64,
-    arrived_ms: i64,
-    now_ms: i64,
-) -> Schedule {
-    let span: i64 = durations.iter().map(|duration| duration + 1).sum();
-    let busy = if durations.is_empty() {
-        startup_ms
-    } else {
-        startup_ms + span + pending_ms
-    };
-    let send_at = now_ms.max(arrived_ms + busy);
-    let mut start = send_at - pending_ms - span;
-    let mut marks = Vec::with_capacity(durations.len());
-    for &duration in durations {
-        let end = start + duration;
-        marks.push(ProbeMarks { start, end });
-        start = end + 1;
+/// Probe marks laid out as the probes run: in order, one millisecond apart. A probe lasts its
+/// planned duration, or until the work it waits for, such as a request, ends.
+pub(crate) struct Timeline {
+    /// When the next probe starts, in epoch milliseconds.
+    pub next_start: i64,
+    marks: Vec<ProbeMarks>,
+}
+
+impl Timeline {
+    #[must_use]
+    pub(crate) fn starting(next_start: i64) -> Self {
+        Self {
+            next_start,
+            marks: Vec::new(),
+        }
     }
-    Schedule { marks, send_at }
+
+    /// Ends the next probe `planned_ms` after it starts, or at `finished_ms` if its work ended
+    /// later.
+    pub(crate) fn finish(&mut self, planned_ms: i64, finished_ms: Option<i64>) {
+        let start = self.next_start;
+        let planned_end = start + planned_ms;
+        let end = finished_ms.map_or(planned_end, |finished| finished.max(planned_end));
+        self.marks.push(ProbeMarks { start, end });
+        self.next_start = end + 1;
+    }
+
+    /// Sends `pending_ms` after the last probe's next mark. Programs without probes send when
+    /// they start.
+    #[must_use]
+    pub(crate) fn schedule(self, pending_ms: i64) -> Schedule {
+        let pending_ms = if self.marks.is_empty() { 0 } else { pending_ms };
+        Schedule {
+            marks: self.marks,
+            send_at: self.next_start + pending_ms,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -112,13 +123,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probes_end_pending_ms_before_a_send_no_sooner_than_a_browser_could() {
-        let schedule = schedule(&[3, 5], 400, 15, 1_000, 1_100);
-        assert_eq!(
-            schedule.send_at, 1_425,
-            "400 ms startup, then 3 + 1 and 5 + 1 ms of probes, then 15 ms pending: a browser \
-             could send 425 ms after the program arrived"
-        );
+    fn probes_run_in_order_and_last_until_their_requests_end() {
+        let mut timeline = Timeline::starting(1_400);
+        timeline.finish(3, None);
+        // The request took longer than planned.
+        timeline.finish(5, Some(1_430));
+        // The request ended before the planned duration ran out.
+        timeline.finish(10, Some(1_433));
+        let schedule = timeline.schedule(15);
         assert_eq!(
             schedule.marks,
             [
@@ -128,35 +140,28 @@ mod tests {
                 },
                 ProbeMarks {
                     start: 1_404,
-                    end: 1_409
+                    end: 1_430
                 },
-            ],
+                ProbeMarks {
+                    start: 1_431,
+                    end: 1_441
+                },
+            ]
+        );
+        assert_eq!(
+            schedule.send_at, 1_457,
             "the last probe's next mark is exactly `pending_ms` before sending"
         );
-
-        let late = super::schedule(&[3, 5], 400, 15, 1_000, 2_000);
-        assert_eq!(late.send_at, 2_000);
-        assert_eq!(
-            late.marks[0].start, 1_975,
-            "a late send moves every mark with it"
-        );
-    }
-
-    #[test]
-    fn a_program_without_probes_waits_for_its_startup_alone() {
-        let schedule = schedule(&[], 400, 15, 1_000, 1_100);
-        assert_eq!(
-            schedule,
-            Schedule {
-                marks: Vec::new(),
-                send_at: 1_400
-            }
-        );
+        assert_eq!(Timeline::starting(900).schedule(15).send_at, 900);
     }
 
     #[test]
     fn signed_durations_are_kept() {
-        let schedule = schedule(&[-2, 4], 0, 0, 0, 0);
-        assert_eq!(schedule.marks[0].end - schedule.marks[0].start, -2);
+        let mut timeline = Timeline::starting(0);
+        timeline.finish(-2, None);
+        assert_eq!(
+            timeline.schedule(0).marks,
+            [ProbeMarks { start: 0, end: -2 }]
+        );
     }
 }

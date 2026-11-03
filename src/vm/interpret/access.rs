@@ -271,6 +271,7 @@ impl<'ast> Run<'ast, '_> {
                 self.set_field(name.to_owned(), value);
             }
             Value::Array(elements) if key.text() == Some("length") => {
+                self.writable(object)?;
                 match value.number() {
                     Some(length) => {
                         let length = convert::length(length)
@@ -294,6 +295,7 @@ impl<'ast> Run<'ast, '_> {
                     .and_then(convert::length)
                     .filter(|&index| index < MAXIMUM_LENGTH)
                     .ok_or_else(|| unsupported("array index", key))?;
+                self.writable(object)?;
                 let mut elements = elements.borrow_mut();
                 if elements.len() <= index {
                     elements.resize(index + 1, Value::Undefined);
@@ -304,6 +306,7 @@ impl<'ast> Run<'ast, '_> {
                 let name = key
                     .property()
                     .ok_or_else(|| unsupported("object key", key))?;
+                self.writable(object)?;
                 let mut properties = properties.borrow_mut();
                 match properties
                     .iter_mut()
@@ -348,33 +351,14 @@ impl<'ast> Run<'ast, '_> {
 
     /// Decrypts a string record using the same logic as the register file's `read` method.
     fn decrypted(&mut self, record: Value<'ast>) -> Evaluation<'ast, Value<'ast>> {
-        let Value::Array(elements) = &record else {
+        if !matches!(record, Value::Array(_)) {
             return Ok(record);
-        };
-        let field = |index: usize| elements.borrow().get(index).and_then(Value::number);
-        let key = match (field(1), field(2), field(3)) {
-            (Some(pc), Some(length), Some(key)) => Some((pc as u32, length as u32, key as u32)),
-            _ => None,
-        };
-        if let Some(key) = key
-            && let Some(text) = self.session.decrypted.borrow().get(&key)
-        {
-            return Ok(text.clone());
         }
         let decoder = self
             .session
             .record_decoder
-            .as_ref()
             .ok_or_else(|| Stop::unsupported("an encrypted string with no decoder"))?;
-        let decoder = self.lookup(decoder)?;
-        let text = self.apply(decoder, Value::Undefined, vec![record])?;
-        if let (Some(key), Value::String(_)) = (key, &text) {
-            self.session
-                .decrypted
-                .borrow_mut()
-                .insert(key, text.clone());
-        }
-        Ok(text)
+        self.script(decoder, None, Value::Undefined, vec![record])
     }
 
     /// A member of the register file (see [`Member`]).

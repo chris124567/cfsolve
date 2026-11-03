@@ -4,13 +4,49 @@ use swc_core::atoms::Atom;
 use swc_core::ecma::ast::BinaryOp;
 
 use crate::js::ast;
-use crate::vm::extract;
 use crate::vm::interpret::plan::FunctionPlan;
 use crate::vm::interpret::run::Stop;
 use crate::vm::interpret::{Run, semantics};
-use crate::vm::output::Term;
-use crate::vm::session::Session;
+use crate::vm::output::{Effect, Position, Term};
+use crate::vm::session::{Layout, Session};
 use crate::vm::value::{Callable, Value};
+use crate::vm::{disassemble, extract};
+
+#[test]
+fn concrete_register_stack_keeps_its_exception_continuation() {
+    let parsed = ast::parse_iframe_javascript("function f(stack) { stack.push([42, 9, [], 0]); }")
+        .expect("the source parses");
+    let mut session = Session::empty();
+    session.functions = extract::functions(&parsed.script.body);
+    session.layout = Layout {
+        pc: 240,
+        key: 241,
+        program: 242,
+        cells: 243,
+    };
+    session.initial = vec![(7, Value::array(Vec::new()))];
+    let mut run = Run::method(&session);
+    run.start_at(0, 0);
+    let stack = Value::array(Vec::new());
+    run.registers.insert(7, stack.clone());
+    let function = Callable::Script {
+        name: None,
+        function: session.functions[&Atom::from("f")],
+        scope: None,
+    };
+    let result = run.invoke(&function, Value::Undefined, vec![stack]);
+    let path = run.finish(result).expect("the call completes");
+    let catches = |frame: &Term| {
+        matches!(frame, Term::Array(values)
+            if disassemble::catch_frame(values) == Some(Position::new(42, 9)))
+    };
+    assert!(
+        path.effects.iter().any(|effect| matches!(effect,
+            Effect::Set(7, Term::Array(frames)) if frames.iter().any(catches))),
+        "the pushed catch frame is kept as a register effect: {:?}",
+        path.effects
+    );
+}
 
 /// Compares results, exceptions, symbolic effects, branches, and global writes. Each execution
 /// has independent mutable state. Returns the shared outcome, starting with the result.
@@ -132,7 +168,7 @@ fn branches_and_loops_match() {
 #[test]
 fn functions_declared_in_blocks_are_bound_on_entry() {
     // A function declared after a block's `return` is callable from the start of the block,
-    // including one that reads the enclosing function's locals, which needs a scoped plan.
+    // including one that reads the enclosing function's locals.
     for (source, slots, result) in [
         (
             "function f(a) { { return g(a) + 1; function g(x) { return x * 3; } } }",
@@ -141,7 +177,7 @@ fn functions_declared_in_blocks_are_bound_on_entry() {
         ),
         (
             "function f(a) { { var b = 4; return g(1); function g(x) { return a + b + x; } } }",
-            false,
+            true,
             "return Const(Number(7.0))",
         ),
         (
@@ -159,14 +195,33 @@ fn functions_declared_in_blocks_are_bound_on_entry() {
 fn rejected_functions_use_scoped_plans() {
     for source in [
         "function f(a) { return (function() { return a; })(); }",
-        "function f(a) { var g = () => a; return g(); }",
         "function f(a) { var g = () => arguments[0]; return g(); }",
-        "function f(a) { var g = function() { return a; }; return g(); }",
         "function f(arguments) { return arguments; }",
         "function f(a) { return {[a]: 1}; }",
         "function f(a) { try { return a; } catch ({ e }) { return 0; } }",
     ] {
         compare(source, vec![Value::Number(2.0)], vec![], false);
+    }
+}
+
+/// Locals that nested functions mention stay in the call's scope, and both the outer
+/// function and its closures keep slot plans.
+#[test]
+fn closures_share_captured_locals() {
+    for source in [
+        "function f(a) { var g = () => a; return g(); }",
+        "function f(a) { var g = function() { return a; }; return g(); }",
+        "function f(a) { var s = 0; function g(x) { return k + x; } var k = a * 3; s = g(1) + g(2); return s; }",
+        "function f(a) { var n = 0; var inc = function() { n += a; return n; }; inc(); inc(); return n; }",
+        "function f(a) { var mk = function(b) { return function(c) { return a + b + c; }; }; return mk(1)(2); }",
+        "function f(a) { a = a + 1; var g = function() { return a; }; a = a * 10; return g(); }",
+        "function f(a) { var t = [a]; var g = function(i) { return t[i] + outer; }; return g(0); }",
+        "function f(a) { function r(n) { return n ? r(n - 1) + a : 0; } return r(3); }",
+        "function f(a) { var s = ''; for (var i = 0; i < a; i++) { s += c(i); } return s; function c(j) { var x = j * 2; return k[x]; } var k; }",
+        "function f(a) { var k = 'abcdef', s = ''; for (var i = 0; i < a; i++) { s += c(i); } return s; function c(j) { var x = j * 2; return k[x]; } }",
+        "function f(a) { var o = {}; o.h = function(x, y) { return x ^ y; }; var h = o.h; return h(a, 6); }",
+    ] {
+        compare(source, vec![Value::Number(2.0)], vec![], true);
     }
 }
 

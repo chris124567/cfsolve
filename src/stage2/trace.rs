@@ -6,12 +6,14 @@
 
 use std::collections::BTreeSet;
 
+use anyhow::{Context, Result};
 use swc_core::ecma::ast::{
     AssignExpr, AssignTarget, BinaryOp, BlockStmt, CallExpr, Expr, FnDecl, Function, Lit,
     MemberProp, SimpleAssignTarget, Stmt,
 };
 use swc_core::ecma::visit::{Visit, VisitWith};
 
+use super::vocabulary;
 use crate::js::ast::{self, ParsedScript};
 use crate::script::Source;
 use crate::{candidates, vm};
@@ -31,6 +33,22 @@ pub struct Trace {
 }
 
 impl Trace {
+    /// The frames the environment audit reports, including a worker continuation when present.
+    pub fn audit_key(&self, features: &[String], controller: Option<&str>) -> Result<String> {
+        let entered = features
+            .windows(2)
+            .find_map(|pair| match pair {
+                [name, next] if *next == self.replace && !vocabulary::is_hex_name(name) => {
+                    Some(name)
+                }
+                [previous, name] if *previous == self.replace && name.contains('$') => Some(name),
+                _ => None,
+            })
+            .context("environment audit has no session trace entry")?;
+        let second = controller.unwrap_or(&self.returned_root);
+        Ok(format!("{},{second},{entered}", self.initial_root))
+    }
+
     /// Recovers the iframe's trace if its helpers and entry sites are present and unambiguous.
     #[must_use]
     pub fn recover(source: &Source) -> Option<Self> {

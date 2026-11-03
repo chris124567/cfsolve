@@ -22,6 +22,7 @@ use crate::resource_timing::LoadTiming;
 use crate::script::Source;
 use crate::stage2::call_stack::{self, CaseOpcodes, ScriptPosition};
 use crate::stage2::payload::Environment;
+use crate::stage2::replay::Globals;
 use crate::{deep_stack, performance_clock};
 
 /// Default loader URL for pages that load Turnstile dynamically without a script tag.
@@ -70,6 +71,8 @@ impl Fetched {
 
 /// The evaluated first-payload template, before sender fields, and state for later payloads.
 pub(crate) struct FirstPayload {
+    /// Signatures of the session-named globals the initial program installs.
+    pub audit_globals: Globals,
     /// The extracted program with fully populated request options.
     pub program: ExtractedProgram,
     pub state: ScriptState,
@@ -97,6 +100,7 @@ impl FirstPayload {
         complete: impl FnOnce(&mut Options) -> (Option<&'mark str>, i64),
     ) -> Result<Self> {
         let installed = mem::take(&mut program.installed);
+        let audit_globals = Globals::installed(&installed);
         let fields = &program.payload_fields;
         let options = &mut program.request.options;
         options.extend(installed.options);
@@ -115,6 +119,7 @@ impl FirstPayload {
         let globals = payload::infer_globals(fields, &state, options, &window);
         let plaintext = payload::build(fields, options, &globals)?;
         Ok(Self {
+            audit_globals,
             program,
             state,
             window,
@@ -127,6 +132,7 @@ impl FirstPayload {
 
 /// Iframe state after merging page parameters, shared by the first and later payloads.
 pub(crate) struct Merged {
+    pub audit_globals: Globals,
     /// The first payload, which the probe payload extends.
     pub first: Payload,
     pub state: ScriptState,
@@ -215,7 +221,8 @@ pub(crate) async fn render_page(
         sink,
         rendered,
         script,
-        page.layout.clone(),
+        page.layout
+            .placed(page.layout.embedding_pages.get(document.url.as_str())),
         document.referrer_policy,
         Embedding::Site,
     ))
@@ -387,6 +394,7 @@ pub(crate) fn merge(
     ));
     sink.json("payload.json", &first)?;
     let merged = Merged {
+        audit_globals: built.audit_globals,
         first,
         state: built.state,
         window: built.window,

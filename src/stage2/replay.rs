@@ -16,17 +16,19 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use super::analysis;
+pub use super::audit_globals::{Globals, Signature};
 use super::probes::worker_navigator;
 use super::records::{ArrangedFields, Probe, ProbePlan};
 use super::reference::{
     ENVIRONMENT_AUDIT_DECODED, ENVIRONMENT_AUDIT_ENCODED, ENVIRONMENT_AUDIT_GROUPS,
     ENVIRONMENT_AUDIT_REDUCTION, ENVIRONMENT_AUDIT_VALUES, ENVIRONMENT_REFERRER, REFERENCE,
-    WORKER_NAVIGATOR_RESULT,
+    STYLESHEETS_HASH, WORKER_NAVIGATOR_RESULT,
 };
 use super::registry::{AUDIT_PROBE, Kind, Operation, Treatment};
+pub use super::stylesheets::Stylesheet;
 use super::trace::Trace;
-use super::vocabulary::Vocabulary;
+use super::vocabulary::{self, Vocabulary};
+use super::{analysis, stylesheets};
 use crate::http::ResponseMetrics;
 use crate::js::{JsObject, JsValue, Options, Payload, json};
 use crate::script::Source;
@@ -40,6 +42,12 @@ pub struct Answers {
     pub probes: BTreeMap<usize, Stored>,
     /// The worker navigator, by API property.
     pub navigator: JsObject,
+    /// Definitions of the captured iframe globals, under the audit's stored names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub globals: BTreeMap<String, Signature>,
+    /// CSSOM measurements, checked against the current CSS before reuse.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stylesheets: Vec<Stylesheet>,
 }
 
 /// One probe's stored record, without its envelope.
@@ -56,11 +64,47 @@ pub struct Stored {
 }
 
 impl Answers {
+    /// Attaches browser CSSOM measurements only after reproducing this capture's reported hash.
+    pub fn measure_stylesheets(
+        &mut self,
+        source: &Source,
+        program: &[u8],
+        html: &str,
+        templates: Vec<Stylesheet>,
+    ) -> Result<()> {
+        let analysis = analysis::analyze(source, program)?;
+        let (probe, excluded) = analysis
+            .plan()
+            .probes()
+            .iter()
+            .find_map(|probe| Some((probe, stylesheets::excluded_selector(probe)?)))
+            .context("the capture has no stylesheet probe")?;
+        let excluded = excluded?;
+        let partner = analysis
+            .plan()
+            .vocabulary()
+            .partner(probe.position())
+            .context("the stylesheet probe has no reference partner")?;
+        let stored = self
+            .probes
+            .get(&partner)
+            .context("no stored stylesheet answer")?;
+        let mut fields = JsObject::new();
+        stylesheets::patch(html, &templates, excluded, &mut fields)?;
+        ensure!(
+            fields.get(STYLESHEETS_HASH) == stored.fields.get(STYLESHEETS_HASH),
+            "CSSOM measurements do not reproduce the captured stylesheet hash"
+        );
+        self.stylesheets = templates;
+        Ok(())
+    }
+
     /// Builds stored answers from a captured iframe script, probe program, and second payload.
     pub fn capture(source: &Source, program: &[u8], payload: &Payload) -> Result<Self> {
         let analysis = analysis::analyze(source, program)?;
         let plan = analysis.plan();
         let vocabulary = plan.vocabulary();
+        let globals = Globals::capture(source)?;
         let envelope = &plan.record_fields;
         let envelope_names = envelope.names();
         let is_envelope = |name: &String| envelope_names.contains(&name.as_str());
@@ -115,6 +159,10 @@ impl Answers {
             vocabulary.rewrite_to_reference(position, &mut fields);
             // Replay refreshes an audit's navigation sizes and trace by reference name.
             if operation.family() == Kind::EnvironmentAudit {
+                for (name, signature) in &globals.0 {
+                    let name = vocabulary.to_reference(position, name).to_owned();
+                    answers.globals.insert(name, signature.clone());
+                }
                 ensure!(
                     fields.contains_key(ENVIRONMENT_AUDIT_GROUPS)
                         && fields.contains_key(ENVIRONMENT_AUDIT_VALUES),
@@ -209,10 +257,21 @@ impl<'answers> Replay<'answers> {
         let partner = self.vocabulary.partner(position).with_context(missing)?;
         let stored = self.answers.probes.get(&partner).with_context(missing)?;
         let mut fields = stored.fields.clone();
-        session.patch(probe, &mut fields)?;
+        let measured = &self.answers.stylesheets;
+        if !measured.is_empty()
+            && let Some(excluded) = stylesheets::excluded_selector(probe)
+        {
+            stylesheets::patch(session.iframe_html, measured, excluded?, &mut fields)?;
+        }
+        session.patch(probe, &mut fields, &self.answers.globals)?;
         let mut arranged = ArrangedFields::split(fields, &stored.late);
         for fields in [&mut arranged.early, &mut arranged.late] {
             self.vocabulary.rewrite_to_session(position, fields);
+            for (name, value) in &probe.replay_literals {
+                if let Some(field) = fields.get_mut(name) {
+                    *field = value.clone();
+                }
+            }
         }
         Ok(arranged)
     }
@@ -220,6 +279,8 @@ impl<'answers> Replay<'answers> {
 
 /// Current-session values needed to refresh stored records.
 pub struct Session<'session> {
+    /// Current iframe HTML, including its inline styles.
+    pub iframe_html: &'session str,
     /// The iframe's URL, which records report as the referrer, base URI and stack locations.
     pub iframe_url: &'session str,
     /// `document.lastModified`, as the browser formats it.
@@ -234,12 +295,19 @@ pub struct Session<'session> {
     pub trace: Option<Trace>,
     /// The returned program's own trace frame.
     pub controller: Option<&'session str>,
+    /// Definitions in the current iframe, used to translate audited globals.
+    pub globals: &'session Globals,
 }
 
 impl Session<'_> {
     /// Patches a stored record while it still uses reference names: document identity, the
     /// referrer, and the environment audit's trace membership and navigation measurements.
-    fn patch(&self, probe: &Probe, fields: &mut JsObject) -> Result<()> {
+    fn patch(
+        &self,
+        probe: &Probe,
+        fields: &mut JsObject,
+        recorded: &BTreeMap<String, Signature>,
+    ) -> Result<()> {
         for value in fields.values_mut() {
             refresh_transplant(value, self.iframe_url, &self.modified);
         }
@@ -254,6 +322,7 @@ impl Session<'_> {
                 .trace
                 .as_ref()
                 .context("the environment audit needs the iframe's trace")?;
+            refresh_globals(groups, &self.globals.mapping(recorded), self.globals);
             refresh_trace(trace, groups, &probe.features, self.controller)?;
         }
         if let Some(values) = fields
@@ -360,7 +429,37 @@ fn refresh_string(text: &mut String, iframe_url: &str, modified: &str) {
     }
 }
 
-/// Moves the trace global to the audit group matching this session's trace frames. Uses the
+/// Substitutes this session's globals and removes unmatched names and their empty groups.
+fn refresh_globals(groups: &mut JsObject, mapping: &BTreeMap<String, String>, globals: &Globals) {
+    for (key, members) in mem::take(groups) {
+        let JsValue::Array(members) = members else {
+            groups.insert(key, members);
+            continue;
+        };
+        if members.is_empty() {
+            group(groups, key);
+            continue;
+        }
+        for member in members {
+            let global = member
+                .as_str()
+                .and_then(|name| name.strip_prefix("o."))
+                .filter(|name| vocabulary::is_hex_name(name));
+            let Some(global) = global else {
+                group(groups, key.clone()).push(member);
+                continue;
+            };
+            let Some(current) = mapping.get(global) else {
+                continue;
+            };
+            let current_key = globals.0.get(current).and_then(Signature::audit_value);
+            let current_key = current_key.unwrap_or(&key).to_owned();
+            group(groups, current_key).push(json!(format!("o.{current}")));
+        }
+    }
+}
+
+/// Places this session's trace global in the audit group matching its trace frames. Uses the
 /// recovered controller frame as the second root, or the iframe callback frame if none was
 /// recovered.
 fn refresh_trace(
@@ -370,18 +469,7 @@ fn refresh_trace(
     controller: Option<&str>,
 ) -> Result<()> {
     let member = JsValue::String(format!("o.{}", trace.global));
-    let traced =
-        |names: &JsValue| matches!(names, JsValue::Array(names) if names.contains(&member));
-    if !groups.values().any(traced) {
-        return Ok(());
-    }
-    let entered = features
-        .windows(2)
-        .find(|pair| pair[1] == trace.replace)
-        .map(|pair| pair[0].as_str())
-        .context("environment audit has no session trace entry")?;
-    let second = controller.unwrap_or(&trace.returned_root);
-    let key = format!("{},{},{}", trace.initial_root, second, entered);
+    let key = trace.audit_key(features, controller)?;
     for (old_key, mut names) in mem::take(groups) {
         let members = names
             .as_array_mut()
@@ -394,6 +482,11 @@ fn refresh_trace(
         if has_trace {
             group(groups, key.clone()).push(member.clone());
         }
+    }
+    // Recorded answers name another session's trace global, which is dropped beforehand.
+    let traced = group(groups, key);
+    if !traced.contains(&member) {
+        traced.push(member);
     }
     Ok(())
 }
@@ -441,7 +534,56 @@ fn refresh_transplant(value: &mut JsValue, iframe_url: &str, modified: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::challenge::installed::Installed;
     use crate::js;
+
+    #[test]
+    fn audit_globals_keep_their_groups_under_current_names() {
+        let mut groups: JsObject = js::from_value(json!({
+            "N": ["o._111111111111111111111111", "o.alert"],
+            "o": ["o._222222222222222222222222"],
+            "empty": []
+        }))
+        .unwrap();
+        refresh_globals(
+            &mut groups,
+            &BTreeMap::from([(
+                "_111111111111111111111111".into(),
+                "_aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            )]),
+            &Globals::default(),
+        );
+        assert_eq!(
+            json!(groups),
+            json!({
+                "N": ["o._aaaaaaaaaaaaaaaaaaaaaaaa", "o.alert"], "empty": []
+            })
+        );
+    }
+
+    #[test]
+    fn installed_globals_refresh_their_values_and_split_shared_groups() {
+        let installed = |name: &str, value: &str| {
+            Globals::installed(&Installed {
+                audit: BTreeMap::from([(name.into(), value.into())]),
+                ..Default::default()
+            })
+        };
+        let globals = installed("_aaaaaaaaaaaaaaaaaaaaaaaa", "_bbbbbbbbbbbbbbbbbbbbbbbb");
+        let recorded = installed("_111111111111111111111111", "_222222222222222222222222");
+        let mut groups: JsObject = js::from_value(json!({
+            "_222222222222222222222222": ["o._111111111111111111111111", "other"]
+        }))
+        .unwrap();
+        refresh_globals(&mut groups, &globals.mapping(&recorded.0), &globals);
+        assert_eq!(
+            json!(groups),
+            json!({
+                "_bbbbbbbbbbbbbbbbbbbbbbbb": ["o._aaaaaaaaaaaaaaaaaaaaaaaa"],
+                "_222222222222222222222222": ["other"]
+            })
+        );
+    }
 
     #[test]
     fn the_trace_moves_alone_into_this_sessions_group() {
@@ -473,6 +615,16 @@ mod tests {
             r#"{"old-root,old-response,old-probe":["other"],"fresh-root,controller-frame,fresh-probe":["o.trace"],"T":["enabled"],"empty":[]}"#
         );
         assert!(refreshed(&[], None).is_err());
+        let packed = [
+            "_111111111111111111111111".into(),
+            "replaceTrace".into(),
+            "fresh-probe$frame".into(),
+        ];
+        assert!(
+            refreshed(&packed, None)
+                .unwrap()
+                .contains("fresh-response,fresh-probe$frame")
+        );
     }
 
     const CURRENT: &str = "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/av0/rch/y3vzw/0x4AAAAAAB8gDxRzm2UASWbL/light/fbE/new/normal?lang=auto";

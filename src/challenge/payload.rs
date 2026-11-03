@@ -1,12 +1,15 @@
 //! Builds the plaintext first challenge payload by evaluating the template's field expressions
 //! against session options and the script's namespace.
 
+use std::sync::LazyLock;
+
 use anyhow::{Context, Result, ensure};
+use regex::Regex;
 use swc_core::ecma::ast::{BinaryOp, Expr};
 use swc_core::ecma::codegen;
 
 use crate::challenge::expression;
-use crate::challenge::state::{Difference, ScriptState};
+use crate::challenge::state::{Difference, Getter, ScriptState};
 use crate::js::{JsValue, Options, Payload, Window, ast, json};
 use crate::random_id;
 
@@ -41,8 +44,7 @@ pub(crate) fn infer_globals(
             (None, Shape::Called) => script
                 .getters
                 .get(name)
-                .and_then(|option| options.get(option))
-                .cloned()
+                .and_then(|getter| called(getter, options))
                 .unwrap_or_else(|| json!([])),
             // No interaction has been recorded, so the collection is empty.
             (None, Shape::Stringified) => json!([]),
@@ -64,6 +66,66 @@ pub(crate) fn infer_globals(
         globals.insert(name.to_owned(), value);
     }
     globals
+}
+
+/// The value `getter` returns: its option, with each render sample's stack split at page URLs
+/// if the getter does so.
+fn called(getter: &Getter, options: &Options) -> Option<JsValue> {
+    let mut value = options.get(&getter.option)?.clone();
+    if let Some(origin) = &getter.page_origin
+        && let JsValue::Array(samples) = &mut value
+    {
+        let origin = options
+            .get(origin)
+            .and_then(JsValue::as_str)
+            .unwrap_or_default();
+        for sample in samples {
+            if let JsValue::Object(sample) = sample
+                && let Some(stack) = sample.get("s").and_then(JsValue::as_str)
+            {
+                let split = split_page_urls(stack, origin);
+                sample.insert("s".to_owned(), split);
+            }
+        }
+    }
+    Some(value)
+}
+
+/// Splits `stack` as the iframe's sample getter does. Each URL on `origin`, less a trailing
+/// `:line` or `:line:column`, becomes the index of that URL in a list of at most 64. Returns
+/// `[parts, urls]`, where `parts` alternates text and indices and ends with text.
+fn split_page_urls(stack: &str, origin: &str) -> JsValue {
+    const MAX_URLS: usize = 64;
+    static URL: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"https?://[^\s)"'<>]+"#).expect("the URL pattern is valid"));
+    static POSITION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r":[0-9]+(?::[0-9]+)?$").expect("the position pattern is valid")
+    });
+    let mut parts = Vec::new();
+    let mut urls: Vec<&str> = Vec::new();
+    let mut copied = 0;
+    for found in URL.find_iter(stack) {
+        let url = found.as_str();
+        let url = POSITION
+            .find(url)
+            .map_or(url, |position| &url[..position.start()]);
+        if url != origin && !url.starts_with(&format!("{origin}/")) {
+            continue;
+        }
+        let index = match urls.iter().position(|known| *known == url) {
+            Some(index) => index,
+            None if urls.len() >= MAX_URLS => continue,
+            None => {
+                urls.push(url);
+                urls.len() - 1
+            }
+        };
+        parts.push(json!(&stack[copied..found.start()]));
+        parts.push(json!(index));
+        copied = found.start() + url.len();
+    }
+    parts.push(json!(&stack[copied..]));
+    json!([parts, urls])
 }
 
 #[derive(Debug, Clone)]
@@ -89,7 +151,10 @@ impl Field {
     #[must_use]
     pub(crate) fn option<'a>(&'a self, script: &'a ScriptState) -> Option<&'a str> {
         expression::option_key(&self.expression).or_else(|| match self.global()? {
-            (name, Shape::Called) => script.getters.get(name).map(String::as_str),
+            (name, Shape::Called) => script
+                .getters
+                .get(name)
+                .map(|getter| getter.option.as_str()),
             _ => None,
         })
     }
@@ -198,6 +263,37 @@ mod tests {
     use crate::challenge::reduced_timing::ResourceTiming;
     use crate::challenge::state::Elapsed;
     use crate::challenge::tally::Tally;
+
+    /// Page URLs become indices into a list of distinct URLs; other hosts stay in the text.
+    #[test]
+    fn splits_stacks_at_page_urls() {
+        let stack = "Error\n    at f (https://captchatest.book.bi/app.js:1:20)\n    at g \
+                     (https://challenges.cloudflare.com/turnstile/v0/api.js:2:7)\n    at h \
+                     (https://captchatest.book.bi/app.js:3:4)";
+        assert_eq!(
+            split_page_urls(stack, "https://captchatest.book.bi"),
+            json!([
+                [
+                    "Error\n    at f (",
+                    0,
+                    ":1:20)\n    at g (https://challenges.cloudflare.com/turnstile/v0/api.js:2:7)\n    at h (",
+                    0,
+                    ":3:4)"
+                ],
+                ["https://captchatest.book.bi/app.js"]
+            ])
+        );
+        // As in the captured sessions, a stack without page URLs stays whole.
+        assert_eq!(
+            split_page_urls(stack, "https://example.com"),
+            json!([[stack], []])
+        );
+        assert_eq!(split_page_urls(stack, ""), json!([[stack], []]));
+        assert_eq!(
+            split_page_urls("at https://a.b:443/x.js:2:7", "https://a.b:443"),
+            json!([["at ", 0, ":2:7"], ["https://a.b:443/x.js"]])
+        );
+    }
 
     fn field(name: &str, text: &str) -> Field {
         Field {
@@ -313,7 +409,13 @@ mod tests {
                 global: "tally".into(),
                 counters: vec!["a".into()],
             }),
-            getters: BTreeMap::from([("getter".into(), "opt".into())]),
+            getters: BTreeMap::from([(
+                "getter".into(),
+                Getter {
+                    option: "opt".into(),
+                    page_origin: None,
+                },
+            )]),
             ..ScriptState::default()
         };
         let options = Options::from_iter([("opt".to_owned(), json!(["x"]))]);

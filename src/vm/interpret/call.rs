@@ -1,11 +1,13 @@
 //! Calls and constructions of script functions, arrows, builtins, and bound functions.
 
+use std::ptr;
+
 use swc_core::atoms::{Atom, atom};
 use swc_core::ecma::ast::{ArrowExpr, Decl, Function, Pat, Stmt};
 
 use super::access::Key;
-use super::plan;
-use super::run::{Evaluation, Frame, Run, Stop};
+use super::run::{Evaluation, Frame, RecordKey, RecordPart, Run, Stop};
+use super::{intrinsic, plan};
 use crate::vm::HashMap;
 use crate::vm::output::Term;
 use crate::vm::value::{Callable, Env, Scope, Value};
@@ -112,15 +114,24 @@ impl<'ast> Run<'ast, '_> {
                 function,
                 scope,
             } if arguments.iter().any(Value::is_symbolic) => {
-                let call = Term::Call {
+                // The call records the arguments as they were before the attempt. Only
+                // containers can change during it, so calls without them are kept (`Err`) and
+                // recorded only when the attempt fails.
+                let call = |arguments: &[Value<'ast>]| Term::Call {
                     callee: Box::new(Term::Global(name.to_string())),
                     this: None,
                     arguments: arguments.iter().map(Value::expr).collect(),
+                };
+                let recorded = if arguments.iter().all(Value::is_immutable) {
+                    Err(arguments.clone())
+                } else {
+                    Ok(call(&arguments))
                 };
                 let checkpoint = self.checkpoint();
                 match self.script(function, scope.as_ref(), this, arguments) {
                     Err(stop) if matches!(*stop, Stop::Unsupported(_)) => {
                         self.restore(checkpoint);
+                        let call = recorded.unwrap_or_else(|kept| call(&kept));
                         Ok(self.temp(call))
                     }
                     outcome => {
@@ -191,20 +202,59 @@ impl<'ast> Run<'ast, '_> {
         }
     }
 
-    /// Calls a function through its slot plan if it has one and is not a closure, or else
-    /// through its scoped plan.
-    fn script(
+    /// Calls a script function: natively if it has an intrinsic that accepts the arguments,
+    /// from the program's cache if it decrypts a string record decrypted before, or else
+    /// interpreted.
+    pub(super) fn script(
         &mut self,
         function: &'ast Function,
         scope: Option<&Scope<'ast>>,
         this: Value<'ast>,
         arguments: Vec<Value<'ast>>,
     ) -> Evaluation<'ast, Value<'ast>> {
-        if scope.is_none()
-            && self.setup.is_none()
+        if let Some(intrinsic) = self.session.intrinsics.get(&intrinsic::address(function)) {
+            // Intrinsics may write to their arguments.
+            for argument in &arguments {
+                self.writable(argument)?;
+            }
+            if let Some(value) = intrinsic.call(&arguments) {
+                return Ok(value);
+            }
+        }
+        // Handlers decrypt strings both by reading registers and by calling the decoder.
+        if self
+            .session
+            .record_decoder
+            .is_some_and(|decoder| ptr::eq(decoder, function))
+            && let Some(decrypted) = self.decrypted
+            && let [record] = &arguments[..]
+            && let Some(key) = record_key(record)
+        {
+            if let Some(text) = decrypted.borrow().get(&key) {
+                return Ok(text.clone());
+            }
+            let text = self.interpret(function, scope, this, arguments)?;
+            // A run that thawed a shared object may have computed the text differently.
+            if matches!(text, Value::String(_)) && !self.thawed {
+                decrypted.borrow_mut().insert(key, text.clone());
+            }
+            return Ok(text);
+        }
+        self.interpret(function, scope, this, arguments)
+    }
+
+    /// Runs a function through its slot plan if it has one, or else through its scoped plan.
+    fn interpret(
+        &mut self,
+        function: &'ast Function,
+        scope: Option<&Scope<'ast>>,
+        this: Value<'ast>,
+        arguments: Vec<Value<'ast>>,
+    ) -> Evaluation<'ast, Value<'ast>> {
+        if self.setup.is_none()
             && let Some(plan) = self.session.compiled.slots(function)
         {
-            return self.call_plan(&plan, this, arguments);
+            return self.call_plan(&plan, scope, this, arguments);
         }
         let body = function
             .body
@@ -250,6 +300,33 @@ impl<'ast> Run<'ast, '_> {
             })),
         }
     }
+}
+
+/// Identifies a string record: the program, then numbers and arrays of numbers. A program's
+/// records with the same contents decrypt to the same string.
+fn record_key(record: &Value<'_>) -> Option<RecordKey> {
+    let Value::Array(elements) = record else {
+        return None;
+    };
+    let elements = elements.borrow();
+    let (Value::Program, rest) = elements.split_first()? else {
+        return None;
+    };
+    let bits = |value: &Value<'_>| match value {
+        Value::Number(number) => Some(number.to_bits()),
+        _ => None,
+    };
+    rest.iter()
+        .map(|element| match element {
+            Value::Array(numbers) => numbers
+                .borrow()
+                .iter()
+                .map(bits)
+                .collect::<Option<_>>()
+                .map(RecordPart::Numbers),
+            element => bits(element).map(RecordPart::Number),
+        })
+        .collect()
 }
 
 /// Binds call arguments to parameters and reserves `room` additional local slots.

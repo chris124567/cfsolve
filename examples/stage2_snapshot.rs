@@ -54,7 +54,10 @@ fn main() -> Result<()> {
         let frames = fields
             .calls
             .context("the stack probe's calls have an unrecognized shape")
-            .and_then(|calls| call_stack::recover_probe(&original, &cases, calls))
+            .and_then(|calls| {
+                let resumed = call_stack::Resumption::WorkerMessage;
+                call_stack::recover_probe(&original, &cases, calls, resumed)
+            })
             .map(|geometry| {
                 json!({
                     "frames": geometry.frames,

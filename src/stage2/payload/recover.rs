@@ -180,7 +180,8 @@ pub(in crate::stage2) struct Recovered<'listing> {
 }
 
 /// Recovers the payload and any checkbox record. Tries unique header names as record-counter
-/// candidates. Uses `program` to identify errors.
+/// candidates, then, for programs whose header holds no names, the fields published objects
+/// start at zero. Uses `program` to identify errors.
 pub(in crate::stage2) fn recover_unique<'listing>(
     index: &Index<'listing>,
     program: &str,
@@ -191,10 +192,18 @@ pub(in crate::stage2) fn recover_unique<'listing>(
     let scan = scan(index, pool);
     let mut layouts = Vec::new();
     let mut failure = None;
-    for counter in index.header().values() {
-        match scan.layout(counter) {
-            Ok(layout) => layouts.push((counter.clone(), layout)),
-            Err(error) => failure = Some(error),
+    for candidates in [
+        index.header().values().cloned().collect(),
+        scan.zeroed_fields(),
+    ] {
+        for counter in candidates {
+            match scan.layout(&counter) {
+                Ok(layout) => layouts.push((counter, layout)),
+                Err(error) => failure = Some(error),
+            }
+        }
+        if !layouts.is_empty() {
+            break;
         }
     }
     ensure!(layouts.len() <= 1, "ambiguous {program} payload counter");
@@ -230,6 +239,35 @@ pub(in crate::stage2) struct RecordLiteral {
 pub(in crate::stage2) struct Scan(Vec<FunctionWrites>);
 
 impl Scan {
+    /// Fields a published object starts at zero that the program also writes to the payload as
+    /// a computed value, as it does when it increments the record counter. Other zeroed fields,
+    /// such as the probe count, are published as literals.
+    fn zeroed_fields(&self) -> Vec<String> {
+        let incremented = |field: &str| {
+            let mut payload_writes = self.0.iter().flat_map(FunctionWrites::payload_writes);
+            payload_writes.any(|write| {
+                write.key == field
+                    && !matches!(write.value, Written::Expression(Expression::Literal { .. }))
+            })
+        };
+        let mut fields: Vec<String> = Vec::new();
+        for function in &self.0 {
+            let Some(publication) = function.published else {
+                continue;
+            };
+            for write in &function.writes {
+                if write.is_zero()
+                    && write.target == WriteTarget::Object(publication.object)
+                    && !fields.contains(&write.key)
+                    && incremented(&write.key)
+                {
+                    fields.push(write.key.clone());
+                }
+            }
+        }
+        fields
+    }
+
     /// Recovers field sources for the second payload. Identifies the replacement template as the
     /// object published to the payload cell with its record `counter` initialized to zero.
     pub(in crate::stage2) fn layout(&self, counter: &str) -> Result<Layout> {
@@ -243,11 +281,9 @@ impl Scan {
                 .filter(|write| write.target == WriteTarget::Object(publication.object))
                 .collect();
             fields.len() > 20
-                && fields.iter().any(|write| {
-                    write.key == counter
-                        && matches!(&write.value, Written::Expression(Expression::Literal { value })
-                            if value.as_f64() == Some(0.0))
-                })
+                && fields
+                    .iter()
+                    .any(|write| write.key == counter && write.is_zero())
         };
         let templates = functions
             .iter()
@@ -438,6 +474,14 @@ struct Write {
     target: WriteTarget,
     key: String,
     value: Written,
+}
+
+impl Write {
+    /// Whether the write stores a literal zero, as for the record counter in the template.
+    fn is_zero(&self) -> bool {
+        matches!(&self.value, Written::Expression(Expression::Literal { value })
+            if value.as_f64() == Some(0.0))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]

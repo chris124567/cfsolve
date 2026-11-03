@@ -2,6 +2,7 @@
 //! journal that undoes speculative attempts.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::hash::Hash;
 use std::mem;
 use std::rc::Rc;
@@ -10,12 +11,13 @@ use swc_core::atoms::Atom;
 use swc_core::ecma::ast::{BinaryOp, UnaryOp};
 
 use super::builtin;
-use super::copies::{self, Copies};
+use super::copies::{self, Copies, Fork};
 use super::explore::Invocation;
+use super::frozen::{self, Frozen};
 use crate::vm::output::{Constant, Effect, Exit, Path, Position, Term};
 use crate::vm::session::Session;
 use crate::vm::value::{Callable, Env, Scope, Value};
-use crate::vm::{HashMap, convert};
+use crate::vm::{HashMap, convert, disassemble};
 
 /// Why evaluation stopped before completing normally.
 pub(crate) enum Stop<'ast> {
@@ -51,6 +53,8 @@ pub(crate) struct Run<'ast, 'session> {
     pub(super) program: &'session [u8],
     /// Instance fields derived from program bytes by the constructor, once known.
     constructed: Option<&'session HashMap<String, Value<'ast>>>,
+    /// Strings decrypted from the program's records, once a program is loaded.
+    pub(super) decrypted: Option<&'session Decrypted<'ast>>,
     pub(super) registers: HashMap<u8, Value<'ast>>,
     /// Tags written before their register values; see [`crate::vm::registers`].
     pub(super) tags: HashMap<u8, Value<'ast>>,
@@ -76,6 +80,23 @@ pub(crate) struct Run<'ast, 'session> {
     facts: Vec<(Term, Value<'ast>)>,
     journal: Journal<'ast>,
     pub(super) spare: Spare<'ast>,
+    /// Whether the run shares [`Frozen`] session objects instead of copying them.
+    pub(super) sharing: bool,
+    /// Whether the run wrote to a shared object, thawing it. Its results are discarded.
+    pub(super) thawed: bool,
+}
+
+/// Strings decrypted from a program's string records, by record contents (see
+/// [`RecordKey`]).
+pub(crate) type Decrypted<'ast> = RefCell<HashMap<RecordKey, Value<'ast>>>;
+
+/// The contents of a string record after the program: numbers and arrays of numbers, as bits.
+pub(crate) type RecordKey = Vec<RecordPart>;
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RecordPart {
+    Number(u64),
+    Numbers(Vec<u64>),
 }
 
 /// Cleared buffers from completed calls. Handler runs take them from the session and
@@ -222,6 +243,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
             session,
             program,
             constructed: None,
+            decrypted: None,
             registers: HashMap::default(),
             tags: HashMap::default(),
             fields: HashMap::default(),
@@ -240,26 +262,34 @@ impl<'ast, 'session> Run<'ast, 'session> {
             facts: Vec::new(),
             journal: Journal::default(),
             spare: Spare::default(),
+            sharing: false,
+            thawed: false,
         }
     }
 
     /// A handler run that follows `decisions`, then takes any further symbolic branch as true.
     pub(super) fn handler(invocation: &Invocation<'session, 'ast>, decisions: Vec<bool>) -> Self {
-        let session = invocation.session;
-        let mut run = Self::new(
-            session,
-            invocation.program,
-            decisions,
-            Some(Copies::default()),
-        );
-        run.constructed = Some(invocation.fields);
-        run.spare = session.spare.take();
-        for (register, value) in &session.initial {
+        let mut run = Self::invoked(invocation, decisions, Some(Copies::default()));
+        for (register, value) in &invocation.session.initial {
             let value = run.isolate(value);
             run.registers.insert(*register, value);
         }
         run.start_at(invocation.pc, invocation.key);
         run.registers.extend(invocation.known.iter().cloned());
+        run
+    }
+
+    /// A run of `invocation`'s handler with no registers set, sharing frozen session objects.
+    fn invoked(
+        invocation: &Invocation<'session, 'ast>,
+        decisions: Vec<bool>,
+        copies: Option<Copies<'ast>>,
+    ) -> Self {
+        let mut run = Self::new(invocation.session, invocation.program, decisions, copies);
+        run.constructed = Some(invocation.fields);
+        run.decrypted = Some(invocation.decrypted);
+        run.spare = invocation.session.spare.take();
+        run.sharing = true;
         run
     }
 
@@ -311,6 +341,19 @@ impl<'ast, 'session> Run<'ast, 'session> {
                 },
             },
         };
+        // A catch handler can be pushed onto a constructor-created register stack.
+        // Native array operations mutate that stack without producing an effect; retain
+        // its frame so disassembly can also visit the exception continuation.
+        for (register, _) in &self.session.initial {
+            if let Some(value @ Value::Array(elements)) = self.registers.get(register)
+                && elements.borrow().iter().any(|element| {
+                    matches!(element.expr(), Term::Array(ref frame)
+                        if disassemble::catch_frame(frame).is_some())
+                })
+            {
+                self.effects.push(Effect::Set(*register, value.expr()));
+            }
+        }
         // The listing retains every path, so release unused vector capacity.
         let mut conditions = self.branches.conditions;
         conditions.shrink_to_fit();
@@ -578,10 +621,156 @@ impl<'ast, 'session> Run<'ast, 'session> {
 
     /// Copies a session value for use by this run, preserving run-local sharing.
     pub(super) fn isolate(&mut self, value: &Value<'ast>) -> Value<'ast> {
+        let frozen = self.frozen();
         let Some(copies) = &mut self.copies else {
             return value.clone();
         };
-        copies::copy(value, copies)
+        copies::copy(value, copies, frozen)
+    }
+
+    /// The session objects this run shares, if it shares them.
+    fn frozen(&self) -> Option<&'session Frozen> {
+        self.sharing.then_some(&self.session.frozen)
+    }
+
+    /// Checks that the run may write to `object`. A write to a shared session object thaws its
+    /// group and stops the run, whose caller reruns the instruction with the group copied.
+    pub(super) fn writable(&mut self, object: &Value<'ast>) -> Evaluation<'ast, ()> {
+        if let Some(frozen) = self.frozen()
+            && let Some(address) = frozen::address(object)
+            && frozen.contains(address)
+        {
+            frozen.thaw(address);
+            self.thawed = true;
+            return Err(Stop::unsupported("a write to a shared session object"));
+        }
+        Ok(())
+    }
+
+    /// Takes a snapshot of a handler run before top-level statement `statement`, with the
+    /// handler's `locals`. Returns `None` if the run is inside a speculative attempt or setup
+    /// changed which names are unavailable, which a snapshot does not restore.
+    pub(super) fn snapshot(
+        &self,
+        statement: usize,
+        locals: &[Option<Value<'ast>>],
+    ) -> Option<Snapshot<'ast>> {
+        if self.journal.recording()
+            || matches!(self.unavailable, Cow::Owned(_))
+            || self.frames.len() != 1
+            || self.setup.is_some()
+            || self.constructed.is_none()
+        {
+            return None;
+        }
+        let mut fork = Fork::new(self.frozen());
+        let frame = self.frame();
+        Some(Snapshot {
+            statement,
+            decided: self.branches.decisions[..self.branches.decided].to_vec(),
+            registers: fork.map(&self.registers),
+            tags: fork.map(&self.tags),
+            fields: fork.map(&self.fields),
+            globals: fork.map(&self.globals),
+            copies: self.copies.as_ref().map(|copies| fork.copies(copies)),
+            closed: self.closed.iter().map(|scope| fork.scope(scope)).collect(),
+            effects: self.effects.clone(),
+            temps: self.temps,
+            conditions: self.branches.conditions.clone(),
+            facts: self
+                .facts
+                .iter()
+                .map(|(term, value)| (term.clone(), fork.value(value)))
+                .collect(),
+            this: fork.value(&frame.this),
+            scope: fork.scope(&frame.scope),
+            locals: locals
+                .iter()
+                .map(|local| local.as_ref().map(|value| fork.value(value)))
+                .collect(),
+            copied: fork.copied,
+        })
+    }
+
+    /// A handler run resumed from `snapshot`, following `decisions`, whose first decisions are
+    /// the snapshot's. Returns the run, the handler's locals, and the scopes copied for it,
+    /// which the caller clears when the run ends.
+    pub(super) fn resume(
+        invocation: &Invocation<'session, 'ast>,
+        snapshot: &Snapshot<'ast>,
+        decisions: Vec<bool>,
+    ) -> (Self, Vec<Option<Value<'ast>>>, Vec<Scope<'ast>>) {
+        let mut fork = Fork::new(Some(&invocation.session.frozen));
+        let copies = snapshot.copies.as_ref().map(|copies| fork.copies(copies));
+        let mut run = Self::invoked(invocation, decisions, copies);
+        run.registers = fork.map(&snapshot.registers);
+        run.tags = fork.map(&snapshot.tags);
+        run.fields = fork.map(&snapshot.fields);
+        run.globals = fork.map(&snapshot.globals);
+        run.closed = snapshot
+            .closed
+            .iter()
+            .map(|scope| fork.scope(scope))
+            .collect();
+        run.effects = snapshot.effects.clone();
+        run.temps = snapshot.temps;
+        run.branches.decided = snapshot.decided.len();
+        run.branches.conditions = snapshot.conditions.clone();
+        run.facts = snapshot
+            .facts
+            .iter()
+            .map(|(term, value)| (term.clone(), fork.value(value)))
+            .collect();
+        run.frames.push(Frame {
+            this: fork.value(&snapshot.this),
+            scope: fork.scope(&snapshot.scope),
+        });
+        let locals = snapshot
+            .locals
+            .iter()
+            .map(|local| local.as_ref().map(|value| fork.value(value)))
+            .collect();
+        (run, locals, fork.copied)
+    }
+}
+
+/// A handler run's state before one of the top-level statements of its body. Paths that share
+/// the decisions made before that statement resume here instead of rerunning the statements
+/// before it.
+pub(super) struct Snapshot<'ast> {
+    /// The top-level statement to resume at.
+    pub(super) statement: usize,
+    /// The decisions consumed before the statement.
+    decided: Vec<bool>,
+    registers: HashMap<u8, Value<'ast>>,
+    tags: HashMap<u8, Value<'ast>>,
+    fields: HashMap<String, Value<'ast>>,
+    globals: HashMap<Atom, Value<'ast>>,
+    copies: Option<Copies<'ast>>,
+    closed: Vec<Scope<'ast>>,
+    effects: Vec<Effect>,
+    temps: usize,
+    conditions: Vec<(Term, bool)>,
+    facts: Vec<(Term, Value<'ast>)>,
+    this: Value<'ast>,
+    scope: Scope<'ast>,
+    locals: Vec<Option<Value<'ast>>>,
+    /// Every scope the snapshot holds, cleared when it is dropped to break cycles.
+    copied: Vec<Scope<'ast>>,
+}
+
+impl Drop for Snapshot<'_> {
+    fn drop(&mut self) {
+        for scope in &self.copied {
+            scope.borrow_mut().variables.clear();
+        }
+    }
+}
+
+impl<'ast> Snapshot<'ast> {
+    /// Whether a run following `decisions` makes the same decisions before the statement.
+    pub(super) fn resumes(&self, decisions: &[bool]) -> bool {
+        decisions.starts_with(&self.decided)
     }
 }
 

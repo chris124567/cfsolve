@@ -153,14 +153,23 @@ pub struct MethodCall {
     pub arity: usize,
 }
 
-/// Call path to `new Error()` in the stack probe. The listener enters the probe function, which
-/// calls a closure that constructs the error.
+/// Call path to `new Error()` in the stack probe. The probe function calls a closure that
+/// constructs the error.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct ProbeCalls {
     /// The opcode that constructs `new Error()`.
     pub construct: u8,
-    /// How many parameters the probe function declares.
-    pub arity: usize,
+}
+
+/// The callback that last resumed the VM before the stack probe, whose listener is the probe's
+/// outermost frame. Chrome and Safari captures show both; a Worker message is more common.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resumption {
+    /// A timer, whose callback receives no arguments. V8 leaves its listener anonymous.
+    Timer,
+    /// A Worker's message event, which passes the event. V8 names the listener by its
+    /// receiver, `Worker.<anonymous>`.
+    WorkerMessage,
 }
 
 /// Recovers callback frames for a VM function with `arity` parameters and error-construction
@@ -179,15 +188,24 @@ pub fn recover(source: &str, cases: &CaseOpcodes, construct: u8, arity: usize) -
     })
 }
 
-/// Recovers frames for the stack probe. The VM executes closures in its dispatch loop without
-/// JavaScript calls, so frames stop at the listener that entered the probe. V8 retains only the
-/// innermost ten frames.
-pub fn recover_probe(source: &str, cases: &CaseOpcodes, calls: ProbeCalls) -> Result<Geometry> {
+/// Recovers frames for the stack probe, run after `resumed`. The VM executes closures in its
+/// dispatch loop without JavaScript calls, so frames stop at the listener that resumed it. V8
+/// retains only the innermost ten frames.
+pub fn recover_probe(
+    source: &str,
+    cases: &CaseOpcodes,
+    calls: ProbeCalls,
+    resumed: Resumption,
+) -> Result<Geometry> {
     geometry(source, cases, |machine| {
         // The probe registers an exception handler, so its instructions dispatch from the
         // guarded loop.
         let mut chain = machine.construction(calls.construct, true)?;
-        chain.frames.extend(machine.listener(calls.arity, "")?);
+        let (arity, name) = match resumed {
+            Resumption::Timer => (0, ""),
+            Resumption::WorkerMessage => (1, "Worker.<anonymous>"),
+        };
+        chain.frames.extend(machine.listener(arity, name)?);
         chain.frames.truncate(V8_STACK_LIMIT);
         Ok(chain)
     })

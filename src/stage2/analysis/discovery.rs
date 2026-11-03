@@ -272,10 +272,7 @@ fn collection_strings(
                             }
                         }
                         Term::Closure { pc, .. } => pending.push(*pc),
-                        // A frame pushed for a catch handler: [pc, key, ...].
-                        Term::Array(frame) => {
-                            pending.extend(vm::catch_frame(frame).map(|handler| handler.pc));
-                        }
+                        // Exception results are recovered separately from collection paths.
                         _ => {}
                     });
                 }
@@ -287,7 +284,34 @@ fn collection_strings(
             }
         },
     );
-    (strings.into_values().flatten().collect(), outputs)
+    (
+        without_inline_descriptors(strings.into_values().flatten()),
+        outputs,
+    )
+}
+
+/// Drops string descriptors the program decodes in place, keeping the decoded text that follows
+/// each one (see `vm::packed_names`). Other builds decode descriptors where the listing cannot
+/// follow, so recognizers read those descriptors themselves.
+fn without_inline_descriptors(strings: impl Iterator<Item = String>) -> Vec<String> {
+    // An inline descriptor: a two-unit big-endian length, then at least that much text.
+    let describes = |descriptor: &str, text: &str| {
+        let units: Vec<u16> = descriptor.encode_utf16().collect();
+        let [high @ 0..=255, low @ 0..=255, rest @ ..] = units.as_slice() else {
+            return false;
+        };
+        let length = usize::from(*high) * 256 + usize::from(*low);
+        rest.get(..length)
+            .is_some_and(|described| described.iter().copied().eq(text.encode_utf16()))
+    };
+    let mut kept: Vec<String> = Vec::new();
+    for text in strings {
+        if kept.last().is_some_and(|last| describes(last, &text)) {
+            kept.pop();
+        }
+        kept.push(text);
+    }
+    kept
 }
 
 /// Writes made by a collection function, in execution order.
@@ -492,4 +516,22 @@ fn pushed_object(
         object,
         stores_before,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_inline_descriptors;
+
+    #[test]
+    fn drops_only_descriptors_followed_by_their_text() {
+        let strings = [
+            "\0\u{3}abc\0\0", // decoded in place
+            "abc",
+            "\0\u{3}xyz\0", // decoded elsewhere
+            "toString",     // reads as an oversized length
+            "String",
+        ];
+        let kept = without_inline_descriptors(strings.into_iter().map(String::from));
+        assert_eq!(kept, ["abc", "\0\u{3}xyz\0", "toString", "String"]);
+    }
 }

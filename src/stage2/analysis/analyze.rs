@@ -9,14 +9,15 @@ use serde::Serialize;
 use super::recognize::{ProbeView, Strings};
 use super::{audit, controller, discovery, envelope};
 use crate::candidates;
-use crate::js::JsValue;
+use crate::js::{JsObject, JsValue};
 use crate::listing::Index;
 use crate::script::Source;
 use crate::stage2::payload::{self, Layout};
 use crate::stage2::records::{Envelope, Probe, ProbePlan, WriteOrder};
-use crate::stage2::registry::{AUDIT_PROBE, Operation};
+use crate::stage2::reference::ISOLATION_FAILURE_FIELDS;
+use crate::stage2::registry::{AUDIT_PROBE, Kind, Operation};
 use crate::stage2::trace::Trace;
-use crate::stage2::vocabulary::Vocabulary;
+use crate::stage2::vocabulary::{self, Vocabulary};
 use crate::vm::{Failure, Position};
 
 /// A recovered probe plan with supporting analysis evidence.
@@ -67,6 +68,7 @@ impl Analysis {
             operation: probe.operation.as_ref(),
             features: &probe.features,
             writes: &probe.writes,
+            replay_literals: &probe.replay_literals,
             reference: evidence.reference,
         });
         Artifact {
@@ -112,6 +114,7 @@ struct ProbeArtifact<'analysis> {
     operation: Option<&'analysis Operation>,
     features: &'analysis [String],
     writes: &'analysis WriteOrder,
+    replay_literals: &'analysis JsObject,
     reference: Option<usize>,
 }
 
@@ -124,6 +127,18 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     let index = Index::new(&listing);
     let (pool_pc, pool) = index.pool()?;
     let discovery = discovery::discover(&index, pool)?;
+    let mut wrapper: BTreeSet<String> = discovery
+        .probes
+        .first()
+        .map(|first| first.features.iter().cloned().collect())
+        .unwrap_or_default();
+    for probe in &discovery.probes {
+        wrapper.retain(|text| probe.features.contains(text));
+    }
+    // Builds with hex names decode program-wide names, such as the record envelope's, in every
+    // probe instead of loading them once in the header. Recognizers treat them as header names.
+    let hex_names = wrapper.iter().filter(|text| vocabulary::is_hex_name(text));
+    let header: BTreeSet<String> = index.header().values().chain(hex_names).cloned().collect();
     let session_features: Vec<&[String]> = discovery
         .probes
         .iter()
@@ -136,15 +151,6 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
         {
             vocabulary.pin(position, names);
         }
-    }
-    let header: BTreeSet<String> = index.header().values().cloned().collect();
-    let mut wrapper: BTreeSet<String> = discovery
-        .probes
-        .first()
-        .map(|first| first.features.iter().cloned().collect())
-        .unwrap_or_default();
-    for probe in &discovery.probes {
-        wrapper.retain(|text| probe.features.contains(text));
     }
     let mut probes = Vec::new();
     let mut evidence = Vec::new();
@@ -168,6 +174,30 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
             strings: Strings::new(&features, &outputs),
         })
         .or(reference.map(|reference| Operation::Replay { reference }));
+        let mut replay_literals = JsObject::new();
+        // The last history result write is its exception branch. The eval callback reports the
+        // same failure marker. Both are program literals.
+        if reference.and_then(Kind::from_reference) == Some(Kind::Isolation)
+            && let Some(marker) = index
+                .stores()
+                .iter()
+                .rev()
+                .filter(|store| {
+                    vocabulary.to_reference(position, &store.key) == ISOLATION_FAILURE_FIELDS[1]
+                })
+                .find_map(|store| {
+                    index
+                        .text(store.pc, &store.value)
+                        .filter(|text| vocabulary::is_hex_name(text))
+                })
+        {
+            for name in ISOLATION_FAILURE_FIELDS {
+                replay_literals.insert(
+                    vocabulary.to_session(position, name).to_owned(),
+                    JsValue::String(marker.clone()),
+                );
+            }
+        }
         probes.push(Probe {
             index: raw.index,
             token: raw.token,
@@ -175,6 +205,7 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
             operation,
             features: raw.features,
             writes: raw.writes,
+            replay_literals,
         });
         evidence.push(ProbeEvidence {
             states: raw.states,
@@ -211,12 +242,15 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     })
 }
 
-/// Finds the frame left by the probe immediately before the uniquely paired environment audit.
-/// If the audit runs first, retains the iframe's root frames.
+/// The early audit runs in the worker-navigator continuation if that probe has finished.
+/// Synchronous probes between the worker and the audit do not replace that continuation.
+/// Without a preceding worker, the iframe callback remains the controller frame.
 fn controller_frame(index: &Index<'_>, evidence: &[ProbeEvidence], push: &str) -> Option<String> {
     let audits =
         (0..evidence.len()).filter(|&position| evidence[position].reference == Some(AUDIT_PROBE));
     let position = candidates::exactly_one(audits, "environment audit").ok()?;
-    let preceding = evidence.get(position.checked_sub(1)?)?;
-    controller::controller_trace(index, push, preceding.function.pc)
+    let worker = evidence[..position].iter().rev().find(|probe| {
+        probe.reference.and_then(Kind::from_reference) == Some(Kind::WorkerNavigator)
+    })?;
+    controller::controller_trace(index, push, worker.function.pc)
 }

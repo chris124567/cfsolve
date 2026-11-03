@@ -40,24 +40,58 @@ struct CapturedPayload {
 }
 
 impl CapturedSession {
+    /// The iframe document as received, including its stylesheets.
+    #[must_use]
+    pub fn iframe_html(&self) -> &str {
+        &self.iframe_html
+    }
+
     pub fn read(path: &Path) -> Result<Self> {
         read_json(path)
     }
 
     /// Returns the deobfuscated inline script from the iframe.
     pub fn source(&self) -> Result<Source> {
-        let javascript = challenge::inline_javascript(&self.iframe_html)?;
-        Source::try_new(&deobfuscate::deobfuscate(javascript)?.text)
+        Source::try_new(&deobfuscate::deobfuscate(self.javascript()?)?.text)
+    }
+
+    /// Like [`Self::source`], but reads the `iframe.deobfuscated.js` that `capture_session`
+    /// writes beside `capture_path` when there is one.
+    pub fn source_beside(&self, capture_path: &Path) -> Result<Source> {
+        let deobfuscated = capture_path.with_file_name("iframe.deobfuscated.js");
+        if deobfuscated.exists() {
+            Source::try_new(&fs::read_to_string(deobfuscated)?)
+        } else {
+            self.source()
+        }
     }
 
     /// Returns the probe program from the first POST response, unmasked using the ray ID in the
     /// URL.
     pub fn program(&self) -> Result<Vec<u8>> {
-        let post = self.posts.first().context("the capture has no POST")?;
-        let url = Url::parse(&post.url)?;
-        let encoded =
-            challenge::decode_response(post.response_body.as_bytes(), challenge::ray(&url)?)?;
-        Ok(STANDARD.decode(encoded)?)
+        self.programs()?
+            .into_iter()
+            .next()
+            .context("the capture has no POST")
+    }
+
+    /// Returns the program each POST response carries, in order, such as the probe program and
+    /// then the checkbox program.
+    pub fn programs(&self) -> Result<Vec<Vec<u8>>> {
+        self.posts
+            .iter()
+            .map(|post| {
+                let url = Url::parse(&post.url)?;
+                let ray = challenge::ray(&url)?;
+                let encoded = challenge::decode_response(post.response_body.as_bytes(), ray)?;
+                Ok(STANDARD.decode(encoded)?)
+            })
+            .collect()
+    }
+
+    /// Returns the iframe's inline script, before deobfuscation.
+    pub fn javascript(&self) -> Result<String> {
+        challenge::inline_javascript(&self.iframe_html)
     }
 
     /// Returns the payload built before probes run.
@@ -72,6 +106,12 @@ impl CapturedSession {
         payloads
             .find(|payload| payload.contains_key("1"))
             .context("the capture has no payload with probe records")
+    }
+
+    /// Returns the last payload, such as the checkbox interaction's.
+    #[must_use]
+    pub fn last_payload(&self) -> Option<&Payload> {
+        self.payloads.last().map(|payload| &payload.payload)
     }
 }
 

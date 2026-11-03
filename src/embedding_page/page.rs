@@ -1,7 +1,7 @@
 //! Reconstructs the page after `api.js` renders a widget. Builds the `wPr` page summary sent in
 //! the `requestExtraParams` reply.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::iter;
 
 use anyhow::{Context, Result};
@@ -40,6 +40,9 @@ pub(crate) struct Layout {
     /// Widget position set by a challenge page's stylesheet for this viewport. Overrides the
     /// other position settings.
     pub challenge_page: Option<Placement>,
+    /// Widget positions set by embedding pages' stylesheets for this viewport, measured in the
+    /// browser, by page URL. Each overrides the other position settings on its page.
+    pub embedding_pages: BTreeMap<String, Placement>,
 }
 
 impl Default for Layout {
@@ -53,6 +56,7 @@ impl Default for Layout {
             widget_right: None,
             widget_left: 8.0,
             challenge_page: None,
+            embedding_pages: BTreeMap::new(),
         }
     }
 }
@@ -69,8 +73,14 @@ impl Layout {
     /// Layout settings for a widget positioned by a challenge page's stylesheet.
     #[must_use]
     pub(crate) fn on_challenge_page(&self) -> Self {
+        self.placed(self.challenge_page.as_ref())
+    }
+
+    /// Layout settings for a widget at `placement`, if any.
+    #[must_use]
+    pub(crate) fn placed(&self, placement: Option<&Placement>) -> Self {
         let mut layout = self.clone();
-        if let Some(placement) = &self.challenge_page {
+        if let Some(placement) = placement {
             layout.widget_top = placement.top;
             layout.widget_left = placement.left;
             layout.widget_right = Some(placement.right);
@@ -948,6 +958,22 @@ mod tests {
         let url = Url::parse("http://x/").unwrap();
         let page = RenderedPage::render(html, url, "w", None).unwrap();
         json!(page.signals(&Layout::default(), None))
+    }
+
+    #[test]
+    fn placements_override_the_widget_position() {
+        let placement = Placement {
+            top: 166.875,
+            left: 363.0,
+            right: 1003.0,
+        };
+        let placed = Layout::default().placed(Some(&placement));
+        assert_eq!(
+            (placed.widget_top, placed.widget_left, placed.widget_right),
+            (166.875, 363.0, Some(1003.0))
+        );
+        let unplaced = Layout::default().placed(None);
+        assert_eq!((unplaced.widget_top, unplaced.widget_right), (8.0, None));
     }
 
     #[test]

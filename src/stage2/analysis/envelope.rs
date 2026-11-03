@@ -24,16 +24,26 @@ pub(super) fn recover(
 ) -> Result<Envelope> {
     let listing = index.listing();
     let header = index.header();
-    let counter = creation
-        .iter()
-        .filter_map(|pc| listing.instructions.get(pc))
-        .flat_map(|instruction| instruction.effects())
-        .find_map(|effect| match effect {
-            Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => {
-                header.get(&register).cloned()
-            }
-            _ => None,
+    // The counter's key is a header register, or, in programs that unpack names where they
+    // use them, a register loaded in the creation state.
+    let keys = || {
+        let instructions = creation
+            .iter()
+            .filter_map(|pc| listing.instructions.get(pc));
+        instructions.flat_map(|instruction| {
+            instruction
+                .effects()
+                .filter_map(move |effect| match effect {
+                    Effect::SetProperty { key, .. } if let Term::Reg(register) = **key => {
+                        Some((instruction.pc, register))
+                    }
+                    _ => None,
+                })
         })
+    };
+    let counter = keys()
+        .find_map(|(_, register)| header.get(&register).cloned())
+        .or_else(|| keys().find_map(|(pc, register)| index.text(pc, &Term::Reg(register))))
         .context("record counter field not found")?;
     let written_from = |matches: &dyn Fn(&Probe, &JsValue) -> bool| {
         literals
@@ -57,11 +67,17 @@ pub(super) fn recover(
         },
     );
     let wrapper = property_values(index, &main);
+    // Prefers header names, as for the counter.
     let wrapper_field = |what: &str, wanted: fn(&Known<Term>) -> bool| {
-        wrapper
+        let mut fields = wrapper
             .iter()
-            .find(|(field, value)| header.values().any(|name| name == field) && wanted(value))
-            .map(|(field, _)| field.clone())
+            .filter(|(_, value)| wanted(value))
+            .map(|(field, _)| field);
+        fields
+            .clone()
+            .find(|field| header.values().any(|name| name == *field))
+            .or_else(|| fields.next())
+            .cloned()
             .with_context(|| format!("record {what} field not found"))
     };
     let status = wrapper_field("status", |value| {

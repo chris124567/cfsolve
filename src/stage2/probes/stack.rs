@@ -10,6 +10,7 @@ use crate::js::{JsObject, json};
 use crate::listing::Index;
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::call_stack::ProbeCalls;
+use crate::stage2::vocabulary;
 use crate::vm::Term;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -29,7 +30,7 @@ impl Fields {
 
 /// Finds the closure called by the probe function at `entry` to construct `new Error()`.
 fn calls(index: &Index<'_>, entry: u32) -> Option<ProbeCalls> {
-    let construct = index
+    index
         .effects_in(index.function_range(entry)?)
         .find_map(|(pc, effect)| {
             let (callee, _) = effect.call()?;
@@ -37,11 +38,8 @@ fn calls(index: &Index<'_>, entry: u32) -> Option<ProbeCalls> {
                 return None;
             };
             construction(index, closure)
-        })?;
-    Some(ProbeCalls {
-        construct,
-        arity: index.arity(entry)?,
-    })
+        })
+        .map(|construct| ProbeCalls { construct })
 }
 
 /// The opcode with which the function at `entry` constructs `new Error()`.
@@ -65,7 +63,7 @@ fn construction(index: &Index<'_>, entry: u32) -> Option<u8> {
 
 /// Finds the output field hidden by base64 encoding and a two-byte XOR key. A name that decodes to
 /// `stack` identifies the key. The output field is the remaining name after excluding `stack` and
-/// the record counter from the header.
+/// the record counter from the header. Builds with hex names encode only `stack`.
 fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Option<String> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -74,6 +72,11 @@ fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Optio
         .iter()
         .filter_map(|text| STANDARD.decode(text).ok())
         .filter(|bytes| (3..=12).contains(&bytes.len()))
+        .collect();
+    let plain: BTreeSet<String> = features
+        .iter()
+        .filter(|name| vocabulary::is_hex_name(name))
+        .cloned()
         .collect();
     for candidate in decoded.iter().filter(|bytes| bytes.len() == "stack".len()) {
         let key = [candidate[0] ^ b's', candidate[1] ^ b't'];
@@ -89,15 +92,16 @@ fn encoded_result_field(features: &[String], header: &BTreeSet<String>) -> Optio
         }
         // Plain strings such as `this` can also be valid base64. Restrict candidates to the
         // four-to-nine-character program names.
-        let names = decoded.iter().filter_map(reveal).filter(|name| {
+        let revealed = decoded.iter().filter_map(reveal).filter(|name| {
             (4..=9).contains(&name.len())
                 && name.starts_with(|first: char| first.is_ascii_alphabetic())
                 && name
                     .chars()
                     .all(|character| character.is_ascii_alphanumeric())
-                && name != "stack"
-                && !header.contains(name)
         });
+        let names = revealed
+            .chain(plain.iter().cloned())
+            .filter(|name| name != "stack" && !header.contains(name));
         if let Ok(result) = candidates::exactly_one(names, "stack result field") {
             return Some(result);
         }

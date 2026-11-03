@@ -157,65 +157,65 @@ macro_rules! families {
 
 families! {
     Media { fields: Box<media::Fields> } =>
-        media, "media", Reference, Computed, [16];
+        media, "media", Reference, Computed, [32];
     PrivateToken { fields: private_token::Fields } =>
-        private_token, "private_token", Reference, Computed, [4];
+        private_token, "private_token", Reference, Computed, [5];
     WorkerFetch { fields: worker_fetch::Fields } =>
-        worker_fetch, "worker_fetch", Reference, Computed, [5];
+        worker_fetch, "worker_fetch", Reference, Computed, [4];
     Image { fields: image::Fields } =>
-        image, "image", Reference, Computed, [30];
+        image, "image", Reference, Computed, [33];
     ParentInfo {} =>
-        parent_info, "parent_info", Reference, Computed, [24];
+        parent_info, "parent_info", Reference, Computed, [7];
     DateParsingOffsets(dates::Fields) =>
-        dates, "date_parsing_offsets", Reference, Computed, [38];
+        dates, "date_parsing_offsets", Reference, Computed, [21];
     // The payload publishes the error-message length beside the record.
     ErrorMessageLength {} =>
         error_message_length, "error_message_length", Reference, Replayed, [3];
     NetworkInformation(network_information::Fields) =>
-        network_information, "network_information", Reference, Computed, [29];
+        network_information, "network_information", Reference, Computed, [25];
     WorkerNavigator(worker_navigator::Fields) =>
         worker_navigator, "worker_navigator", Reference, Computed, [1];
     ClockResolution {} =>
-        clock, "clock_resolution", Reference, Computed, [9];
+        clock, "clock_resolution", Reference, Computed, [8];
     Benchmark { fields: benchmark::Fields } =>
         benchmark, "benchmark", Structural, Computed, [];
     // Element ID queries from this probe appear in the selector log.
     Rects { fields: rects::Fields } =>
-        rects, "rects", Structural, Replayed, [37];
+        rects, "rects", Structural, Replayed, [29];
     DomMutation { fields: dom_mutation::Fields } =>
-        dom_mutation, "dom_mutation", Structural, Computed, [17];
+        dom_mutation, "dom_mutation", Structural, Computed, [18];
     PerformanceEntries { fields: performance::Fields } =>
-        performance, "performance_entries", Structural, Computed, [36];
+        performance, "performance_entries", Structural, Computed, [30];
     // Rebuilt from the session's own script. The reference build's stack probe is probe 28.
     Stack { fields: stack::Fields } =>
         stack, "stack", Structural, Computed, [28];
     HostReachability { fields: host_reachability::Fields } =>
         host_reachability, "host_reachability", Structural, Computed, [];
     WebSocketEcho { fields: websocket_echo::Fields } =>
-        websocket_echo, "websocket_echo", Structural, Computed, [];
-    @empty [11, 26, 33];
+        websocket_echo, "websocket_echo", Structural, Computed, [6];
+    @empty [10, 24, 39];
     @replayed {
         EnvironmentAudit => "environment_audit", 2;
-        Environment => "environment", 6;
-        HighEntropyUserAgent => "high_entropy_user_agent", 7;
-        EmojiColor => "emoji_color", 8;
-        Behavior => "behavior", 10;
-        KeyboardLayout => "keyboard_layout", 12;
-        Console => "console", 13;
-        Math => "math", 14;
-        DocumentStructure => "document_structure", 15;
-        Graphics => "graphics", 18;
-        SvgGeometry => "svg_geometry", 19;
-        SummarizerAvailability => "summarizer_availability", 20;
-        Audio => "audio", 21;
-        NativeInspection => "native_inspection", 22;
-        FontEnumeration => "font_enumeration", 23;
-        DocumentSummary => "document_summary", 25;
-        ComputedStyleHash => "computed_style_hash", 27;
-        Intl => "intl", 31;
-        Storage => "storage", 32;
-        Stylesheets => "stylesheets", 34;
-        Isolation => "isolation", 35;
+        Environment => "environment", 35;
+        HighEntropyUserAgent => "high_entropy_user_agent", 12;
+        EmojiColor => "emoji_color", 19;
+        Behavior => "behavior", 9;
+        KeyboardLayout => "keyboard_layout", 13;
+        Console => "console", 36;
+        Math => "math", 26;
+        DocumentStructure => "document_structure", 20;
+        Graphics => "graphics", 37;
+        SvgGeometry => "svg_geometry", 15;
+        SummarizerAvailability => "summarizer_availability", 17;
+        Audio => "audio", 38;
+        NativeInspection => "native_inspection", 16;
+        FontEnumeration => "font_enumeration", 27;
+        DocumentSummary => "document_summary", 34;
+        ComputedStyleHash => "computed_style_hash", 23;
+        Intl => "intl", 14;
+        Storage => "storage", 11;
+        Stylesheets => "stylesheets", 31;
+        Isolation => "isolation", 22;
     }
 }
 
@@ -309,11 +309,18 @@ impl Observed {
 }
 
 impl Operation {
-    /// Tries reference recognizers, then structural ones, and returns the first match.
+    /// Tries reference recognizers, then structural ones, and returns the first match. A paired
+    /// probe only matches families including its partner, as hex-name builds reuse result names.
     #[must_use]
     pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Self> {
+        let partner = probe.vocabulary.partner(probe.position);
+        let fits = |kind: &Kind| {
+            let references = kind.references();
+            references.is_empty() || partner.is_none_or(|partner| references.contains(&partner))
+        };
         Kind::in_phase(Phase::Reference)
             .chain(Kind::in_phase(Phase::Structural))
+            .filter(fits)
             .find_map(|kind| kind.recognize(probe))
     }
 

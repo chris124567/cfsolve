@@ -3,16 +3,23 @@
 
 use std::ops::{Deref, DerefMut};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::js::{JsObject, JsValue};
 
 macro_rules! object {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
-        #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+        #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
         #[serde(transparent)]
         pub struct $name(JsObject);
+
+        /// Serializes as `JSON.stringify` does, leaving out `undefined` properties.
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.collect_map(self.0.iter().filter(|(_, value)| !value.is_undefined()))
+            }
+        }
 
         impl $name {
             #[must_use]

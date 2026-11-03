@@ -378,14 +378,6 @@
               {
                 "candidate": "candidate:3747697418 1 udp 2113937151 f9501b39-1d57-4eb6-8029-16167a5a330b.local 51498 typ host generation 0 ufrag mtbG network-cost 999",
                 "observed_ms": 1792876992039
-              },
-              {
-                "candidate": "candidate:1648342598 1 udp 1677729535 192.0.2.1 64597 typ srflx raddr 0.0.0.0 rport 0 generation 0 ufrag mtbG network-cost 999",
-                "observed_ms": 1792876992052
-              },
-              {
-                "candidate": "candidate:2007285888 1 udp 1677732095 2001:db8::1 59340 typ srflx raddr :: rport 0 generation 0 ufrag mtbG network-cost 999",
-                "observed_ms": 1792876992056
               }
             ],
             "data_channel": true,

@@ -141,12 +141,19 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     };
     let before = |sequence: &[&str]| strings.get(find(sequence)?.checked_sub(1)?).cloned();
 
-    let length = find(&["length"])?;
-    let [status, sent, received, opened, _error] = strings.get(length.checked_sub(5)?..length)?
-    else {
+    // Builds that load builtins such as `length`, `Date` and `Math` in the header omit them
+    // here. Their summary follows `readyState` and `close` instead.
+    let (summary, statuses) = match find(&["length"]) {
+        Some(length) => (length.checked_sub(5)?, length + 1),
+        None => {
+            let summary = find(&["readyState", "close"])? + 2;
+            (summary, summary + 5)
+        }
+    };
+    let [status, sent, received, opened, _error] = strings.get(summary..summary + 5)? else {
         return None;
     };
-    let [complete, incomplete] = strings.get(length + 1..length + 3)? else {
+    let [complete, incomplete] = strings.get(statuses..statuses + 2)? else {
         return None;
     };
     let finite = find(&["isFinite"])?;
@@ -163,11 +170,12 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         received: received.clone(),
         opened: opened.clone(),
         round_trips: before(&["JSON", "stringify"])?,
-        elapsed: before(&["String", "Date", "now"])?,
+        elapsed: before(&["String", "Date", "now"]).or_else(|| before(&["String", "now"]))?,
         statuses: Statuses {
             complete: complete.clone(),
             incomplete: incomplete.clone(),
-            timed_out: before(&["String", "Math", "round"])?,
+            timed_out: before(&["String", "Math", "round"])
+                .or_else(|| before(&["String", "round"]))?,
             failed_before_open: failed_before_open.clone(),
             failed_after_open: failed_after_open.clone(),
             closed: closed.clone(),

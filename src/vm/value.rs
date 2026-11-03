@@ -215,6 +215,19 @@ impl<'ast> Value<'ast> {
         }
     }
 
+    /// Whether nothing a run does can change the value or its [`Value::expr`]: it is not a
+    /// container or a function with captured state.
+    pub(super) fn is_immutable(&self) -> bool {
+        match self {
+            Self::Array(_) | Self::Object(_) | Self::Set(_) | Self::Map(_) => false,
+            Self::Function(callable) => matches!(
+                &**callable,
+                Callable::Builtin(_) | Callable::Standard(_) | Callable::Script { scope: None, .. }
+            ),
+            _ => true,
+        }
+    }
+
     pub(super) fn is_symbolic(&self) -> bool {
         matches!(self, Self::Symbolic(_))
     }

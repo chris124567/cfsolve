@@ -4,6 +4,7 @@ use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
 
 use crate::stage2::analysis::recognize::ProbeView;
+use crate::stage2::vocabulary;
 
 /// Number of strings from the opening `<style>#` to the closing button, including fragments
 /// interleaved with 27 ID references.
@@ -43,7 +44,7 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         return None;
     }
     // Match `list.split(separator)`, including lists decoded from percent encoding first.
-    (2..strings.len()).find_map(|at| {
+    let split = (2..strings.len()).find_map(|at| {
         let separator = &strings[at - 1];
         if strings[at] != "split" || separator.is_empty() {
             return None;
@@ -59,5 +60,15 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
                 .iter()
                 .all(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()));
         valid.then_some(Fields { ids })
+    });
+    // Builds with hex names store the IDs as hex names in list order: the last ten of the last
+    // run of at least ten before the markup. An option read may precede them in the run.
+    split.or_else(|| {
+        let run = strings[..start]
+            .chunk_by(|left, right| vocabulary::is_hex_name(left) == vocabulary::is_hex_name(right))
+            .rfind(|run| run.len() >= 10 && vocabulary::is_hex_name(&run[0]))?;
+        Some(Fields {
+            ids: run[run.len() - 10..].to_vec(),
+        })
     })
 }

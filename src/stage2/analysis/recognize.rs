@@ -166,7 +166,7 @@ mod tests {
     #[test]
     fn each_recognizer_recovers_only_its_own_reference_probe() {
         let probes = &REFERENCE.probes;
-        assert_eq!(probes.len(), 38);
+        assert_eq!(probes.len(), 39);
         for kind in [
             Kind::Media,
             Kind::PrivateToken,
