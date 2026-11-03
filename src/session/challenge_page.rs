@@ -84,7 +84,11 @@ pub(crate) fn first_payload(
         |options| {
             let framing = orchestrator::frame_options(source, options);
             options.extend(framing);
-            (None, performance_clock::epoch_ms())
+            // Marked as long before now as the payload's timestamps say it takes to send, so it
+            // goes out as soon as it is built rather than idling after the time spent
+            // deobfuscating: a browser whose script ran that much shorter.
+            let send = intervals.handoff + 1 + intervals.send;
+            (None, performance_clock::epoch_ms() - send)
         },
     )
 }

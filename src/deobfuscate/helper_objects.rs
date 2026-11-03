@@ -13,9 +13,6 @@
 use std::iter;
 use std::rc::Rc;
 
-use imbl::shared_ptr::RcK;
-use rustc_hash::FxBuildHasher;
-
 use swc_core::atoms::Atom;
 use swc_core::common::SyntaxContext;
 use swc_core::ecma::ast::{
@@ -28,7 +25,7 @@ use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
 use super::HashMap;
 use super::analysis::effects::{self, Effects};
-use super::analysis::hoisting::{self, HoistFacts, Hoisted, Hoisting, List};
+use super::analysis::hoisting::{self, HoistFacts, Hoisted, Hoisting, List, Persistent};
 use super::analysis::{self, Analysis, Bindings, Globals, Properties, names};
 use crate::js::ast;
 
@@ -98,8 +95,6 @@ struct Helpers {
     /// Functions assigned to a binding written once.
     functions: Persistent<Id, Rc<FnExpr>>,
 }
-
-type Persistent<K, V> = imbl::GenericHashMap<K, V, FxBuildHasher, RcK>;
 
 /// At a control-flow join, keeps the objects and properties known on both paths.
 impl HoistFacts for Helpers {
