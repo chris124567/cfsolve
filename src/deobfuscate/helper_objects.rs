@@ -13,6 +13,9 @@
 use std::iter;
 use std::rc::Rc;
 
+use imbl::shared_ptr::RcK;
+use rustc_hash::FxBuildHasher;
+
 use swc_core::atoms::Atom;
 use swc_core::common::SyntaxContext;
 use swc_core::ecma::ast::{
@@ -86,21 +89,35 @@ impl ObjectProperties {
 }
 
 /// The helper objects and functions known at one point, by binding.
+///
+/// The maps are persistent: hoisting keeps a copy of the known helpers for every statement list
+/// and declaration it passes, which shares rather than copies them.
 #[derive(Clone, Default)]
 struct Helpers {
-    objects: HashMap<Id, Rc<ObjectProperties>>,
+    objects: Persistent<Id, Rc<ObjectProperties>>,
     /// Functions assigned to a binding written once.
-    functions: HashMap<Id, Rc<FnExpr>>,
+    functions: Persistent<Id, Rc<FnExpr>>,
 }
+
+type Persistent<K, V> = imbl::GenericHashMap<K, V, FxBuildHasher, RcK>;
 
 /// At a control-flow join, keeps the objects and properties known on both paths.
 impl HoistFacts for Helpers {
     fn meet(&mut self, other: &Self) {
-        self.objects.retain(|id, properties| {
-            let Some(theirs) = other.objects.get(id) else {
-                return false;
-            };
-            if !Rc::ptr_eq(properties, theirs) {
+        if !self.objects.ptr_eq(&other.objects) {
+            let mut narrowed = Vec::new();
+            self.objects.retain(|id, properties| {
+                let Some(theirs) = other.objects.get(id) else {
+                    return false;
+                };
+                if !Rc::ptr_eq(properties, theirs) {
+                    narrowed.push(id.clone());
+                }
+                true
+            });
+            for id in narrowed {
+                let theirs = &other.objects[&id];
+                let properties = self.objects.get_mut(&id).expect("kept above");
                 let properties = Rc::make_mut(properties);
                 properties
                     .functions
@@ -109,9 +126,11 @@ impl HoistFacts for Helpers {
                     .literals
                     .retain(|name, _| theirs.literals.contains_key(name));
             }
-            true
-        });
-        self.functions.meet(&other.functions);
+        }
+        if !self.functions.ptr_eq(&other.functions) {
+            self.functions
+                .retain(|id, _| other.functions.contains_key(id));
+        }
     }
 }
 
