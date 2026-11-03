@@ -72,11 +72,12 @@ pub(crate) async fn collect(
     let queried = checkbox::queries(&fetched.source, options)?;
     let script_position = fetched.script_position()?;
     let geometry = call_stack::recover(
-        &fetched.javascript,
+        &fetched.decoding,
         &fetched.cases,
         plan.diagnostics.construct,
         plan.diagnostics.callback_arity,
-    )?;
+    )
+    .await?;
     let engine = session.client.engine();
     let stack = geometry.format(&script_position, engine);
     let clock = PerformanceClock::from_epoch_origin(

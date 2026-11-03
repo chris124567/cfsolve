@@ -2,9 +2,10 @@
 //! through SWC.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rustc_hash::FxHasher;
 use swc::Compiler;
 use swc::config::{Config, IsModule, JscConfig, Options};
@@ -14,6 +15,7 @@ use swc_core::common::{BytePos, FileName, GLOBALS, Globals, Mark, SourceMap};
 use swc_core::ecma::ast::{EsVersion, Pass, Program, fn_pass, noop_pass};
 use swc_ecma_transforms::optimization::simplify::expr::{self, Config as ExprSimplifierConfig};
 use swc_ecma_transforms::{fixer, hygiene};
+use tokio::sync::oneshot;
 
 use super::analysis::Analysis;
 use super::{
@@ -22,6 +24,7 @@ use super::{
     helper_objects, int32_helpers, literals, loops, memoized_strings, merged_functions,
     register_arrays, state_machines, statements, static_members, unused_bindings,
 };
+use crate::deep_stack;
 
 /// Deobfuscated JavaScript with optional convergence diagnostics for the caller to report.
 pub struct Deobfuscated {
@@ -58,6 +61,70 @@ pub(crate) fn read_decoded<T>(
     run(source, &[DECODE_STEPS], noop_pass, read)?.1
 }
 
+/// A script decoded as [`read_decoded`] decodes it, on a thread of its own that starts as soon as
+/// the script is known, so a read needed later finds it decoded rather than decoding it then.
+/// Reads run in turn on that thread, which ends once the handle goes.
+pub struct Decoding {
+    reads: Mutex<mpsc::Sender<Read>>,
+}
+
+/// A read of the decoded program, or of why the script could not be decoded.
+type Read = Box<dyn FnOnce(Result<(&Program, BytePos, &str), &anyhow::Error>) + Send>;
+
+impl Decoding {
+    /// Starts decoding `source`.
+    pub fn start(source: String) -> Result<Self> {
+        let (reads, waiting) = mpsc::channel::<Read>();
+        thread::Builder::new()
+            .name("decoding".into())
+            .stack_size(deep_stack::STACK_SIZE)
+            .spawn(move || {
+                let text = source.clone();
+                let decoded = read_decoded(source, |program, start| {
+                    for read in waiting.iter() {
+                        read(Ok((program, start, &text)));
+                    }
+                    Ok(())
+                });
+                if let Err(error) = decoded {
+                    for read in waiting.iter() {
+                        read(Err(&error));
+                    }
+                }
+            })
+            .context("starting the decoding thread")?;
+        Ok(Self {
+            reads: Mutex::new(reads),
+        })
+    }
+
+    /// Calls `read` with the decoded program, its starting position and the source, once it is
+    /// decoded.
+    pub async fn read<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Program, BytePos, &str) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (answer, answered) = oneshot::channel();
+        let read: Read = Box::new(move |decoded| {
+            let result = match decoded {
+                Ok((program, start, source)) => read(program, start, source),
+                Err(error) => Err(anyhow::anyhow!("{error:#}")),
+            };
+            // The caller is gone only if it stopped waiting.
+            let _ = answer.send(result);
+        });
+        self.reads
+            .lock()
+            .expect("decoding lock")
+            .send(read)
+            .map_err(|_| anyhow::anyhow!("the decoding thread stopped"))?;
+        answered
+            .await
+            .context("the decoding thread stopped")?
+            .context("decoding the script")
+    }
+}
+
 /// Runs `steps`, then the pass `finish` returns, then `read`, and prints the result.
 fn run<T, P: Pass>(
     source: String,
@@ -65,8 +132,6 @@ fn run<T, P: Pass>(
     finish: impl FnOnce() -> P,
     mut read: impl FnMut(&Program, BytePos) -> T,
 ) -> Result<(Deobfuscated, T)> {
-    use anyhow::Context;
-
     let mut result = None;
     let slot = &mut result;
     let mut unconverged = None;

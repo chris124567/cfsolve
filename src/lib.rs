@@ -69,6 +69,8 @@ pub mod stage2;
 pub mod vm;
 
 pub use browser::Browser;
+#[doc(hidden)]
+pub use deobfuscate::Decoding;
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub use deobfuscate::{Deobfuscated, Unconverged, deobfuscate};

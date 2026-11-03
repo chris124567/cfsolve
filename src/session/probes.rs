@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use chrono::Local;
-use tokio::{task, time};
+use tokio::time;
 use url::Url;
 use wreq::ws::message::Message;
 
@@ -267,19 +267,12 @@ async fn probe_stack(session: &WidgetSession<'_>, plan: &ProbePlan) -> Result<Op
         )
     })?;
     let fetched = &session.fetched;
-    let javascript = fetched.javascript.clone();
-    let cases = fetched.cases.clone();
     let origin = fetched.script_position()?;
-    let engine = session.client.engine();
-    let stack = task::spawn_blocking(move || {
-        let resumed = call_stack::Resumption::WorkerMessage;
-        let geometry = call_stack::recover_probe(&javascript, &cases, calls, resumed)?;
-        anyhow::Ok(geometry.format(&origin, engine))
-    })
-    .await
-    .context("the stack recovery thread failed")?
-    .with_context(|| format!("rebuilding probe {}'s stack", probe.index))?;
-    Ok(Some(stack))
+    let resumed = call_stack::Resumption::WorkerMessage;
+    let geometry = call_stack::recover_probe(&fetched.decoding, &fetched.cases, calls, resumed)
+        .await
+        .with_context(|| format!("rebuilding probe {}'s stack", probe.index))?;
+    Ok(Some(geometry.format(&origin, session.client.engine())))
 }
 
 /// Chooses probe durations from completed work, `configured` profile values, stored answers, or
