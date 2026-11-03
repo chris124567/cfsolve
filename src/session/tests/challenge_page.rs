@@ -1,9 +1,12 @@
 //! Regression tests for a challenge-page session.
 
+use wreq::StatusCode;
+
+use crate::Error;
 use crate::challenge::reduced_timing::{Measure, ResourceTiming};
 use crate::js::json;
 use crate::resource_timing::{LoadTiming, Phases};
-use crate::session::challenge_page;
+use crate::session::{Stage, challenge_page};
 
 /// A load measured only as a whole.
 fn fetch(url: &str, started_ms: i64, duration_ms: f64) -> LoadTiming {
@@ -60,4 +63,36 @@ fn the_pages_resource_timing_lists_both_of_the_widget_programs_reads() {
             json!({"n": "https://challenges/iframe", "d": 25, "r": 425, "b": 0}),
         ]
     );
+}
+
+/// Whether a clearance form response refuses the answers, as a caller sees it.
+fn refused(status: StatusCode, challenged: bool, clearance: Option<&str>) -> bool {
+    let error = challenge_page::accept_clearance(status, challenged, clearance.map(str::to_owned))
+        .expect_err("the response should not pass");
+    matches!(
+        Error::classify(error),
+        Error::Rejected {
+            stage: Stage::Clearance,
+            ..
+        }
+    )
+}
+
+/// A `cf_clearance` cookie is a pass whatever the status of the page behind the challenge,
+/// such as a waiting room's HTTP 429. Another challenge page, or an error status without the
+/// cookie, is a refusal. A success without the cookie is a failure the solver can't explain.
+#[test]
+fn the_clearance_form_passes_when_it_sets_the_cookie_whatever_the_pages_status() {
+    for status in [
+        StatusCode::OK,
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::NOT_FOUND,
+    ] {
+        let clearance = challenge_page::accept_clearance(status, false, Some("token".into()));
+        assert_eq!(clearance.unwrap(), "token", "HTTP {status}");
+    }
+    assert!(refused(StatusCode::OK, true, Some("token")));
+    assert!(refused(StatusCode::FORBIDDEN, true, Some("token")));
+    assert!(refused(StatusCode::TOO_MANY_REQUESTS, false, None));
+    assert!(!refused(StatusCode::OK, false, None));
 }

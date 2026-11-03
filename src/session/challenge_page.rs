@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use url::Url;
+use wreq::StatusCode;
 
 use super::Sink;
 use super::channel::{Channel, Origin, Stage, Submission};
@@ -308,33 +309,52 @@ impl OrchestratorSession {
             .unwrap_or(&self.challenge.url);
         let cleared = http::submit_form(client, referer, &form.action, &form.fields).await?;
         sink.artifact("cleared.html", cleared.html.as_bytes())?;
-        if !cleared.status.is_success()
-            || ChallengePage::parse(&cleared.html, &cleared.url)?.is_some()
-        {
-            let message = format!(
-                "the clearance form returned HTTP {} without the page",
-                cleared.status
-            );
-            bail!(Refused::new(Stage::Clearance, message));
-        }
+        let challenged = ChallengePage::parse(&cleared.html, &cleared.url)?.is_some();
+        let cookies = client.cookies(&cleared.url);
+        let clearance = cookies
+            .iter()
+            .find(|cookie| cookie.name() == "cf_clearance")
+            .map(|cookie| cookie.value().to_owned());
+        let clearance = accept_clearance(cleared.status, challenged, clearance)?;
         sink.progress(&format!(
             "Cleared the challenge: {} answered HTTP {} with the page ({} bytes)",
             cleared.url,
             cleared.status,
             cleared.html.len()
         ));
-        let cookies = client.cookies(&cleared.url);
-        let clearance = cookies
-            .iter()
-            .find(|cookie| cookie.name() == "cf_clearance")
-            .context("the clearance form set no `cf_clearance` cookie")?
-            .value()
-            .to_owned();
         Ok(Clearance {
             clearance,
             cookies,
             page: cleared,
         })
+    }
+}
+
+/// Decides whether the clearance form passed the challenge, from the response to the form:
+/// its HTTP status, whether it is another challenge page, and the `cf_clearance` cookie it set,
+/// if any. Returns the cookie's value.
+///
+/// Cloudflare sets `cf_clearance` when the form passes. After that, the page behind the
+/// challenge can still answer with an error status. For example, a site's waiting room can
+/// answer HTTP 429 to the visitors it is queueing. So an error status with the cookie still
+/// counts as a pass. Another challenge page, or an error status without the cookie, means
+/// Cloudflare refused the answers.
+pub(crate) fn accept_clearance(
+    status: StatusCode,
+    challenged: bool,
+    clearance: Option<String>,
+) -> Result<String> {
+    let refused = || {
+        let message = format!("the clearance form returned HTTP {status} without the page");
+        Refused::new(Stage::Clearance, message)
+    };
+    if challenged {
+        bail!(refused());
+    }
+    match clearance {
+        Some(clearance) => Ok(clearance),
+        None if !status.is_success() => bail!(refused()),
+        None => bail!("the clearance form set no `cf_clearance` cookie"),
     }
 }
 
