@@ -35,6 +35,7 @@
     allow(dead_code, unreachable_pub, unused_imports)
 )]
 
+mod arena;
 mod browser;
 mod candidates;
 mod deep_stack;
@@ -68,6 +69,7 @@ pub mod stage2;
 #[doc(hidden)]
 pub mod vm;
 
+pub use arena::Allocator;
 pub use browser::Browser;
 #[doc(hidden)]
 pub use deobfuscate::Decoding;

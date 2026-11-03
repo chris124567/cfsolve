@@ -77,10 +77,15 @@ imbl = "7.0.2"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 
-# `QueryPerformanceCounter`, the time base Chrome's `performance.now()` is derived from on
-# Windows.
+# `QueryPerformanceCounter` and address space for the arena `Allocator` on Windows.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Performance", "Win32_System_Memory"] }
+
+# Installs `cfsolve::Allocator` as its global allocator, so it runs in a process of its own.
+[[test]]
+name = "arena"
+path = "tests/arena.rs"
+required-features = ["internals"]
 
 # Chrome 154's ClientHello: ML-DSA and GREASE signature algorithms and the
 # trust_anchors extension, which the published crates cannot send. See the
