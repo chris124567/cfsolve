@@ -151,6 +151,37 @@ impl Browser {
         load().map_err(Error::Config)
     }
 
+    /// The tracked iOS Safari 26 profile (`profiles/safari-26-ios.json`) with its stored answers,
+    /// compiled in. The answers suit the challenge builds this revision solves, so a library user
+    /// gets matching ones with each update rather than keeping copies in step.
+    pub fn safari_26_ios() -> Result<Self, Error> {
+        fn parse<T: serde::de::DeserializeOwned>(json: &str, what: &str) -> Result<T, Error> {
+            serde_json::from_str(json)
+                .with_context(|| format!("reading the bundled {what}"))
+                .map_err(Error::Config)
+        }
+        Self::try_new(
+            parse(include_str!("../profiles/safari-26-ios.json"), "profile")?,
+            Some(parse(
+                include_str!("../profiles/safari-26-ios/answers.json"),
+                "answers",
+            )?),
+            Some(parse(
+                include_str!("../profiles/safari-26-ios/challenge-page-answers.json"),
+                "challenge page answers",
+            )?),
+        )
+    }
+
+    /// The `User-Agent` this profile sends, if it names one. Cloudflare honours a clearance only
+    /// for requests that send the same one, from the same address.
+    pub fn user_agent(&self) -> Option<&str> {
+        self.transport
+            .headers
+            .get(USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+    }
+
     fn configure(
         fingerprint: Fingerprint,
         answers: Option<Answers>,
@@ -416,6 +447,14 @@ mod tests {
         assert_eq!(solve.profile.image.effective_type, "4g");
         assert!(solve.profile.image.online);
         assert!(solve.answers.is_none());
+    }
+
+    #[test]
+    fn the_bundled_profile_loads_with_its_answers() {
+        let browser = Browser::safari_26_ios().unwrap();
+        assert!(browser.solve.answers.is_some() && browser.solve.challenge_page_answers.is_some());
+        let user_agent = browser.user_agent().unwrap();
+        assert!(user_agent.contains("iPhone"), "{user_agent}");
     }
 
     #[test]
