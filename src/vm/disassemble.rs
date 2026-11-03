@@ -11,6 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::ops::ControlFlow;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, ScopedJoinHandle};
 
 use anyhow::{Result, bail};
 use indexmap::IndexSet;
@@ -18,8 +21,10 @@ use rustc_hash::FxBuildHasher;
 use swc_core::ecma::ast::BinaryOp;
 
 use super::interpret::Way;
-use super::machine::{Loaded, Machine};
-use super::output::{Constant, Effect, Exit, Hidden, Instruction, Listing, Path, Position, Term};
+use super::machine::{Definition, Loaded, Machine};
+use super::output::{
+    Constant, Effect, Exit, Failure, Hidden, Instruction, Listing, Path, Position, Term,
+};
 use super::value::Value;
 use super::{HashMap, convert, dataflow, packed_names};
 use crate::candidates;
@@ -50,17 +55,15 @@ impl Machine<'_> {
             walk.enqueue(entry)?;
         }
         let loaded = self.load(program);
-        loop {
-            while let Some(Position { pc, key }) = walk.queue.pop_front() {
-                match self.decode(&loaded, pc, key, &[]) {
-                    Ok(instruction) => walk.add(self, &loaded, instruction)?,
-                    Err(failure) => walk.listing.failures.push(failure),
+        thread::scope(|scope| -> Result<()> {
+            let decoders = Decoders::start(scope, self.definition, program);
+            loop {
+                decoders.walk(&mut walk, self, &loaded)?;
+                if !(walk.retry(self, &loaded)? || walk.drop_shortcuts()) {
+                    return Ok(());
                 }
             }
-            if !(walk.retry(self, &loaded)? || walk.drop_shortcuts()) {
-                break;
-            }
-        }
+        })?;
         let mut listing = walk.listing;
         // Discovery order must not affect the output.
         listing.functions[1..].sort_unstable();
@@ -71,6 +74,188 @@ impl Machine<'_> {
         fuse_method_calls(&mut listing);
         packed_names::fold(&mut listing);
         Ok(listing)
+    }
+}
+
+/// Threads that decode queued positions alongside the walk, each with a machine of its own: the
+/// interpreter's values are not shareable, but a decoded [`Instruction`] is plain data.
+///
+/// Decoding a position reads only the program and the machine, never the walk, so positions can
+/// be decoded in any order and on any thread. The walk still adds them in the order it queued
+/// them, which makes the listing the one a single thread would produce. Programs branch often
+/// enough (tens of positions queued at once on average) that most of the work spreads out.
+struct Decoders<'scope> {
+    /// Positions waiting to be decoded, in the order they were queued, numbered by that order.
+    queue: Arc<Queue>,
+    decoded: Receiver<(u64, Decoded)>,
+    /// Kept so the channel stays open while no worker has started.
+    _sender: Sender<(u64, Decoded)>,
+    _workers: Vec<ScopedJoinHandle<'scope, ()>>,
+}
+
+/// What decoding one position gave, or why a worker could not start.
+enum Decoded {
+    Instruction(Result<Instruction, Failure>),
+    Unavailable(anyhow::Error),
+}
+
+#[derive(Default)]
+struct Queue {
+    waiting: Mutex<Waiting>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct Waiting {
+    positions: VecDeque<(u64, Position)>,
+    closed: bool,
+}
+
+impl Queue {
+    fn push(&self, positions: impl IntoIterator<Item = (u64, Position)>) {
+        let mut waiting = self.waiting.lock().expect("decode queue lock");
+        let before = waiting.positions.len();
+        waiting.positions.extend(positions);
+        match waiting.positions.len() - before {
+            0 => {}
+            1 => self.ready.notify_one(),
+            _ => self.ready.notify_all(),
+        }
+    }
+
+    /// The next position to decode, without waiting.
+    fn take(&self) -> Option<(u64, Position)> {
+        self.waiting
+            .lock()
+            .expect("decode queue lock")
+            .positions
+            .pop_front()
+    }
+
+    /// The next position to decode, waiting for one; `None` once the queue closes.
+    fn wait(&self) -> Option<(u64, Position)> {
+        let mut waiting = self.waiting.lock().expect("decode queue lock");
+        loop {
+            if waiting.closed {
+                return None;
+            }
+            if let Some(next) = waiting.positions.pop_front() {
+                return Some(next);
+            }
+            waiting = self.ready.wait(waiting).expect("decode queue lock");
+        }
+    }
+
+    fn close(&self) {
+        self.waiting.lock().expect("decode queue lock").closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// Decoding threads beside the walk's own: enough to keep a few cores busy, while leaving room
+/// for other work on the machine.
+fn decoding_threads() -> usize {
+    thread::available_parallelism().map_or(1, |cores| cores.get().min(8)) - 1
+}
+
+impl<'scope> Decoders<'scope> {
+    fn start<'env>(
+        scope: &'scope thread::Scope<'scope, 'env>,
+        definition: &'env Definition,
+        program: &'env [u8],
+    ) -> Self {
+        let queue = Arc::new(Queue::default());
+        let (sender, decoded) = mpsc::channel();
+        let workers = (0..decoding_threads())
+            .map(|_| {
+                let (queue, sender) = (queue.clone(), sender.clone());
+                scope.spawn(move || {
+                    let machine = match Machine::try_new(definition) {
+                        Ok(machine) => machine,
+                        Err(error) => {
+                            let _ = sender.send((u64::MAX, Decoded::Unavailable(error)));
+                            return;
+                        }
+                    };
+                    let loaded = machine.load(program);
+                    while let Some((number, Position { pc, key })) = queue.wait() {
+                        let instruction = machine.decode(&loaded, pc, key, &[]);
+                        if sender
+                            .send((number, Decoded::Instruction(instruction)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        Self {
+            queue,
+            decoded,
+            _sender: sender,
+            _workers: workers,
+        }
+    }
+
+    /// Empties the walk's queue: decodes each queued position (helping the workers) and adds it,
+    /// in queue order, queueing what it reaches.
+    fn walk<'a>(
+        &self,
+        walk: &mut Walk,
+        machine: &Machine<'a>,
+        loaded: &Loaded<'_, 'a>,
+    ) -> Result<()> {
+        let mut queued = 0;
+        let queue_new = |walk: &mut Walk, queued: &mut u64| {
+            self.queue.push(walk.queue.drain(..).map(|position| {
+                *queued += 1;
+                (*queued - 1, position)
+            }));
+        };
+        queue_new(walk, &mut queued);
+        // Decoded positions waiting for the ones queued before them.
+        let mut early: HashMap<u64, Result<Instruction, Failure>> = HashMap::default();
+        for next in 0.. {
+            if next == queued {
+                return Ok(());
+            }
+            let instruction = loop {
+                if let Some(instruction) = early.remove(&next) {
+                    break instruction;
+                }
+                let (number, decoded) = match self.decoded.try_recv() {
+                    Ok(decoded) => decoded,
+                    Err(_) => match self.queue.take() {
+                        Some((number, Position { pc, key })) => (
+                            number,
+                            Decoded::Instruction(machine.decode(loaded, pc, key, &[])),
+                        ),
+                        None => self.decoded.recv().expect("the walk keeps a sender"),
+                    },
+                };
+                match decoded {
+                    Decoded::Instruction(instruction) => {
+                        early.insert(number, instruction);
+                    }
+                    Decoded::Unavailable(error) => {
+                        return Err(error.context("starting a decoding thread"));
+                    }
+                }
+            };
+            match instruction {
+                Ok(instruction) => walk.add(machine, loaded, instruction)?,
+                Err(failure) => walk.listing.failures.push(failure),
+            }
+            queue_new(walk, &mut queued);
+        }
+        unreachable!("the positions run out")
+    }
+}
+
+impl Drop for Decoders<'_> {
+    fn drop(&mut self) {
+        self.queue.close();
     }
 }
 
