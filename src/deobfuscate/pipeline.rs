@@ -24,7 +24,7 @@ use super::{
     helper_objects, int32_helpers, literals, loops, memoized_strings, merged_functions,
     register_arrays, state_machines, statements, static_members, unused_bindings,
 };
-use crate::deep_stack;
+use crate::{arena, deep_stack};
 
 /// Deobfuscated JavaScript with optional convergence diagnostics for the caller to report.
 pub struct Deobfuscated {
@@ -148,7 +148,10 @@ fn run<T, P: Pass>(
             finish(),
             fn_pass(move |program: &mut Program| *slot = Some(read(program, start))),
         )
-    })?;
+    });
+    // The tree is gone, and with it everything in its chunk, whether or not printing succeeded.
+    arena::release();
+    let text = text?;
     let read = result.context("the script was never read")?;
     Ok((Deobfuscated { text, unconverged }, read))
 }
@@ -329,10 +332,10 @@ impl Pass for Pipeline<'_> {
         let mut rounds = 0;
         while !converged && rounds < MAX_ROUNDS {
             rounds += 1;
-            // Each round starts from a fresh copy of the tree, laid out in traversal order. The
-            // rewrites leave it scattered across the heap, and the steps are walks bound by
-            // memory latency: about 7% faster deobfuscation, net of the copies.
-            *program = program.clone();
+            // Each round starts from a fresh copy of the tree, laid out in traversal order (see
+            // `arena`): the rewrites leave it scattered, and the steps are walks bound by memory
+            // latency.
+            arena::relayout(program);
             let (version, start) = (self.version, self.fingerprint(program));
             converged = self.round(program)
                 || self.version == version

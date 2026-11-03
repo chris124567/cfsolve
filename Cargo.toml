@@ -75,6 +75,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 rcgen = { version = "0.14", features = ["x509-parser"], optional = true }
 imbl = "7.0.2"
 
+# The address space `Allocator`'s chunks come from, reserved and committed on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
+# Installs `cfsolve::Allocator` as its global allocator, so it runs in a process of its own.
+[[test]]
+name = "arena"
+path = "tests/arena.rs"
+required-features = ["internals"]
+
 # Chrome 154's ClientHello: ML-DSA and GREASE signature algorithms and the
 # trust_anchors extension, which the published crates cannot send. See the
 # "cfsolve patch" comments in vendor/.
