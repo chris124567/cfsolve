@@ -143,6 +143,7 @@ fn run<T, P: Pass>(
                 analysis: Analysis::new(unresolved_mark),
                 version: 0,
                 unchanged_at: HashMap::default(),
+                fingerprinted: None,
             },
             finish(),
             fn_pass(move |program: &mut Program| *slot = Some(read(program, start))),
@@ -219,19 +220,38 @@ impl fmt::Display for Unconverged {
 /// name. Running any occurrence records that the step has processed the current program.
 struct Step {
     name: &'static str,
-    rewrite: fn(&mut Program, &mut Analysis) -> bool,
+    rewrite: Rewrite,
+}
+
+/// How a step's rewrite tells whether it changed the program.
+#[derive(Clone, Copy)]
+enum Rewrite {
+    /// It says so.
+    Reports(fn(&mut Program, &mut Analysis) -> bool),
+    /// The pipeline compares the program's fingerprints from before and after.
+    Compared(fn(&mut Program, &mut Analysis)),
 }
 
 const fn step(name: &'static str, rewrite: fn(&mut Program, &mut Analysis) -> bool) -> Step {
-    Step { name, rewrite }
+    Step {
+        name,
+        rewrite: Rewrite::Reports(rewrite),
+    }
 }
 
-const SIMPLIFY: Step = step("simplify", simplify);
+const fn compared(name: &'static str, rewrite: fn(&mut Program, &mut Analysis)) -> Step {
+    Step {
+        name,
+        rewrite: Rewrite::Compared(rewrite),
+    }
+}
+
+const SIMPLIFY: Step = compared("simplify", simplify);
 const STATIC_MEMBERS: Step = step("static members", static_members::run);
 const HELPER_OBJECTS: Step = step("helper objects", helper_objects::run);
 const CONTROL_FLOW: Step = step("control flow", control_flow::run);
 const UNUSED_BINDINGS: Step = step("unused bindings", unused_bindings::run);
-const FIX_PARENTHESES: Step = step("fix parentheses", fix_parentheses);
+const FIX_PARENTHESES: Step = compared("fix parentheses", fix_parentheses);
 
 const STEPS: &[&[Step]] = &[DECODE_STEPS, LATER_STEPS];
 
@@ -298,6 +318,9 @@ struct Pipeline<'outcome> {
     version: u64,
     /// Last program version each named step processed without changes.
     unchanged_at: HashMap<&'static str, u64>,
+    /// The fingerprint of a program version, kept because hashing the whole tree is costly and
+    /// most versions are compared several times.
+    fingerprinted: Option<(u64, u64)>,
 }
 
 impl Pass for Pipeline<'_> {
@@ -306,8 +329,10 @@ impl Pass for Pipeline<'_> {
         let mut rounds = 0;
         while !converged && rounds < MAX_ROUNDS {
             rounds += 1;
-            let start = fingerprint(program);
-            converged = self.round(program) || fingerprint(program) == start;
+            let (version, start) = (self.version, self.fingerprint(program));
+            converged = self.round(program)
+                || self.version == version
+                || self.fingerprint(program) == start;
         }
         *self.unconverged = (!converged).then_some(Unconverged { rounds });
         // Even without convergence, fix parentheses introduced by the last rewrites so output
@@ -330,6 +355,18 @@ impl Pipeline<'_> {
         false
     }
 
+    /// The current program's fingerprint.
+    fn fingerprint(&mut self, program: &Program) -> u64 {
+        match self.fingerprinted {
+            Some((version, fingerprint)) if version == self.version => fingerprint,
+            _ => {
+                let fingerprint = fingerprint(program);
+                self.fingerprinted = Some((self.version, fingerprint));
+                fingerprint
+            }
+        }
+    }
+
     /// Whether `step` last ran on this exact program without changing it.
     fn has_seen(&self, step: &Step) -> bool {
         self.unchanged_at.get(step.name) == Some(&self.version)
@@ -340,17 +377,29 @@ impl Pipeline<'_> {
         if self.has_seen(step) {
             return;
         }
-        // Tests check every step's report against the program itself.
-        let before = cfg!(test).then(|| fingerprint(program));
-        let changed = (step.rewrite)(program, &mut self.analysis);
-        if let Some(before) = before {
-            assert_eq!(
-                changed,
-                fingerprint(program) != before,
-                "the {} step misreported whether it changed the program",
-                step.name
-            );
-        }
+        let changed = match step.rewrite {
+            Rewrite::Reports(rewrite) => {
+                // Tests check every step's report against the program itself.
+                let before = cfg!(test).then(|| fingerprint(program));
+                let changed = rewrite(program, &mut self.analysis);
+                if let Some(before) = before {
+                    assert_eq!(
+                        changed,
+                        fingerprint(program) != before,
+                        "the {} step misreported whether it changed the program",
+                        step.name
+                    );
+                }
+                changed
+            }
+            Rewrite::Compared(rewrite) => {
+                let before = self.fingerprint(program);
+                rewrite(program, &mut self.analysis);
+                let after = fingerprint(program);
+                self.fingerprinted = Some((self.version + u64::from(after != before), after));
+                after != before
+            }
+        };
         if changed {
             self.version += 1;
             self.analysis.invalidate();
@@ -371,18 +420,14 @@ fn fingerprint(program: &Program) -> u64 {
     hasher.finish()
 }
 
-/// Folds constant expressions such as `1 + 2`. Compares fingerprints because the simplifier's
-/// change flag misses some rewrites, such as single-element sequences.
-fn simplify(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let before = fingerprint(program);
+/// Folds constant expressions such as `1 + 2`. Its changes are found by comparing fingerprints,
+/// because the simplifier's change flag misses some rewrites, such as single-element sequences.
+fn simplify(program: &mut Program, analysis: &mut Analysis) {
     expr::expr_simplifier(analysis.globals.mark, ExprSimplifierConfig::default()).process(program);
-    fingerprint(program) != before
 }
 
 /// Adds parentheses that rewritten expressions need, such as in `x = (a, b)`. SWC's own fixer
 /// ran before the rewrites.
-fn fix_parentheses(program: &mut Program, _: &mut Analysis) -> bool {
-    let before = fingerprint(program);
+fn fix_parentheses(program: &mut Program, _: &mut Analysis) {
     fixer::fixer(None).process(program);
-    fingerprint(program) != before
 }
