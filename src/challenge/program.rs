@@ -1,7 +1,7 @@
 //! Extracts a session's encoding constants and payload template without relying on randomized
 //! names. The encoding algorithms are implemented in `crate::challenge::codec`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result};
@@ -12,7 +12,7 @@ use swc_core::ecma::ast::{
     ArrowExpr, AssignExpr, AssignTarget, BindingIdent, BlockStmt, CallExpr, Callee, ClassDecl,
     Expr, FnDecl, Function, IfStmt, ObjectLit, Script, SimpleAssignTarget, Stmt, VarDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 use url::Url;
 
 use crate::challenge::codec::{Codec, KEY_LENGTH, SEED_LENGTH};
@@ -143,6 +143,7 @@ impl<'source> PreparedSession<'source> {
             encoders: BTreeSet::new(),
             programs: BTreeMap::new(),
             templates: Vec::new(),
+            constants: Vec::new(),
         };
         parsed.script.visit_with(&mut components);
         let encoder = candidates::exactly_one(components.encoders, "XHR body encoder")?;
@@ -449,9 +450,44 @@ struct Components<'session> {
     /// Orchestrators may repeat a program for different startup paths.
     programs: BTreeMap<String, String>,
     templates: Vec<Vec<Field>>,
+    /// Constants assigned earlier in each enclosing block of the current function, innermost
+    /// last. Some builds read a payload field from a local, as in `x = 1; t = { f: x }`.
+    constants: Vec<HashMap<String, Expr>>,
+}
+
+impl Components<'_> {
+    /// Visits a function body without the enclosing function's constants.
+    fn visit_function_scope(&mut self, visit: impl FnOnce(&mut Self)) {
+        let outer = std::mem::take(&mut self.constants);
+        visit(self);
+        self.constants = outer;
+    }
 }
 
 impl Visit for Components<'_> {
+    fn visit_function(&mut self, function: &Function) {
+        self.visit_function_scope(|this| function.visit_children_with(this));
+    }
+
+    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
+        self.visit_function_scope(|this| arrow.visit_children_with(this));
+    }
+
+    fn visit_block_stmt(&mut self, block: &BlockStmt) {
+        self.constants.push(HashMap::new());
+        for statement in &block.stmts {
+            statement.visit_with(self);
+            let constants = self.constants.last_mut().expect("pushed above");
+            for (name, value) in ast::constant_assignments(statement) {
+                match value {
+                    Some(value) => constants.insert(name, value),
+                    None => constants.remove(&name),
+                };
+            }
+        }
+        self.constants.pop();
+    }
+
     fn visit_call_expr(&mut self, call: &CallExpr) {
         if vm::calls_runner(call, &self.runner)
             && let Some(program) = call
@@ -480,10 +516,42 @@ impl Visit for Components<'_> {
 
     fn visit_object_lit(&mut self, object: &ObjectLit) {
         if source::is_payload_template(object, self.options) {
+            let mut constants = HashMap::new();
+            for block in &self.constants {
+                constants.extend(
+                    block
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+            }
+            let mut object = object.clone();
+            object.visit_mut_with(&mut Substitute { constants });
             self.templates
-                .push(payload_fields(object, self.parsed, self.options));
+                .push(payload_fields(&object, self.parsed, self.options));
         }
         object.visit_children_with(self);
+    }
+}
+
+/// Replaces identifiers with the constants assigned to them. Nested functions keep their own
+/// names, since a parameter or local there can shadow the constant.
+struct Substitute {
+    constants: HashMap<String, Expr>,
+}
+
+impl VisitMut for Substitute {
+    fn visit_mut_function(&mut self, _: &mut Function) {}
+
+    fn visit_mut_arrow_expr(&mut self, _: &mut ArrowExpr) {}
+
+    fn visit_mut_expr(&mut self, expression: &mut Expr) {
+        if let Expr::Ident(ident) = expression
+            && let Some(value) = self.constants.get(&*ident.sym)
+        {
+            *expression = value.clone();
+            return;
+        }
+        expression.visit_mut_children_with(self);
     }
 }
 
@@ -513,6 +581,44 @@ mod tests {
             .into_iter()
             .next()
             .unwrap()
+    }
+
+    #[test]
+    fn substitutes_constants_for_identifiers_but_not_property_names() {
+        let Stmt::Expr(template) = statement("t = { Wrb: Wrb, b: o.Wrb === Wrb, c: x };") else {
+            unreachable!()
+        };
+        let mut expression = *template.expr;
+        let one = ast::constant_assignments(&statement("Wrb = 1;"))
+            .remove(0)
+            .1
+            .unwrap();
+        expression.visit_mut_with(&mut Substitute {
+            constants: HashMap::from([("Wrb".to_owned(), one)]),
+        });
+        assert_eq!(
+            swc_core::ecma::codegen::to_code(&expression),
+            "t = {\n    Wrb: 1,\n    b: o.Wrb === 1,\n    c: x\n}"
+        );
+    }
+
+    #[test]
+    fn leaves_names_inside_nested_functions_alone() {
+        let Stmt::Expr(template) =
+            statement("t = { a: function (Wrb) { return Wrb; }, b: (Wrb) => Wrb };")
+        else {
+            unreachable!()
+        };
+        let mut expression = *template.expr;
+        let before = swc_core::ecma::codegen::to_code(&expression);
+        let one = ast::constant_assignments(&statement("Wrb = 1;"))
+            .remove(0)
+            .1
+            .unwrap();
+        expression.visit_mut_with(&mut Substitute {
+            constants: HashMap::from([("Wrb".to_owned(), one)]),
+        });
+        assert_eq!(swc_core::ecma::codegen::to_code(&expression), before);
     }
 
     #[test]
