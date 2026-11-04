@@ -28,7 +28,8 @@ pub(crate) enum RequestKind {
     CorsScript,
     /// A classic script request after a redirect.
     ScriptRedirect,
-    /// The orchestrator a challenge page loads from its own origin.
+    /// A script a challenge page loads from its own origin: the orchestrator, or the precursor
+    /// script a precursor interstitial's program loads.
     Orchestrator,
     /// An image a challenge page loads from its own origin.
     PageImage,

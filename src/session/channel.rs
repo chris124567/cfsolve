@@ -47,9 +47,11 @@ pub enum Stage {
     Probes,
     /// The checkbox program's record.
     Interaction,
-    /// The orchestrator's first payload, whose response renders a widget.
+    /// The orchestrator's first payload, whose response renders a widget or, on a precursor
+    /// interstitial, loads the precursor script.
     Orchestrator,
-    /// The orchestrator's widget-completion report, whose response submits the clearance form.
+    /// The orchestrator's report that the widget or precursor script completed, whose response
+    /// submits the clearance form.
     Clearance,
 }
 

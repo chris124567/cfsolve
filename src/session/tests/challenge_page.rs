@@ -45,8 +45,9 @@ fn the_pages_resource_timing_lists_both_of_the_widget_programs_reads() {
         request: 0.5,
         response: 0.25,
     };
+    let load = challenge_page::ProgramLoad::Iframe(&iframe);
     let entries =
-        challenge_page::page_resource_timing(&timing, phases, &navigation, &loads, &post, &iframe);
+        challenge_page::page_resource_timing(&timing, phases, &navigation, &loads, &post, load);
     assert_eq!(
         entries,
         [

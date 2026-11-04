@@ -100,19 +100,15 @@ pub async fn navigate(client: &BrowserClient, url: &Url) -> Result<PageDocument>
     PageDocument::read(response).await
 }
 
-/// Loads a same-origin orchestrator script after the page has requested high-entropy hints.
-/// `referer` is the page's temporary address during loading.
-pub async fn fetch_orchestrator(
-    client: &BrowserClient,
-    url: &Url,
-    referer: &Url,
-) -> Result<String> {
+/// Loads a same-origin script a challenge page inserts, after the page has requested
+/// high-entropy hints: the orchestrator, from the page's temporary address during loading, or
+/// the precursor script a precursor interstitial's program loads, from the restored address.
+pub async fn fetch_page_script(client: &BrowserClient, url: &Url, referer: &Url) -> Result<String> {
     let request = client.http.get(url.as_str());
     let supplied = [("referer", Some(referer.as_str()))];
     let response = client
         .send(request, RequestKind::Orchestrator, &supplied)
-        .await
-        .context("loading the orchestrator")?
+        .await?
         .error_for_status()?;
     Ok(response.text().await?)
 }

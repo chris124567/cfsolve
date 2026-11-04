@@ -1,14 +1,16 @@
 //! Analyzes response programs used by the challenge-page orchestrator.
 //!
 //! The first response renders a Turnstile widget and prepares a second payload containing
-//! session state, one widget-outcome record, and literal footer fields. The next response
-//! submits a form to obtain clearance.
+//! session state, one widget-outcome record, and literal footer fields. On a precursor
+//! interstitial, it loads the precursor script instead, and its record reports that script's
+//! completion. The next response submits a form to obtain clearance.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
 use anyhow::{Context, Result, bail, ensure};
 use indexmap::IndexMap;
+use swc_core::ecma::ast::BinaryOp;
 use url::Url;
 
 use crate::candidates;
@@ -151,21 +153,16 @@ impl WidgetProgram {
         );
         let outcome = &self.outcome;
         // Preserve first-write order: literals, state moved by the finishing function, callback
-        // result, then closing timestamps. Clear the original start before sending.
-        let mut record = JsObject::new();
-        record.insert(self.record.token_field.clone(), json!(self.record.token));
-        record.insert(self.record.input_field.clone(), self.record.input.clone());
-        record.extend(outcome.finish.iter().cloned());
-        record.insert(outcome.token.clone(), json!(settled.token));
-        record.insert(outcome.status.clone(), json!(""));
-        record.insert(outcome.started.clone(), json!(settled.started_ms));
-        record.insert(outcome.ended.clone(), json!(settled.ended_ms));
-        record.insert(
-            outcome.duration.clone(),
-            json!(settled.ended_ms - settled.started_ms),
-        );
-        // This record is the first numbered entry.
-        let records = JsObject::from_iter([("1".to_owned(), JsValue::Object(record))]);
+        // result, then closing timestamps.
+        let mut written = JsObject::from_iter(outcome.finish.iter().cloned());
+        written.insert(outcome.token.clone(), json!(settled.token));
+        written.insert(outcome.status.clone(), json!(""));
+        let closing = Closing {
+            started: &outcome.started,
+            ended: &outcome.ended,
+            duration: &outcome.duration,
+        };
+        let records = closing.records(&self.record, written, settled.started_ms, settled.ended_ms);
         let mut extra = JsObject::new();
         if let (Some(field), Some(value)) = (&self.after_challenge, &settled.after_challenge) {
             extra.insert(field.clone(), json!(value));
@@ -189,6 +186,168 @@ impl WidgetProgram {
                 Ok((name.clone(), value))
             })
             .collect()
+    }
+}
+
+/// Whether a first response program renders a widget, by writing its `sitekey`. A precursor
+/// interstitial's program loads the precursor script instead.
+#[must_use]
+pub(crate) fn renders_widget(listing: &Listing) -> bool {
+    let index = Index::new(listing);
+    index.stores().iter().any(|store| store.key == "sitekey")
+}
+
+/// A precursor interstitial's first response program. It loads Cloudflare's precursor script
+/// into the page, handing it a callback on `window._cf_chl_opt`, and sends its second payload
+/// once the script has run and called back.
+#[derive(Debug)]
+pub(crate) struct PrecursorProgram {
+    /// The record counter, which the template starts at zero.
+    pub counter: String,
+    pub layout: Layout,
+    /// The record the program adds, with its literal token and input.
+    pub record: RecordTemplate,
+    /// The script's address, as the parts the program concatenates.
+    pub script: Vec<Expression>,
+    /// The record's status and message, as the callback writes them, in order.
+    pub finish: Vec<(String, JsValue)>,
+    /// Copied start time, end time, and duration fields. The original start field is cleared
+    /// before sending.
+    pub started: String,
+    pub ended: String,
+    pub duration: String,
+    /// Window globals the program sets to literals of its own.
+    pub window: Window,
+}
+
+impl PrecursorProgram {
+    pub(crate) fn recover(listing: &Listing) -> Result<Self> {
+        ensure!(
+            listing.failures.is_empty(),
+            "precursor program has undecoded instructions"
+        );
+        let index = Index::new(listing);
+        let Recovered {
+            pool,
+            counter,
+            layout,
+            record,
+            ..
+        } = payload::recover_unique(&index, "precursor program")?;
+        let reader = Reader {
+            index: &index,
+            pool,
+        };
+        // The script element's `src`; the program's other elements are a sandbox iframe and
+        // workers, which it gives no address.
+        let script = candidates::exactly_one(
+            index
+                .stores()
+                .iter()
+                .filter(|store| store.key == "src")
+                .filter_map(|store| reader.concatenation(store.pc, &store.value)),
+            "precursor script address",
+        )?;
+        let callback = candidates::exactly_one(reader.option_callbacks(), "precursor callback")?;
+        let finish = reader
+            .stores_in(index.function_at(callback))
+            .filter_map(|store| match reader.origin(store.pc, &store.value)? {
+                Expression::Literal { value } => Some((store.key.clone(), value)),
+                _ => None,
+            })
+            .collect();
+        let [started, ended, duration] = reader
+            .closing(&record.started_field)?
+            .map(|store| store.key.clone());
+        Ok(Self {
+            counter,
+            layout,
+            record,
+            script,
+            finish,
+            started,
+            ended,
+            duration,
+            window: reader.window_literals(),
+        })
+    }
+
+    /// The precursor script's address on `page`.
+    pub(crate) fn script_url(&self, options: &Options, window: &Window, page: &Url) -> Result<Url> {
+        let mut path = String::new();
+        for part in &self.script {
+            let value = resolve(part, options, window)?;
+            let text = value
+                .as_ref()
+                .and_then(JsValue::as_str)
+                .with_context(|| format!("precursor script address part {part:?} is not text"))?;
+            path.push_str(text);
+        }
+        Ok(page.join(&path)?)
+    }
+
+    /// Builds the payload passed to the orchestrator sender once the script has called back,
+    /// before sender fields are appended. `state` uses the orchestrator's first payload as
+    /// input.
+    pub(crate) fn payload(
+        &self,
+        state: &State<'_>,
+        started_ms: i64,
+        ended_ms: i64,
+    ) -> Result<Payload> {
+        ensure!(
+            self.layout
+                .published
+                .iter()
+                .all(|(_, value)| value.is_some()),
+            "precursor program publishes a field only a browser computes"
+        );
+        let closing = Closing {
+            started: &self.started,
+            ended: &self.ended,
+            duration: &self.duration,
+        };
+        let written = JsObject::from_iter(self.finish.iter().cloned());
+        let records = closing.records(&self.record, written, started_ms, ended_ms);
+        self.layout.assemble(
+            state,
+            &Document::default(),
+            records,
+            &self.counter,
+            JsObject::new(),
+            None,
+        )
+    }
+}
+
+/// The fields that close a program's record: a copy of its start, its end, and the time
+/// between.
+struct Closing<'field> {
+    started: &'field str,
+    ended: &'field str,
+    duration: &'field str,
+}
+
+impl Closing<'_> {
+    /// The payload's numbered records: `record`'s literals, the fields `written` while it was
+    /// open, then the closing timestamps. The original start is cleared before sending, so it
+    /// is left out.
+    fn records(
+        &self,
+        record: &RecordTemplate,
+        written: JsObject,
+        started_ms: i64,
+        ended_ms: i64,
+    ) -> JsObject {
+        let mut fields = JsObject::new();
+        fields.insert(record.token_field.clone(), json!(record.token));
+        fields.insert(record.input_field.clone(), record.input.clone());
+        fields.extend(written);
+        fields.insert(self.started.to_owned(), json!(started_ms));
+        fields.insert(self.ended.to_owned(), json!(ended_ms));
+        fields.insert(self.duration.to_owned(), json!(ended_ms - started_ms));
+        // This record is the first numbered entry.
+        JsObject::from_iter([("1".to_owned(), JsValue::Object(fields))])
     }
 }
 
@@ -244,6 +403,36 @@ impl Reader<'_> {
             }
             _ => return None,
         })
+    }
+
+    /// The parts of a string `term` concatenates at `pc` with `+`, each resolved by
+    /// [`Self::origin`].
+    fn concatenation(&self, pc: u32, term: &Term) -> Option<Vec<Expression>> {
+        if let Some((at, Term::Binary(BinaryOp::Add, left, right))) =
+            self.index.dereference(pc, term)
+        {
+            let mut parts = self.concatenation(at, &left)?;
+            parts.extend(self.concatenation(at, &right)?);
+            return Some(parts);
+        }
+        Some(vec![self.origin(pc, term)?])
+    }
+
+    /// Entry points of the program functions stored on `window._cf_chl_opt`, directly or
+    /// through cells, for another script to call.
+    fn option_callbacks(&self) -> BTreeSet<u32> {
+        let mut entries = BTreeSet::new();
+        for store in self.index.stores() {
+            let on_options = self.index.holds_options(store.pc, &Term::Reg(store.object));
+            match self.index.dereference(store.pc, &store.value) {
+                Some((_, Term::Closure { pc, .. })) if on_options => {
+                    entries.insert(pc);
+                }
+                Some((_, Term::Cell(cell))) if on_options => entries.extend(self.closures_in(cell)),
+                _ => {}
+            }
+        }
+        entries
     }
 
     fn window_literals(&self) -> Window {
@@ -388,18 +577,28 @@ impl Reader<'_> {
         }
         let mut entries = Vec::new();
         for cell in cells {
-            for (pc, effect) in self.index.effects_in(..) {
-                if let Effect::SetCell(target, value) = effect
-                    && *target == cell
-                    && let Some((_, Term::Closure { pc: entry, .. })) =
-                        self.index.dereference(pc, value)
-                    && !entries.contains(&entry)
-                {
+            for entry in self.closures_in(cell) {
+                if !entries.contains(&entry) {
                     entries.push(entry);
                 }
             }
         }
         entries
+    }
+
+    /// Entry points of the program functions stored in `cell`, in program order.
+    fn closures_in(&self, cell: u32) -> impl Iterator<Item = u32> {
+        self.index
+            .effects_in(..)
+            .filter_map(move |(pc, effect)| match effect {
+                Effect::SetCell(target, value) if *target == cell => {
+                    match self.index.dereference(pc, value) {
+                        Some((_, Term::Closure { pc: entry, .. })) => Some(entry),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
     }
 
     /// The closing writes: a copy of the start, the end, and end minus start. The original start
