@@ -299,8 +299,12 @@ impl RenderedPage {
                 })
             });
         let Some(container) = container else {
-            let widget =
-                widget.with_context(|| format!("page has no .{CONTAINER_CLASS} container"))?;
+            let widget = widget.with_context(|| {
+                format!(
+                    "page has no .{CONTAINER_CLASS} container; \
+                         if it renders the widget from JavaScript, pass the sitekey"
+                )
+            })?;
             let params = Params::from_attributes(|name| match name {
                 "data-sitekey" => Some(widget.sitekey.as_str()),
                 "data-action" => widget.action.as_deref(),
