@@ -17,6 +17,7 @@ use super::extract::{Argument, DispatchLoop};
 use super::interpret;
 use super::session::Session;
 use super::value::Value;
+use crate::js::ast;
 
 /// Function extracted from the dispatch loop to decode opcodes.
 pub(crate) struct Dispatch {
@@ -84,6 +85,7 @@ impl Dispatch {
             }
             Some(Stmt::Decl(Decl::Var(declaration)))
         });
+        let constants = constants_before_loop(&body.stmts).cloned();
         let returned = Stmt::Return(ReturnStmt {
             span: DUMMY_SP,
             arg: Some(Box::new(Expr::Ident(opcode))),
@@ -92,7 +94,11 @@ impl Dispatch {
             body: Some(BlockStmt {
                 span: body.span,
                 ctxt: body.ctxt,
-                stmts: declarations.chain(decoding).chain([returned]).collect(),
+                stmts: declarations
+                    .chain(constants)
+                    .chain(decoding)
+                    .chain([returned])
+                    .collect(),
             }),
             ..function.clone()
         };
@@ -124,6 +130,19 @@ impl Dispatch {
     }
 }
 
+/// The statements before the loop that only assign constants. Some builds move a literal the
+/// decoding reads into a function local, as in `x = undefined; x = 1; while (...) { ... a.i === x
+/// ... }`, so the extracted decoder has to keep those assignments.
+fn constants_before_loop(statements: &[Stmt]) -> impl Iterator<Item = &Stmt> {
+    statements
+        .iter()
+        .take_while(|statement| !statement.is_while_stmt())
+        .filter(|statement| {
+            let assigned = ast::constant_assignments(statement);
+            !assigned.is_empty() && assigned.iter().all(|(_, value)| value.is_some())
+        })
+}
+
 /// Matches `<opcode> < 0` or `0 > <opcode>`.
 fn is_negative(test: &Expr, opcode: &Ident) -> bool {
     let Some(test) = test.unwrap_parens().as_bin() else {
@@ -135,5 +154,20 @@ fn is_negative(test: &Expr, opcode: &Ident) -> bool {
         BinaryOp::Lt => is_opcode(&test.left) && is_zero(&test.right),
         BinaryOp::Gt => is_zero(&test.left) && is_opcode(&test.right),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keeps_only_constant_assignments_before_the_loop() {
+        let source = "x = undefined; x = 1; y = f(); z = 2, w = g(); while (a) { v = 3; } u = 4;";
+        let statements = ast::parse_javascript("t.js", source).unwrap().script.body;
+        let kept: Vec<String> = constants_before_loop(&statements)
+            .map(swc_core::ecma::codegen::to_code)
+            .collect();
+        assert_eq!(kept, ["x = undefined;\n", "x = 1;\n"]);
     }
 }
