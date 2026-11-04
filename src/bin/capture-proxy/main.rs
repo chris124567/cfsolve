@@ -12,7 +12,8 @@
 //! pages are intercepted.
 //!
 //! Ctrl-C waits for session extraction to finish and writes the logs. A second Ctrl-C writes
-//! the logs without waiting.
+//! the logs without waiting. On Windows, closing the console also writes the logs without
+//! waiting, because Windows ends the process a few seconds later.
 
 mod cli;
 mod io;
