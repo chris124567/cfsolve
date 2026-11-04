@@ -31,19 +31,15 @@ fn main() -> Result<()> {
 }
 
 fn snapshot(path: &str, program: &str, names: Option<&str>) -> Result<()> {
-    let source = fs::read_to_string(path)?;
+    let source = Source::try_new(&fs::read_to_string(path)?)?;
     let text = if program == "-" {
-        let start =
-            source.find("runProgram(`").context("no embedded program")? + "runProgram(`".len();
-        let end = start + source[start..].find('`').context("unterminated program")?;
-        source[start..end].to_owned()
+        source.embedded_program().context("no embedded program")?
     } else {
         fs::read_to_string(program)?
     };
     let program = STANDARD.decode(text.trim())?;
     let names: Vec<&str> = names.map_or_else(Vec::new, |names| names.split(',').collect());
 
-    let source = Source::try_new(&source)?;
     let started = Instant::now();
     let machine = source.machine()?;
     let built = started.elapsed();

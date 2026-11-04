@@ -1,7 +1,7 @@
 //! Print the instructions of a session's VM program.
 //!
 //! `disassemble <deobfuscated.js> [program.txt [entries.json]]` reads the program as the
-//! `runProgram` argument text (base64); without a file it disassembles the
+//! program runner's argument text (base64); without a file it disassembles the
 //! script's own embedded program. A third argument adds entries the program
 //! reaches some other way, such as a browser's recorded coverage.
 
@@ -19,17 +19,12 @@ fn main() -> Result<()> {
         .next()
         .context("usage: disassemble <deobfuscated.js> [program.txt]")?;
     let text = fs::read_to_string(&script)?;
+    let source = Source::try_new(&text)?;
     let program = match arguments.next() {
         Some(path) => fs::read_to_string(path)?,
-        None => {
-            let start =
-                text.find("runProgram(`").context("no embedded program")? + "runProgram(`".len();
-            let end = start + text[start..].find('`').context("unterminated program")?;
-            text[start..end].to_owned()
-        }
+        None => source.embedded_program().context("no embedded program")?,
     };
     let program = STANDARD.decode(program.trim())?;
-    let source = Source::try_new(&text)?;
     let machine = source.machine()?;
     // A third argument lists more entries, as JSON `[[pc, key], ...]`.
     let mut entries = vec![machine.entry()];

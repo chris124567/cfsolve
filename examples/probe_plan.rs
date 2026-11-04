@@ -3,9 +3,9 @@
 //! its stored answer is filed under.
 //! Usage: probe_plan <capture.json>
 //!
-//! The capture is what `scripts/cdp_capture.mjs` or the capture proxy
-//! writes. Records are shuffled per session, so this is the key for reading
-//! a capture's second payload by hand.
+//! The capture is a session's `capture.json` from the capture proxy. Records
+//! are shuffled per session, so this is the key for reading a capture's
+//! second payload by hand.
 
 use std::env;
 use std::path::Path;

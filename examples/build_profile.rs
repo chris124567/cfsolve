@@ -1,9 +1,8 @@
 //! Store a real browser's probe answers for a device profile.
 //! Usage: build_profile <capture.json> [cssom.json] > answers.json
 //!
-//! The capture is a session's `capture.json` from the capture proxy, or what
-//! `scripts/cdp_capture.mjs` writes: the iframe's HTML, its POSTs with their
-//! responses, and the plaintext payloads. Each probe's record from the second
+//! The capture is a session's `capture.json` from the capture proxy: the
+//! iframe's HTML, its POSTs with their responses, and the plaintext payloads. Each probe's record from the second
 //! payload is stored under the reference build's names; see
 //! `cfsolve::stage2::replay`. An adjacent `iframe.deobfuscated.js` (from
 //! `capture_session`) is used instead of deobfuscating the capture's script.
