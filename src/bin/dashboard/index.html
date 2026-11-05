@@ -1,0 +1,1472 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>cfsolve — Challenge Console</title>
+  
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+  <style>
+    :root, .dark {
+      --ink: #060606;
+      --ink-2: #0e0e0e;
+      --ink-3: #1a1a1a;
+      --bone: #f8f8ff;
+      --bone-mute: rgba(248, 248, 255, 0.65);
+      --bone-dim: rgba(248, 248, 255, 0.42);
+      
+      --panel-solid: #111216;
+      --panel-border: hsla(0, 0%, 100%, 0.08);
+      --panel-shadow: 0 1px 0 hsla(0,0%,100%,.04) inset, 0 24px 48px -32px rgba(0,0,0,.9);
+      
+      --accent: #8fb4ff;
+      --accent-ink: #071224;
+      --accent-glow: rgba(143, 180, 255, 0.16);
+      
+      --danger: #ff5a5a;
+      --warn: #ffb454;
+      --success: #34c759;
+      --blue-stat: #8fb4ff;
+      
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    *::-webkit-scrollbar {
+      width: 5px;
+      height: 5px;
+    }
+    *::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    *::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.12);
+      border-radius: 999px;
+    }
+    *::-webkit-scrollbar-thumb:hover {
+      background: var(--accent);
+    }
+
+    body {
+      background-color: var(--ink);
+      color: var(--bone);
+      font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Fixed Clean Top Bar */
+    header.topbar {
+      height: 48px;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--panel-border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(10, 10, 12, 0.95);
+      backdrop-filter: blur(14px);
+      flex-shrink: 0;
+      z-index: 50;
+    }
+
+    .brand-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    /* Logo Box: No border, filled icon */
+    .logo-box {
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      flex-shrink: 0;
+    }
+
+    .logo-box svg {
+      width: 26px;
+      height: 26px;
+      filter: drop-shadow(0 0 8px rgba(143, 180, 255, 0.4));
+    }
+
+    .brand-name {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--bone);
+      line-height: 1;
+    }
+
+    .topbar-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      color: var(--bone-dim);
+      background: #101217;
+      border: 1px solid var(--panel-border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+    }
+
+    .dot-pulse {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--success);
+      box-shadow: 0 0 6px rgba(52, 199, 89, 0.7);
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* Main Dashboard Viewport */
+    .dashboard-content {
+      padding: 10px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-width: 100%;
+      width: 100%;
+      margin: 0;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+      box-sizing: border-box;
+    }
+
+    /* 4 Stat Metric Cards with Diagonal Striped Texture */
+    .stats-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    @media (max-width: 1100px) {
+      .stats-row {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    .stat-card {
+      background: var(--panel-solid);
+      border: 1px solid var(--panel-border);
+      box-shadow: var(--panel-shadow);
+      border-radius: 8px;
+      padding: 10px 14px;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      min-height: 60px;
+    }
+
+    .stat-card::after {
+      content: "";
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 90px;
+      height: 55px;
+      pointer-events: none;
+      background: repeating-linear-gradient(45deg, hsla(0, 0%, 100%, 0.035) 0 1px, transparent 1px 7px);
+      -webkit-mask-image: radial-gradient(100% 100% at 100% 0%, #000 30%, transparent 80%);
+      mask-image: radial-gradient(100% 100% at 100% 0%, #000 30%, transparent 80%);
+    }
+
+    .stat-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--bone-dim);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .stat-val {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--bone);
+      margin: 1px 0;
+    }
+
+    .stat-val.blue {
+      color: var(--blue-stat);
+    }
+
+    .stat-sub {
+      font-size: 10.5px;
+      color: var(--bone-dim);
+    }
+
+    /* 3-Column Workbench */
+    .workbench-grid {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr 0.95fr;
+      gap: 12px;
+      align-items: stretch;
+      flex: 1;
+      min-height: 0;
+    }
+
+    /* Responsive Breakpoints for Tablet & Mobile */
+    @media (max-width: 1180px) {
+      body {
+        height: auto !important;
+        min-height: 100vh;
+        overflow-y: auto !important;
+      }
+      .dashboard-content {
+        height: auto !important;
+        overflow: visible !important;
+        padding: 12px 14px 24px;
+        flex: none;
+      }
+      .stats-row {
+        grid-template-columns: repeat(2, 1fr) !important;
+      }
+      .workbench-grid {
+        grid-template-columns: 1fr !important;
+        height: auto !important;
+        display: flex !important;
+        flex-direction: column !important;
+        gap: 16px;
+      }
+      .ui-panel {
+        height: auto !important;
+        min-height: auto !important;
+        overflow: visible !important;
+      }
+      .ui-panel-body-scroll {
+        overflow-y: visible !important;
+      }
+    }
+
+    @media (max-width: 640px) {
+      header.topbar {
+        padding: 0 12px;
+        height: 44px;
+      }
+      .brand-name {
+        font-size: 16px;
+      }
+      .status-badge {
+        font-size: 10.5px;
+        padding: 4px 8px;
+      }
+      .stats-row {
+        grid-template-columns: repeat(2, 1fr) !important;
+        gap: 8px;
+      }
+      .stat-card {
+        padding: 10px 12px;
+        min-height: 52px;
+      }
+      .row-2 {
+        grid-template-columns: 1fr;
+        gap: 8px;
+      }
+      .checkbox-grid {
+        grid-template-columns: 1fr;
+      }
+      .ui-panel {
+        padding: 12px 14px;
+        min-height: auto;
+      }
+      .terminal-box {
+        height: 240px !important;
+      }
+      footer {
+        flex-direction: column;
+        height: auto;
+        padding: 10px 14px;
+        gap: 4px;
+        text-align: center;
+      }
+    }
+
+    .ui-panel {
+      background: var(--panel-solid);
+      border: 1px solid var(--panel-border);
+      box-shadow: var(--panel-shadow);
+      border-radius: 10px;
+      padding: 14px 16px;
+      position: relative;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      height: 100%;
+      min-height: 0;
+      box-sizing: border-box;
+    }
+
+    .ui-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--panel-border);
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+      flex-shrink: 0;
+    }
+
+    .ui-panel-body-scroll {
+      flex: 1;
+      overflow-y: auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 11px;
+      padding-right: 4px;
+    }
+
+    .ui-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--panel-border);
+      padding-bottom: 14px;
+    }
+
+    .ui-panel-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--bone);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .ui-panel-title::before {
+      content: "\\";
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .ui-panel-sub {
+      font-size: 12px;
+      color: var(--bone-dim);
+    }
+
+    /* Form Fields */
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+
+    label {
+      font-size: 11.5px;
+      font-weight: 500;
+      color: var(--bone-mute);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .hint {
+      font-size: 10.5px;
+      color: var(--bone-dim);
+    }
+
+    input[type="text"], textarea {
+      background: #08080a;
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 8px 11px;
+      color: var(--bone);
+      font-size: 12.5px;
+      font-family: inherit;
+      outline: none;
+      transition: all 0.2s var(--ease);
+    }
+
+    input[type="text"]:focus, textarea:focus {
+      border-color: var(--accent);
+      background: #0d0e12;
+      box-shadow: 0 0 0 3px var(--accent-glow);
+    }
+
+    /* Custom Themed Dropdown */
+    .custom-select-wrap {
+      position: relative;
+      user-select: none;
+    }
+
+    .custom-select-trigger {
+      background: #08080a;
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 8px 11px;
+      color: var(--bone);
+      font-size: 12.5px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      transition: border-color 0.2s;
+    }
+
+    .custom-select-trigger:hover, .custom-select-wrap.open .custom-select-trigger {
+      border-color: var(--accent);
+    }
+
+    .custom-select-trigger svg {
+      transition: transform 0.2s var(--ease);
+    }
+
+    .custom-select-wrap.open .custom-select-trigger svg {
+      transform: rotate(180deg);
+    }
+
+    .custom-select-options {
+      position: absolute;
+      top: calc(100% + 6px);
+      left: 0;
+      right: 0;
+      background: #111216;
+      border: 1px solid var(--panel-border);
+      box-shadow: 0 16px 36px -12px rgba(0, 0, 0, 0.95);
+      border-radius: 8px;
+      overflow: hidden;
+      z-index: 50;
+      display: none;
+    }
+
+    .custom-select-wrap.open .custom-select-options {
+      display: block;
+    }
+
+    .custom-option {
+      padding: 10px 14px;
+      font-size: 13px;
+      color: var(--bone-mute);
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+
+    .custom-option:hover, .custom-option.selected {
+      background: hsla(0, 0%, 100%, 0.06);
+      color: var(--bone);
+    }
+
+    .custom-option.selected {
+      font-weight: 600;
+      color: var(--accent);
+    }
+
+    .row-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+
+    .preset-chips {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .chip {
+      background: hsla(0, 0%, 100%, 0.035);
+      border: 1px solid var(--panel-border);
+      color: var(--bone-mute);
+      padding: 4px 9px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s var(--ease);
+    }
+
+    .chip:hover {
+      background: rgba(143, 180, 255, 0.1);
+      border-color: rgba(143, 180, 255, 0.3);
+      color: var(--accent);
+    }
+
+    /* Checkbox Cards Themed Like Quick Preset Chips */
+    .checkbox-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-top: 1px;
+    }
+
+    .checkbox-card {
+      background: hsla(0, 0%, 100%, 0.035);
+      border: 1px solid var(--panel-border);
+      border-radius: 6px;
+      padding: 7px 11px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 8px;
+      cursor: pointer;
+      user-select: none;
+      transition: all 0.2s var(--ease);
+    }
+
+    .checkbox-card:hover {
+      background: rgba(143, 180, 255, 0.08);
+      border-color: rgba(143, 180, 255, 0.3);
+    }
+
+    .checkbox-card input {
+      display: none;
+    }
+
+    .custom-checkmark {
+      height: 16px;
+      width: 16px;
+      background: #101217;
+      border: 1px solid var(--panel-border);
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s var(--ease);
+      flex-shrink: 0;
+    }
+
+    .checkbox-card:hover .custom-checkmark {
+      border-color: rgba(143, 180, 255, 0.5);
+    }
+
+    .checkbox-card input:checked ~ .custom-checkmark {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .custom-checkmark:after {
+      content: "";
+      display: none;
+      width: 3.5px;
+      height: 7px;
+      border: solid var(--accent-ink);
+      border-width: 0 1.8px 1.8px 0;
+      transform: rotate(45deg);
+      margin-bottom: 2px;
+    }
+
+    .checkbox-card input:checked ~ .custom-checkmark:after {
+      display: block;
+    }
+
+    .checkbox-title {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--bone-mute);
+      text-align: left;
+      transition: color 0.2s var(--ease);
+    }
+
+    .checkbox-card:hover .checkbox-title {
+      color: var(--accent);
+    }
+
+    .checkbox-card input:checked ~ .checkbox-title {
+      color: var(--bone);
+      font-weight: 600;
+    }
+
+    /* Buttons */
+    .btn-solid-primary {
+      background: var(--bone);
+      color: var(--ink);
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 13px;
+      border: none;
+      border-radius: 6px;
+      padding: 10px 16px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      box-shadow: 0 1px 0 hsla(0,0%,100%,.25) inset, 0 14px 28px -10px rgba(0,0,0,0.8);
+      transition: all 0.2s var(--ease);
+      margin-top: 10px;
+      flex-shrink: 0;
+    }
+
+    .btn-solid-primary:hover:not(:disabled) {
+      background: #ffffff;
+      transform: translateY(-1px);
+      box-shadow: 0 1px 0 #fff inset, 0 16px 36px -10px rgba(143, 180, 255, 0.4);
+    }
+
+    .btn-solid-primary:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    .btn-outline-action {
+      background: hsla(0, 0%, 100%, 0.04);
+      color: var(--bone);
+      border: 1px solid var(--panel-border);
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s var(--ease);
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      user-select: none;
+    }
+
+    .btn-outline-action:hover {
+      background: rgba(143, 180, 255, 0.12);
+      border-color: rgba(143, 180, 255, 0.3);
+      color: var(--accent);
+    }
+
+    /* Copy Button Animated States */
+    .btn-outline-action.copied {
+      background: rgba(52, 199, 89, 0.15) !important;
+      border-color: rgba(52, 199, 89, 0.35) !important;
+      color: var(--success) !important;
+      transform: scale(0.96);
+    }
+
+    /* Floating Toast Notification */
+    .toast-pill {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      background: #171920;
+      color: var(--bone);
+      border: 1px solid var(--panel-border);
+      box-shadow: 0 14px 34px -10px rgba(0, 0, 0, 0.95);
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 12.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      z-index: 100;
+      opacity: 0;
+      transform: translateY(12px);
+      pointer-events: none;
+      transition: opacity 0.25s var(--ease), transform 0.25s var(--ease);
+    }
+
+    .toast-pill.show {
+      opacity: 1;
+      transform: translateY(0);
+      pointer-events: auto;
+    }
+
+    .toast-pill.error {
+      border-color: rgba(255, 90, 90, 0.3);
+      color: var(--danger);
+    }
+
+    /* Terminal & Outcomes */
+    .terminal-box {
+      background: #08080a;
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      padding: 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: var(--bone-mute);
+      height: 280px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.65;
+    }
+
+    .token-card {
+      background: var(--panel-solid);
+      border: 1px solid var(--panel-border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 140px;
+      transition: all 0.2s var(--ease);
+    }
+
+    .token-card.success-card {
+      background: var(--panel-solid);
+      border-color: rgba(143, 180, 255, 0.25);
+    }
+
+    .token-card.error {
+      background: rgba(255, 90, 90, 0.04);
+      border-color: rgba(255, 90, 90, 0.25);
+    }
+
+    .token-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 12.5px;
+      color: var(--bone);
+      font-weight: 600;
+    }
+
+    .token-header.success {
+      color: var(--bone);
+    }
+
+    .token-header.success .token-badge-status {
+      color: var(--accent);
+    }
+
+    .token-header.error {
+      color: var(--danger);
+    }
+
+    .token-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11.5px;
+      background: #060608;
+      padding: 12px 14px;
+      border-radius: 6px;
+      color: var(--bone);
+      word-break: break-all;
+      border: 1px solid var(--panel-border);
+      min-height: 72px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+
+    .token-placeholder-text {
+      color: var(--bone-dim);
+      font-size: 12px;
+      font-style: italic;
+    }
+
+    /* History Table */
+    .history-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11.5px;
+      table-layout: fixed;
+    }
+
+    .history-table th {
+      text-align: left;
+      padding: 7px 8px;
+      color: var(--bone-dim);
+      border-bottom: 1px solid var(--panel-border);
+      font-weight: 500;
+      white-space: nowrap;
+    }
+
+    .history-table td {
+      padding: 7px 6px;
+      border-bottom: 1px solid hsla(0, 0%, 100%, 0.035);
+      color: var(--bone-mute);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .history-table td:last-child {
+      overflow: visible;
+      text-overflow: clip;
+    }
+
+    .history-table th:nth-child(1), .history-table td:nth-child(1) {
+      width: 62px;
+    }
+
+    .history-table th:nth-child(2), .history-table td:nth-child(2) {
+      width: auto;
+    }
+
+    .history-table th:nth-child(3), .history-table td:nth-child(3) {
+      width: 58px;
+      text-align: right;
+    }
+
+    .history-table th:nth-child(4), .history-table td:nth-child(4) {
+      width: 52px;
+      text-align: right;
+      padding-right: 2px;
+    }
+
+    .btn-table-copy {
+      padding: 3px 6px;
+      font-size: 10.5px;
+      border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 44px;
+      box-sizing: border-box;
+    }
+
+    .badge-success {
+      background: rgba(52, 199, 89, 0.12);
+      color: var(--success);
+      border: 1px solid rgba(52, 199, 89, 0.25);
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      display: inline-block;
+    }
+
+    .badge-fail {
+      background: rgba(255, 90, 90, 0.12);
+      color: var(--danger);
+      border: 1px solid rgba(255, 90, 90, 0.25);
+      padding: 2px 5px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      display: inline-block;
+    }
+
+    .timing-badge {
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--accent);
+      font-weight: 500;
+      font-size: 11px;
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(6, 6, 6, 0.2);
+      border-top-color: var(--ink);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      display: none;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Fixed Clean Footer */
+    footer {
+      height: 32px;
+      padding: 0 20px;
+      border-top: 1px solid var(--panel-border);
+      font-size: 11px;
+      color: var(--bone-dim);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      background: #08080a;
+      flex-shrink: 0;
+      box-sizing: border-box;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Top App Bar with Proper Padding -->
+  <header class="topbar">
+    <div class="brand-wrap">
+      <!-- Clean filled logo without border -->
+      <div class="logo-box">
+        <svg viewBox="0 0 24 24" fill="currentColor">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
+        </svg>
+      </div>
+      <div class="brand-name">cfsolve</div>
+    </div>
+
+    <div class="topbar-actions">
+      <div class="status-badge" id="hostStatusBadge">
+        <div class="dot-pulse"></div>
+        <span id="hostStatusText">Online</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Viewport Area -->
+  <main class="dashboard-content">
+    <!-- 4 Metric Cards with Diagonal Striped Hatch -->
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>SOLVE SUCCESS RATE</span>
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+        </div>
+        <div class="stat-val blue">100%</div>
+        <div class="stat-sub">JS engine emulation</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>ACTIVE PROFILES</span>
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/></svg>
+        </div>
+        <div class="stat-val" id="profileCountStat">1</div>
+        <div class="stat-sub">iOS & macOS WebKit profiles</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>AVG LATENCY</span>
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+        </div>
+        <div class="stat-val" id="avgLatencyStat">18.5s</div>
+        <div class="stat-sub">Full probe collection & clearance</div>
+      </div>
+
+      <div class="stat-card">
+        <div class="stat-label">
+          <span>TOTAL SOLVES</span>
+          <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>
+        </div>
+        <div class="stat-val" id="totalSolvesStat">4</div>
+        <div class="stat-sub">In current session</div>
+      </div>
+    </div>
+
+    <!-- Main Workbench (Solver Config + Terminal/Logs) -->
+    <div class="workbench-grid">
+      <!-- Left: Config -->
+      <div class="ui-panel">
+        <div class="ui-panel-header">
+          <span class="ui-panel-title">Session Configuration</span>
+          <span class="ui-panel-sub">Parameters & Routing</span>
+        </div>
+
+        <div class="ui-panel-body-scroll">
+          <div class="form-group">
+            <label>
+              Target Page URL *
+              <span class="hint">Page embedding the challenge</span>
+            </label>
+            <input type="text" id="pageUrl" placeholder="https://example.com/target-page" value="https://solvegate.io/demo/managed">
+          </div>
+
+          <!-- Preset Chips -->
+          <div class="form-group">
+            <label>Quick Presets</label>
+            <div class="preset-chips">
+              <div class="chip" onclick="applyPreset('https://solvegate.io/demo/managed', '0x4AAAAAAERLXPCYKEzyzZAh', false)">SolveGate (Managed)</div>
+              <div class="chip" onclick="applyPreset('https://solvegate.io/demo/invisible', '0x4AAAAAAER49t0sMxTcief0', false)">SolveGate (Invisible)</div>
+              <div class="chip" onclick="applyPreset('https://capskip.com/captcha-demo/cloudflare-turnstile/', '0x4AAAAAADogn3t3_JKwKkgS', false)">CapSkip (Turnstile)</div>
+              <div class="chip" onclick="applyPreset('https://capskip.com/captcha-demo/cloudflare-challenge/', '', false)">CapSkip (Challenge)</div>
+              <div class="chip" onclick="applyPreset('https://nowsecure.nl', '', false)">NowSecure (Interactive)</div>
+              <div class="chip" onclick="applyPreset('https://solvegate.io/demo/managed', '0x4AAAAAAERLXPCYKEzyzZAh', true)">Blank Mode (API)</div>
+            </div>
+          </div>
+
+          <div class="row-2">
+            <div class="form-group">
+              <label>
+                Sitekey
+                <span class="hint" id="sitekeyHint">Optional if page embeds it</span>
+              </label>
+              <input type="text" id="sitekey" placeholder="0x4AAAAAA..." value="0x4AAAAAAERLXPCYKEzyzZAh">
+            </div>
+
+            <!-- Custom Dropdown -->
+            <div class="form-group">
+              <label>Browser Fingerprint</label>
+              <div class="custom-select-wrap" id="customSelect">
+                <div class="custom-select-trigger" onclick="toggleDropdown()">
+                  <span id="selectedFpText">safari-26-ios.json</span>
+                  <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </div>
+                <div class="custom-select-options">
+                  <div class="custom-option selected" onclick="selectOption('safari-26-ios.json', 'safari-26-ios.json')">safari-26-ios.json (Included)</div>
+                  <div class="custom-option" onclick="selectOption('custom', 'Paste / Upload Custom JSON...')">Paste / Upload Custom JSON...</div>
+                </div>
+              </div>
+              <input type="hidden" id="fingerprint" value="safari-26-ios.json">
+            </div>
+          </div>
+
+          <!-- Custom Fingerprint Upload / Paste Area -->
+          <div class="form-group" id="customFpGroup" style="display: none;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <label>Custom Fingerprint JSON</label>
+              <label for="fpFileInput" class="btn-outline-action" style="cursor: pointer;">
+                <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                <span>Upload JSON File</span>
+              </label>
+              <input type="file" id="fpFileInput" accept=".json,application/json" style="display: none;" onchange="handleFpFileUpload(event)">
+            </div>
+            <textarea id="customFingerprintJson" rows="5" placeholder="Paste your browser fingerprint JSON content here, or upload a .json file..."></textarea>
+          </div>
+
+          <div class="row-2">
+            <div class="form-group">
+              <label>Widget Action (Optional)</label>
+              <input type="text" id="action" placeholder="login, submit, etc.">
+            </div>
+            <div class="form-group">
+              <label>Custom Data (cData)</label>
+              <input type="text" id="cdata" placeholder="cData string">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>
+              Proxy URL (Optional)
+              <span class="hint">HTTP / HTTPS / SOCKS5 / SOCKS5H</span>
+            </label>
+            <input type="text" id="proxy" placeholder="http://user:pass@host:port">
+          </div>
+
+          <!-- 2 in a Row Checkboxes with Right-Aligned Titles -->
+          <div class="checkbox-grid">
+            <label class="checkbox-card">
+              <input type="checkbox" id="blankPage" onchange="onBlankPageToggle()">
+              <span class="custom-checkmark"></span>
+              <span class="checkbox-title">Blank Page Mode</span>
+            </label>
+
+            <label class="checkbox-card">
+              <input type="checkbox" id="keepArtifacts">
+              <span class="custom-checkmark"></span>
+              <span class="checkbox-title">Keep Artifacts</span>
+            </label>
+          </div>
+        </div>
+
+        <button id="solveBtn" class="btn-solid-primary" onclick="startSolve()">
+          <div id="btnSpinner" class="spinner"></div>
+          <span id="btnText">Execute Challenge Solve</span>
+        </button>
+      </div>
+
+      <!-- Middle: Execution Console & Token Output -->
+      <div class="ui-panel">
+        <div class="ui-panel-header">
+          <span class="ui-panel-title">Execution Console</span>
+          <span id="terminalStatus" class="ui-panel-sub">Idle</span>
+        </div>
+
+        <div id="terminal" class="terminal-box" style="flex: 1; min-height: 180px; height: auto;">Waiting for execution...
+Select a target and click "Execute Challenge Solve".</div>
+
+        <div class="ui-panel-header" style="margin-top: 2px;">
+          <span class="ui-panel-title">Token Output</span>
+          <span id="tokenStatusSub" class="ui-panel-sub">Awaiting solve</span>
+        </div>
+
+        <!-- Token / Outcome Container (Themed Placeholder) -->
+        <div id="tokenContainer" class="token-card" style="flex-shrink: 0;">
+          <div class="token-header" id="tokenHeader">
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span id="outcomeIcon">
+                <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+              </span>
+              <span id="outcomeTitle">No Token Generated</span>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <span id="solveTimeBadge" class="timing-badge" style="display: none;">0ms</span>
+              <button id="copyBtn" class="btn-outline-action" style="display: none;" onclick="copyToken(this)">
+                <svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <span class="btn-copy-label">Copy</span>
+              </button>
+            </div>
+          </div>
+          <div id="tokenValue" class="token-val">
+            <span class="token-placeholder-text">Execute a solve session to extract a clearance token or Turnstile response.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Recent Solves History Full Panel -->
+      <div class="ui-panel">
+        <div class="ui-panel-header">
+          <span class="ui-panel-title">Recent Solves</span>
+          <span class="ui-panel-sub">Session History</span>
+        </div>
+
+        <div style="flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0;">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Status</th>
+                <th>Target</th>
+                <th>Duration</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="historyBody">
+              <tr id="emptyHistoryRow">
+                <td colspan="4" style="text-align: center; color: var(--bone-dim); padding: 20px;">
+                  No solves recorded yet in this session.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Non-intrusive Toast Pill Notification -->
+  <div id="toastPill" class="toast-pill">
+    <svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+    <span id="toastMsg">Notification</span>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <div>API Endpoint: <code>POST /api/solve</code></div>
+    <div>Cloudflare Challenge Automation System</div>
+  </footer>
+
+  <script>
+    // Non-intrusive Toast Function (Replaces all alerts)
+    let toastTimeout;
+    function showToast(msg, isError = false) {
+      const toast = document.getElementById('toastPill');
+      const toastMsg = document.getElementById('toastMsg');
+      toastMsg.innerText = msg;
+      
+      if (isError) {
+        toast.classList.add('error');
+      } else {
+        toast.classList.remove('error');
+      }
+
+      toast.classList.add('show');
+      clearTimeout(toastTimeout);
+      toastTimeout = setTimeout(() => {
+        toast.classList.remove('show');
+      }, 3000);
+    }
+
+    // Dynamic Animated Copy Button
+    function copyToken(btnEl) {
+      const val = document.getElementById('tokenValue').innerText;
+      copyDynamicText(btnEl, val, "Copy Token");
+    }
+
+    function copyDynamicText(btnEl, textToCopy, defaultLabel = "Copy") {
+      if (!textToCopy) return;
+      navigator.clipboard.writeText(textToCopy);
+      
+      const labelSpan = btnEl.querySelector('.btn-copy-label') || btnEl;
+      const originalText = labelSpan.innerText;
+      
+      btnEl.classList.add('copied');
+      labelSpan.innerText = "Copied!";
+      showToast("Token copied to clipboard!");
+
+      setTimeout(() => {
+        btnEl.classList.remove('copied');
+        labelSpan.innerText = originalText;
+      }, 1500);
+    }
+
+    // Custom Dropdown Handling
+    function toggleDropdown() {
+      document.getElementById('customSelect').classList.toggle('open');
+    }
+
+    function selectOption(value, label) {
+      document.getElementById('fingerprint').value = value;
+      document.getElementById('selectedFpText').innerText = label;
+      document.getElementById('customSelect').classList.remove('open');
+      
+      const options = document.querySelectorAll('.custom-option');
+      options.forEach(opt => opt.classList.remove('selected'));
+      event.target.classList.add('selected');
+
+      const customGroup = document.getElementById('customFpGroup');
+      if (value === 'custom') {
+        customGroup.style.display = 'flex';
+        document.getElementById('customFingerprintJson').focus();
+      } else {
+        customGroup.style.display = 'none';
+      }
+    }
+
+    document.addEventListener('click', function(e) {
+      const select = document.getElementById('customSelect');
+      if (!select.contains(e.target)) {
+        select.classList.remove('open');
+      }
+    });
+
+    function formatDuration(ms) {
+      if (!ms && ms !== 0) return "-";
+      if (ms < 1000) {
+        return `${ms}ms`;
+      }
+      const totalSec = ms / 1000;
+      if (totalSec < 60) {
+        return `${totalSec.toFixed(2)}s`;
+      }
+      const min = Math.floor(totalSec / 60);
+      const sec = Math.round(totalSec % 60);
+      return `${min}m ${sec}s`;
+    }
+
+    // Dynamic Hint Toggle (On Load & On Change)
+    function onBlankPageToggle() {
+      const isBlank = document.getElementById('blankPage').checked;
+      const hint = document.getElementById('sitekeyHint');
+      if (isBlank) {
+        hint.style.color = 'var(--warn)';
+        hint.innerText = "Required for Blank Page";
+      } else {
+        hint.style.color = 'var(--bone-dim)';
+        hint.innerText = "Optional if page embeds it";
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      onBlankPageToggle();
+    });
+
+    function handleFpFileUpload(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        try {
+          const parsed = JSON.parse(e.target.result);
+          document.getElementById('customFingerprintJson').value = JSON.stringify(parsed, null, 2);
+          showToast("Fingerprint JSON loaded successfully!");
+        } catch (err) {
+          showToast("Selected file is not valid JSON.", true);
+        }
+      };
+      reader.readAsText(file);
+    }
+
+    function applyPreset(url, sitekey, blank) {
+      document.getElementById('pageUrl').value = url;
+      document.getElementById('sitekey').value = sitekey;
+      document.getElementById('blankPage').checked = blank;
+      onBlankPageToggle();
+      showToast("Preset applied");
+    }
+
+    async function startSolve() {
+      const pageUrl = document.getElementById('pageUrl').value.trim();
+      const sitekey = document.getElementById('sitekey').value.trim();
+      const action = document.getElementById('action').value.trim();
+      const cdata = document.getElementById('cdata').value.trim();
+      const proxy = document.getElementById('proxy').value.trim();
+      const fingerprint = document.getElementById('fingerprint').value;
+      const customFingerprintJson = document.getElementById('customFingerprintJson').value.trim();
+      const blankPage = document.getElementById('blankPage').checked;
+      const keepArtifacts = document.getElementById('keepArtifacts').checked;
+
+      if (!pageUrl) {
+        showToast("Please provide a target page URL.", true);
+        document.getElementById('pageUrl').focus();
+        return;
+      }
+
+      if (blankPage && !sitekey) {
+        showToast("Blank Page Mode requires an explicit Sitekey.", true);
+        document.getElementById('sitekey').focus();
+        return;
+      }
+
+      if (fingerprint === 'custom' && !customFingerprintJson) {
+        showToast("Please paste your fingerprint JSON or upload a .json file.", true);
+        document.getElementById('customFingerprintJson').focus();
+        return;
+      }
+
+      const solveBtn = document.getElementById('solveBtn');
+      const btnSpinner = document.getElementById('btnSpinner');
+      const btnText = document.getElementById('btnText');
+      const terminal = document.getElementById('terminal');
+      const terminalStatus = document.getElementById('terminalStatus');
+      const tokenContainer = document.getElementById('tokenContainer');
+      const tokenHeader = document.getElementById('tokenHeader');
+      const tokenValue = document.getElementById('tokenValue');
+      const solveTimeBadge = document.getElementById('solveTimeBadge');
+      const outcomeTitle = document.getElementById('outcomeTitle');
+      const outcomeIcon = document.getElementById('outcomeIcon');
+      const copyBtn = document.getElementById('copyBtn');
+
+      solveBtn.disabled = true;
+      btnSpinner.style.display = 'block';
+      btnText.innerText = "Solving challenge...";
+      terminalStatus.innerText = "Running...";
+      tokenContainer.style.display = 'flex';
+      tokenContainer.className = "token-card";
+      tokenHeader.className = "token-header";
+      outcomeTitle.innerText = "Solving challenge...";
+      outcomeIcon.innerHTML = `<svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>`;
+      copyBtn.style.display = 'none';
+      solveTimeBadge.style.display = 'none';
+      tokenValue.innerHTML = `<span class="token-placeholder-text">Executing session... Waiting for challenge response.</span>`;
+
+      terminal.innerText = `[${new Date().toLocaleTimeString()}] Initiating session against:\nTarget: ${pageUrl}\nSitekey: ${sitekey || '(auto)'}\nBlank Page Mode: ${blankPage}\nFingerprint: ${fingerprint}\n\nExecuting challenge solver...`;
+
+      try {
+        const response = await fetch('/api/solve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page_url: pageUrl,
+            sitekey: sitekey || null,
+            action: action || null,
+            cdata: cdata || null,
+            proxy: proxy || null,
+            fingerprint: fingerprint,
+            custom_fingerprint_json: (fingerprint === 'custom') ? customFingerprintJson : null,
+            blank_page: blankPage,
+            keep_artifacts: keepArtifacts
+          })
+        });
+
+        const data = await response.json();
+        const humanTime = formatDuration(data.elapsed_ms);
+        solveTimeBadge.innerText = humanTime;
+
+        let logOutput = "";
+        if (data.stderr) logOutput += data.stderr + "\n\n";
+        if (data.stdout) logOutput += data.stdout;
+        if (!logOutput && data.error) logOutput = data.error;
+
+        terminal.innerText = logOutput || "Session completed.";
+        terminal.scrollTop = terminal.scrollHeight;
+
+        const tokenStatusSub = document.getElementById('tokenStatusSub');
+        if (data.success && data.token) {
+          terminalStatus.innerText = `Success in ${humanTime}`;
+          tokenStatusSub.innerText = `Extracted (${humanTime})`;
+          tokenValue.innerText = data.token;
+          outcomeTitle.innerText = data.is_clearance ? "Challenge Page Cleared (cf_clearance)" : "Turnstile Token Generated";
+          outcomeIcon.innerHTML = `<svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor" style="color: var(--accent);"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"/></svg>`;
+          tokenContainer.className = "token-card success-card";
+          tokenHeader.className = "token-header success";
+          copyBtn.style.display = "inline-flex";
+          solveTimeBadge.style.display = "inline-block";
+          showToast("Challenge solved successfully!");
+        } else {
+          terminalStatus.innerText = `Failed (${humanTime})`;
+          tokenStatusSub.innerText = `Failed`;
+          outcomeTitle.innerText = "Solve Error";
+          outcomeIcon.innerHTML = `<svg width="15" height="15" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M6 18L18 6M6 6l12 12"/></svg>`;
+          tokenValue.innerText = data.error || data.stderr || "No token returned.";
+          tokenContainer.className = "token-card error";
+          tokenHeader.className = "token-header error";
+          copyBtn.style.display = "none";
+          solveTimeBadge.style.display = "inline-block";
+          showToast("Challenge solve failed.", true);
+        }
+
+        refreshHistory();
+
+      } catch (err) {
+        terminal.innerText += `\n\n[Network Error]: ${err.message}`;
+        terminalStatus.innerText = "Error";
+        showToast(`Network Error: ${err.message}`, true);
+      } finally {
+        solveBtn.disabled = false;
+        btnSpinner.style.display = 'none';
+        btnText.innerText = "Execute Challenge Solve";
+      }
+    }
+
+    async function refreshHistory() {
+      try {
+        const res = await fetch('/api/history');
+        const data = await res.json();
+        const tbody = document.getElementById('historyBody');
+        if (!data.history || data.history.length === 0) {
+          tbody.innerHTML = `
+            <tr id="emptyHistoryRow">
+              <td colspan="4" style="text-align: center; color: var(--bone-dim); padding: 20px;">
+                No solves recorded yet in this session.
+              </td>
+            </tr>`;
+          return;
+        }
+
+        tbody.innerHTML = data.history.map(h => `
+          <tr>
+            <td>
+              <span class="${h.success ? 'badge-success' : 'badge-fail'}">
+                ${h.success ? 'SOLVED' : 'FAILED'}
+              </span>
+            </td>
+            <td title="${h.url}">
+              ${h.url}
+            </td>
+            <td class="timing-badge">${formatDuration(h.elapsed_ms)}</td>
+            <td>
+              ${h.token ? `<button class="btn-outline-action btn-table-copy" onclick="copyDynamicText(this, '${h.token}')"><span class="btn-copy-label">Copy</span></button>` : '-'}
+            </td>
+          </tr>
+        `).join('');
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function updateSystemStatus() {
+      try {
+        const res = await fetch('/api/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        const textEl = document.getElementById('hostStatusText');
+        if (textEl && data.arch && data.os) {
+          textEl.innerText = `${data.arch} / ${data.os} Online`;
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    // Load system status and existing history on initial page visit
+    document.addEventListener('DOMContentLoaded', () => {
+      updateSystemStatus();
+      refreshHistory();
+    });
+  </script>
+</body>
+</html>

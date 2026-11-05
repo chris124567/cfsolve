@@ -10,8 +10,8 @@ autotests = false
 # and `Error`. The tools in this repository use the rest.
 [features]
 default = ["internals"]
-# The analysis modules behind the solver (deobfuscation, the VM, payloads, and transport), and
-# the capture proxy, which records the challenge payloads a real browser sends.
+# The analysis modules behind the solver (deobfuscation, the VM, payloads, and transport), the
+# web dashboard, and the capture proxy.
 internals = [
     "dep:bytes",
     "dep:http-body-util",
@@ -22,6 +22,11 @@ internals = [
     "dep:rustls-native-certs",
     "dep:tokio-rustls",
 ]
+
+[[bin]]
+name = "dashboard"
+path = "src/bin/dashboard/main.rs"
+required-features = ["internals"]
 
 [dependencies]
 anyhow = "1.0.104"
