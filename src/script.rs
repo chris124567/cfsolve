@@ -4,8 +4,11 @@ use std::sync::OnceLock;
 
 use anyhow::Result;
 
+use swc_core::ecma::ast::CallExpr;
+use swc_core::ecma::visit::{Visit, VisitWith};
+
 use crate::js::ast::{self, ParsedScript};
-use crate::vm::{Definition, Listing, Machine};
+use crate::vm::{self, Definition, Listing, Machine};
 
 /// A parsed iframe script shared by encoder extraction, parameter merging, scene recovery, and
 /// VM analysis. Rejects scripts with recoverable parse errors.
@@ -39,6 +42,39 @@ impl Source {
             }
         };
         Machine::try_new(definition)
+    }
+
+    /// The base64 text of the first literal program the script passes to its program runner, as
+    /// in `<global>.<runner>("<base64>")`. The runner's name is random.
+    #[must_use]
+    pub fn embedded_program(&self) -> Option<String> {
+        struct First<'name> {
+            runner: &'name str,
+            found: Option<String>,
+        }
+
+        impl Visit for First<'_> {
+            fn visit_call_expr(&mut self, call: &CallExpr) {
+                if self.found.is_none()
+                    && vm::calls_runner(call, self.runner)
+                    && let Some(program) = call
+                        .args
+                        .first()
+                        .and_then(|argument| ast::static_str(&argument.expr))
+                {
+                    self.found = Some(program.to_owned());
+                }
+                call.visit_children_with(self);
+            }
+        }
+
+        let runner = vm::runner_name(&self.parsed.script)?;
+        let mut first = First {
+            runner: &runner,
+            found: None,
+        };
+        self.parsed.script.visit_with(&mut first);
+        first.found
     }
 
     /// Disassembles `program` from its entry using [`Machine::disassemble`]. Probe analysis

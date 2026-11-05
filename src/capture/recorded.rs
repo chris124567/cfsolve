@@ -17,7 +17,6 @@ use crate::script::Source;
 use crate::{challenge, deobfuscate};
 
 /// Session data from `capture.json`: the iframe page, POSTs, and decoded payloads.
-/// `scripts/cdp_capture.mjs` writes the same format without `cfChl`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CapturedSession {
