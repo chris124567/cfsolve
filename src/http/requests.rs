@@ -1,6 +1,8 @@
 //! Builds requests used by the challenge flow. [`super::HeaderOrder`] supplies headers and
 //! ordering; each request supplies values such as its referrer.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use url::Url;
 use url::form_urlencoded::Serializer;
@@ -134,6 +136,12 @@ pub async fn fetch_page_image(
     Ok(metrics)
 }
 
+/// How long a challenge POST may take, including any connection it opens and its response body.
+/// Cloudflare answers these within half a second, but occasionally acknowledges a complete request
+/// and never responds. Giving up sooner than the client's general timeout lets the caller retry
+/// sooner; the error is still a network error.
+const POST_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Posts an encoded challenge body to `post_url` from `document` using `referer`. Does not
 /// follow redirects, preserving the response for the caller.
 async fn encoded_post(
@@ -149,6 +157,7 @@ async fn encoded_post(
     let origin = document.origin().ascii_serialization();
     let request = decode::preserve_encoding(client.http.post(post_url.as_str()))
         .redirect(Policy::none())
+        .timeout(POST_TIMEOUT)
         .body(encoded_body);
     let supplied = [
         ("content-length", Some(length.as_str())),
