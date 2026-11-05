@@ -13,9 +13,9 @@ use swc_core::common::{
     SyntaxContext,
 };
 use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, BinaryOp, BlockStmt, Expr, ExprOrSpread, ExprStmt, FnDecl, Function, Id,
-    Ident, KeyValueProp, Lit, MemberExpr, MemberProp, ObjectLit, ParenExpr, Pat, PropName,
-    PropOrSpread, Script, Stmt, UnaryOp, VarDeclarator,
+    ArrowExpr, AssignExpr, AssignOp, BinaryOp, BlockStmt, Expr, ExprOrSpread, ExprStmt, FnDecl,
+    Function, Id, Ident, KeyValueProp, Lit, MemberExpr, MemberProp, ObjectLit, ParenExpr, Pat,
+    PropName, PropOrSpread, Script, Stmt, UnaryOp, VarDeclarator,
 };
 use swc_core::ecma::parser::{Parser, StringInput, Syntax};
 use swc_core::ecma::visit::{Visit, VisitMutWith, VisitWith};
@@ -276,6 +276,54 @@ pub(crate) fn assignment(expression: &Expr) -> Option<(Id, &Expr)> {
     Some((assignment.left.as_ident()?.to_id(), &assignment.right))
 }
 
+/// The identifiers a statement assigns, in order, each with its value if the statement certainly
+/// assigns a literal or `undefined`. Only top-level assignments of an expression statement,
+/// alone or in a sequence, are certain; any other assignment, such as one in a branch or after
+/// `&&`, makes the identifier's value unknown. Assignments inside nested functions are ignored,
+/// since they happen whenever the function runs.
+#[must_use]
+pub(crate) fn constant_assignments(statement: &Stmt) -> Vec<(String, Option<Expr>)> {
+    struct Assigned(Vec<(String, Option<Expr>)>);
+    impl Visit for Assigned {
+        fn visit_assign_expr(&mut self, assign: &AssignExpr) {
+            if let Some(name) = assign.left.as_ident() {
+                self.0.push((name.sym.to_string(), None));
+            }
+            assign.visit_children_with(self);
+        }
+        fn visit_function(&mut self, _: &Function) {}
+        fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    }
+
+    let mut found = Assigned(Vec::new());
+    let Stmt::Expr(statement) = statement else {
+        statement.visit_with(&mut found);
+        return found.0;
+    };
+    let expressions = match statement.expr.unwrap_parens() {
+        Expr::Seq(sequence) => sequence
+            .exprs
+            .iter()
+            .map(|expression| &**expression)
+            .collect(),
+        expression => vec![expression],
+    };
+    for expression in expressions {
+        let Some((name, value)) = assignment(expression.unwrap_parens()) else {
+            expression.visit_with(&mut found);
+            continue;
+        };
+        value.visit_with(&mut found);
+        let value = match value.unwrap_parens() {
+            value @ Expr::Lit(_) => Some(value.clone()),
+            value @ Expr::Ident(ident) if ident.sym == "undefined" => Some(value.clone()),
+            _ => None,
+        };
+        found.0.push((name.0.to_string(), value));
+    }
+    found.0
+}
+
 /// Matches `callee(args)` when the callee is a plain identifier.
 #[must_use]
 pub(crate) fn direct_call(expression: &Expr) -> Option<(&Ident, &[ExprOrSpread])> {
@@ -402,6 +450,44 @@ pub(crate) fn parenthesized(expression: Box<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn statement(source: &str) -> Stmt {
+        parse_javascript("t.js", source)
+            .unwrap()
+            .script
+            .body
+            .remove(0)
+    }
+
+    #[test]
+    fn tracks_only_certain_literal_assignments() {
+        let assigned = |source: &str| -> Vec<(String, Option<String>)> {
+            constant_assignments(&statement(source))
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name,
+                        value.map(|value| swc_core::ecma::codegen::to_code(&value)),
+                    )
+                })
+                .collect()
+        };
+        let known = |name: &str, value: &str| (name.to_owned(), Some(value.to_owned()));
+        let unknown = |name: &str| (name.to_owned(), None);
+
+        assert_eq!(assigned("x = 1;"), [known("x", "1")]);
+        assert_eq!(assigned("x = undefined;"), [known("x", "undefined")]);
+        assert_eq!(
+            assigned("x = 1, y = \"a\";"),
+            [known("x", "1"), known("y", "\"a\"")]
+        );
+        assert_eq!(assigned("x = f();"), [unknown("x")]);
+        assert_eq!(assigned("x += 1;"), [unknown("x")]);
+        assert_eq!(assigned("a && (x = 1);"), [unknown("x")]);
+        assert_eq!(assigned("if (a) x = 1;"), [unknown("x")]);
+        assert_eq!(assigned("x = (y = 2);"), [unknown("y"), unknown("x")]);
+        assert_eq!(assigned("f(function() { x = 1; });"), []);
+    }
 
     /// Only a static key reads through a computed string literal.
     #[test]
