@@ -13,6 +13,7 @@ use crate::browser::Page;
 use crate::challenge::program::{ExtractedProgram, PreparedSession};
 use crate::challenge::state::{Intervals, ScriptState};
 use crate::challenge::{payload, source};
+use crate::deobfuscate::Decoding;
 use crate::embedding_page::extra_params::{self, ApiScript, LoaderResponse};
 use crate::embedding_page::page::{Layout, PageSignals, RenderedPage, Widget};
 use crate::engine::{self, Lines};
@@ -43,6 +44,8 @@ pub(crate) struct Fetched {
     pub iframe: Iframe,
     /// The iframe's inline challenge script, as served.
     pub javascript: String,
+    /// The same script decoded for stack recovery.
+    pub decoding: Decoding,
     /// The deobfuscated script, parsed once.
     pub source: Source,
     /// Original VM dispatch-case positions used for stack recovery.
@@ -287,12 +290,16 @@ pub(super) async fn fetch(
         iframe.html.len(),
         javascript.len()
     ));
+    // The stack probe's frames are read from the script as decoded, which its own thread
+    // decodes meanwhile.
+    let decoding = Decoding::start(javascript.clone())?;
     let (text, cases) = deobfuscate(sink, javascript.clone()).await?;
     sink.artifact("iframe.deobfuscated.js", text.as_bytes())?;
     let source = Source::try_new(&text).context("parsing the deobfuscated iframe")?;
     Ok(Fetched {
         iframe,
         javascript,
+        decoding,
         source,
         cases,
         navigation,
