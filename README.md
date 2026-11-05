@@ -46,6 +46,9 @@ the challenge page. To pick one widget when the page has several, pass its
 sitekey, with its action and cData when the site sets them. With `--sitekey`,
 it fails on a challenge page.
 
+A page that renders its widget from JavaScript has no container to find, so
+pass the sitekey there as well.
+
 ```sh
 ./target/release/challenge --page 'https://example.com/login' /tmp/solve \
   --solve --fingerprint profiles/safari-26-ios.json \
