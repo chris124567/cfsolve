@@ -521,8 +521,8 @@ mod tests {
         let loaded = "sec-fetch-dest user-agent accept referer sec-fetch-site sec-fetch-mode \
                       accept-language priority accept-encoding";
         let expected = [
-            "sec-fetch-dest user-agent upgrade-insecure-requests accept sec-fetch-site \
-             sec-fetch-mode accept-language priority accept-encoding",
+            "sec-fetch-dest user-agent accept sec-fetch-site sec-fetch-mode accept-language \
+             priority accept-encoding",
             loaded,
             "accept sec-fetch-site priority sec-fetch-mode user-agent accept-language \
              sec-fetch-dest referer accept-encoding",
