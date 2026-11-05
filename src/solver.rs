@@ -18,7 +18,8 @@ use crate::session::{self, Clearance, Discard, Expect, Outcome, Sink};
 /// How one solve reaches the network, and where its diagnostics go.
 #[derive(Clone, Default)]
 pub struct Options {
-    /// An `http://`, `https://`, `socks5://`, or `socks5h://` proxy for every request.
+    /// An `http://`, `https://`, `socks5://`, or `socks5h://` proxy for every request. Without
+    /// one, requests connect directly, whatever the system's proxy settings or `HTTPS_PROXY`.
     pub proxy: Option<String>,
     /// Destination for artifacts and progress messages. Both are discarded if absent.
     pub sink: Option<Arc<dyn Sink>>,

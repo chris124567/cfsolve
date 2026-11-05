@@ -63,7 +63,7 @@ site's real URL.
 | `--sitekey <key>` | Select a widget by sitekey. |
 | `--action <value>`, `--cdata <value>` | Override the widget's action and cData. This needs `--sitekey`. |
 | `--blank-page` | Skip loading the page. Render the widget on a blank page at the page URL. This needs `--solve` and `--sitekey`. |
-| `--proxy <url>` | Send every request through an `http://`, `https://`, `socks5://`, or `socks5h://` proxy. Put credentials in the URL, as in `socks5h://user:password@host:1080`. |
+| `--proxy <url>` | Send every request through an `http://`, `https://`, `socks5://`, or `socks5h://` proxy. Put credentials in the URL, as in `socks5h://user:password@host:1080`. Without it, cfsolve connects directly, ignoring system proxy settings and `HTTPS_PROXY`. |
 | `-h`, `--help` | Show help. |
 
 ## Library
@@ -185,6 +185,10 @@ let options = cfsolve::Options {
     ..Default::default()
 };
 ```
+
+Without a proxy, a solve connects directly. It ignores system proxy settings and
+`HTTPS_PROXY`, which would otherwise send it out from another address than your own
+requests.
 
 Library operations are silent by default. For progress messages and debug files,
 implement `Sink` and set `options.sink` to `Some(Arc::new(your_sink))`.
