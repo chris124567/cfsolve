@@ -9,11 +9,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock as StdRwLock;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use cfsolve::http::BrowserClient;
 use cfsolve::{Browser, Options, Outcome, PageSource, Sink, Turnstile, Widget};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -81,6 +81,7 @@ impl Sink for MemorySink {
 pub struct AppState {
     pub history: Arc<RwLock<Vec<SolveRecord>>>,
     pub profiles_dir: PathBuf,
+    pub persistent_client: Arc<tokio::sync::Mutex<Option<BrowserClient>>>,
 }
 
 fn full_body(text: impl Into<Bytes>) -> BoxBody<Bytes, Infallible> {
@@ -271,9 +272,29 @@ async fn solve_challenge(req: SolveRequest, state: Arc<AppState>) -> Response<Bo
         artifacts_dir: run_dir,
     };
 
+    let client = {
+        let mut guard = state.persistent_client.lock().await;
+        if req.proxy.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none() {
+            if guard.is_none() {
+                if let Ok(c) = browser.create_client(None) {
+                    *guard = Some(c);
+                }
+            }
+            if let Some(c) = guard.as_ref() {
+                c.clear_cookies();
+                Some(c.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
     let options = Options {
         proxy: req.proxy.clone().filter(|s| !s.trim().is_empty()),
         sink: Some(Arc::new(sink)),
+        client,
     };
 
     let parsed_url = match req.page_url.trim().parse::<cfsolve::Url>() {
@@ -365,6 +386,7 @@ fn main() -> Result<()> {
     let state = Arc::new(AppState {
         history: Arc::new(RwLock::new(Vec::new())),
         profiles_dir,
+        persistent_client: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

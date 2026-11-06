@@ -32,6 +32,7 @@ const PROXY_CA: &str = "CFSOLVE_PROXY_CA";
 
 /// HTTP client configured from the browser fingerprint. Shared by all session requests to
 /// preserve cookies and transport settings.
+#[derive(Clone)]
 pub struct BrowserClient {
     pub(super) http: Client,
     /// The cookies the browser holds, `cf_clearance` among them once a challenge page clears.
@@ -40,6 +41,14 @@ pub struct BrowserClient {
     pub(super) own: HeaderMap,
     pub(super) requests: Requests,
     pub(super) engine: Engine,
+}
+
+impl BrowserClient {
+    /// Clears all cookies from the client's cookie jar so connection pools and TLS sessions
+    /// can be reused without retaining state between solves.
+    pub fn clear_cookies(&self) {
+        self.jar.clear();
+    }
 }
 
 /// Browser request settings beyond the transport profile, which vary by browser version.
@@ -116,6 +125,9 @@ impl BrowserClient {
             .cookie_provider(Arc::clone(&jar))
             .redirect(Policy::limited(5))
             .timeout(Duration::from_secs(30))
+            .tcp_nodelay(true)
+            .pool_idle_timeout(Duration::from_secs(120))
+            .pool_max_idle_per_host(32)
             // Without a proxy, connect directly. A system proxy would send the solve out from
             // another address than the caller's own requests, and the clearance is bound to it.
             .no_proxy();

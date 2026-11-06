@@ -144,6 +144,7 @@ async fn main() -> Result<()> {
     let recording = Options {
         proxy: None,
         sink: Some(sink.clone()),
+        ..Default::default()
     };
     check(
         "send_first_payload(managed, widget)",

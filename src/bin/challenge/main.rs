@@ -25,6 +25,7 @@ fn main() -> Result<()> {
     let options = Options {
         proxy: arguments.proxy,
         sink: Some(Arc::new(artifacts)),
+        ..Default::default()
     };
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {

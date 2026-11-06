@@ -23,6 +23,8 @@ pub struct Options {
     pub proxy: Option<String>,
     /// Destination for artifacts and progress messages. Both are discarded if absent.
     pub sink: Option<Arc<dyn Sink>>,
+    /// An optional persistent client to share connection pools and TLS session state.
+    pub client: Option<BrowserClient>,
 }
 
 /// A Turnstile widget to solve, and the page it is on.
@@ -203,8 +205,18 @@ impl Browser {
     }
 
     fn client(&self, options: &Options) -> Result<BrowserClient, Error> {
+        if let Some(client) = &options.client {
+            return Ok(client.clone());
+        }
         self.transport
             .client(options.proxy.as_deref())
+            .map_err(Error::Config)
+    }
+
+    /// Creates a new persistent [`BrowserClient`] for this browser and proxy setting.
+    pub fn create_client(&self, proxy: Option<&str>) -> Result<BrowserClient, Error> {
+        self.transport
+            .client(proxy)
             .map_err(Error::Config)
     }
 }

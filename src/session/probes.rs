@@ -31,8 +31,8 @@ use crate::stage2::replay::{self, Replay};
 use crate::stage2::trace::Trace;
 
 /// Timeout for host reachability fetches. Browsers report these hosts as unreachable within
-/// milliseconds.
-const REACHABILITY_TIMEOUT: Duration = Duration::from_secs(5);
+/// milliseconds, so a short deadline keeps the probe from stalling the solve.
+const REACHABILITY_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// A probe kind's duration when nothing else gives one.
 const DEFAULT_DURATION_MS: i64 = 2;
