@@ -5,7 +5,7 @@ widgets and challenge pages without a headless browser. It returns a Turnstile
 token for widgets or a `cf_clearance` cookie for challenge pages.
 
 Turnstile widgets can be solved using the page URL, the sitekey, and optionally the
-page's HTML (this should not be required in most cases).  Challenge pages require a direct
+page's HTML (this should not be required in most cases). Challenge pages require a direct
 fetch or the HTML of the page.
 
 ## Browser profiles
@@ -18,7 +18,7 @@ stored as JSON in a directory. Keep each profile with its directory when you
 copy. Producing these files requires some manual (or AI) effort though it can
 be greatly aided by solving challenges in a real web browser with the proxy
 set to the address of a running `capture-proxy`, which records the decoded
-payloads sent to Cloudflare.  Currently only Safari and Chrome(ium) profile
+payloads sent to Cloudflare. Currently only Safari and Chrome(ium) profile
 types are supported.
 
 ## Building
