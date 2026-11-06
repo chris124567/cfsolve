@@ -180,7 +180,7 @@ async fn mitm_rewrites_iframes_and_rewraps_posts() {
     tokio::spawn(run_upstream(upstream, Arc::clone(&posts), html.clone()));
     let loopback = Loopback::start(vec!["localhost".to_owned()]).await;
     let proxy = &loopback.proxy;
-    let proxy_modulus = proxy.sessions.proxy_key.modulus.clone();
+    let proxy_modulus = proxy.recorder.sessions.proxy_key.modulus.clone();
 
     // A plain iframe comes back with the proxy modulus in place of the real one.
     let get = format!("GET /iframe HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
@@ -235,9 +235,9 @@ async fn mitm_rewrites_iframes_and_rewraps_posts() {
 
     // The session log uses the format expected by `build_profile`, including the decoded
     // response body.
-    proxy.sessions.finish_extractions().await;
+    proxy.recorder.finish_extractions().await;
     let out = &proxy.config.out_dir;
-    proxy.sessions.write_all(out);
+    proxy.recorder.sessions.write_all(out);
     let session = out.join("sessions/session-0000");
     let read_text = |name: &str| std::fs::read_to_string(session.join(name)).unwrap();
     let read_json = |name: &str| -> Value { serde_json::from_str(&read_text(name)).unwrap() };
@@ -258,7 +258,7 @@ async fn mitm_rewrites_iframes_and_rewraps_posts() {
 
     // The traffic log records each connection's ClientHello and each request's headers in their
     // original order.
-    let path = proxy.traffic().write(out).unwrap();
+    let path = proxy.recorder.traffic().write(out).unwrap();
     let traffic: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let connections = traffic["connections"].as_array().unwrap();
     assert_eq!(connections.len(), 4);
@@ -281,7 +281,7 @@ async fn mitm_rewrites_iframes_and_rewraps_posts() {
             ["host", host], ["content-type", "text/plain;charset=UTF-8"], ["cf-chl", "tok456"],
             ["content-length", browser_body.len().to_string()], ["connection", "close"],
         ],
-        "receivedMs": post["receivedMs"], "answeredMs": post["answeredMs"],
+        "ordered": true, "receivedMs": post["receivedMs"], "answeredMs": post["answeredMs"],
     });
     assert_eq!(*post, expected);
 

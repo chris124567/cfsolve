@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -115,9 +115,12 @@ impl CapturedSession {
     }
 }
 
-/// Traffic and complete sessions from one proxy run directory.
+/// Traffic and complete sessions from one capture: a proxy run's directory, or a [`Recorder`]'s.
+///
+/// [`Recorder`]: super::Recorder
 pub struct Recording {
-    pub(super) dir: PathBuf,
+    /// What notes about the recording call it: its directory, say.
+    pub(super) label: String,
     pub(super) traffic: Traffic,
     pub(super) sessions: BTreeMap<String, CapturedSession>,
     /// Excluded sessions and the reasons they were skipped.
@@ -132,6 +135,33 @@ struct SessionLog {
 }
 
 impl Recording {
+    pub(super) fn new(
+        label: String,
+        traffic: Traffic,
+        sessions: BTreeMap<String, CapturedSession>,
+        skipped: Vec<String>,
+    ) -> Self {
+        Self {
+            label,
+            traffic,
+            sessions,
+            skipped,
+        }
+    }
+
+    /// The complete sessions, by name, in the order they opened.
+    pub fn sessions(&self) -> impl Iterator<Item = (&str, &CapturedSession)> {
+        self.sessions
+            .iter()
+            .map(|(name, session)| (name.as_str(), session))
+    }
+
+    /// Why each session left out of the recording was.
+    #[must_use]
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
+    }
+
     /// Reads the proxy output directory `dir`, skipping incomplete session captures.
     pub fn read(dir: &Path) -> Result<Self> {
         let traffic: Traffic = read_json(&dir.join("traffic.json"))?;
@@ -156,12 +186,12 @@ impl Recording {
             let capture = CapturedSession::read(&session_dir.join("capture.json"))?;
             sessions.insert(name, capture);
         }
-        Ok(Self {
-            dir: dir.to_owned(),
+        Ok(Self::new(
+            dir.display().to_string(),
             traffic,
             sessions,
             skipped,
-        })
+        ))
     }
 
     /// Groups POSTs by the `cf-chl` header shared by all POSTs in a session.

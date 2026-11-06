@@ -3,11 +3,13 @@
 //! Each rewritten iframe GET opens a session with the real modulus and an alphabet read by a
 //! fast scan. Background extraction checks that alphabet and recovers the key-transform secret
 //! from the original HTML. Challenge POSTs use the session bound to their ray, or bind to the
-//! latest unbound session. Shutdown waits for extraction, decrypts payloads, and writes logs.
+//! latest unbound session. Finishing waits for extraction, decrypts payloads, and writes logs or
+//! hands back the captures.
 //!
 //! Each session directory holds the original and rewritten HTML, the full log `session.json`,
 //! and `capture.json`, which `cargo run --example build_profile` turns into `answers.json`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -20,6 +22,7 @@ use swc_core::ecma::ast::Script;
 use tokio::task::JoinSet;
 use url::Url;
 
+use super::recorded::CapturedSession;
 use super::rsa::{ProxyKey, Rewrapped};
 use crate::challenge::codec::{Codec, KEY_LENGTH};
 use crate::challenge::program::{self, PreparedSession};
@@ -43,10 +46,13 @@ pub(super) struct Iframe {
     pub(super) original: String,
     #[serde(skip)]
     pub(super) rewritten: String,
-    // Body sizes before and after rewriting, as observed by the browser.
-    pub(super) upstream_encoded_bytes: u64,
+    // Body sizes before and after rewriting, as observed by the browser. Encoded sizes are known
+    // only where the recorder sees the wire, as the proxy does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) upstream_encoded_bytes: Option<u64>,
     pub(super) upstream_decoded_bytes: u64,
-    pub(super) observed_encoded_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) observed_encoded_bytes: Option<u64>,
     pub(super) observed_decoded_bytes: u64,
 }
 
@@ -204,6 +210,29 @@ impl Sessions {
         self.proxy_key.rewrap(body, alphabet, &iframe.real_modulus)
     }
 
+    /// Decrypts each session's payloads and returns the complete sessions' captures by session
+    /// name, with notes on the sessions left out.
+    pub(super) fn captured(&self) -> (BTreeMap<String, CapturedSession>, Vec<String>) {
+        let (mut captured, mut skipped) = (BTreeMap::new(), Vec::new());
+        for (index, session) in self.lock().iter_mut().enumerate() {
+            session.read_payloads(&self.proxy_key);
+            let name = format!("session-{index:04}");
+            if !session.complete {
+                skipped.push(format!(
+                    "{name}: incomplete capture: {}",
+                    session.notes.join("; ")
+                ));
+                continue;
+            }
+            // The capture reads as `capture.json` does.
+            let capture = serde_json::to_value(session.capture_json())
+                .and_then(serde_json::from_value)
+                .expect("a session's capture reads back");
+            captured.insert(name, capture);
+        }
+        (captured, skipped)
+    }
+
     /// Decrypts each session's payloads and writes its log under `out_dir`.
     pub(super) fn write_all(&self, out_dir: &Path) {
         for (index, session) in self.lock().iter_mut().enumerate() {
@@ -222,6 +251,12 @@ impl Sessions {
 }
 
 impl Session {
+    /// Notes the iframe's encoded size from upstream and as re-encoded for the browser.
+    pub(super) fn note_encoding(&mut self, upstream: u64, observed: u64) {
+        self.iframe.upstream_encoded_bytes = Some(upstream);
+        self.iframe.observed_encoded_bytes = Some(observed);
+    }
+
     /// Marks capture as incomplete and records the reason.
     pub(super) fn poison(&mut self, note: &str) {
         self.complete = false;
@@ -288,6 +323,13 @@ impl Session {
         write_file(&dir.join("rewritten.html"), &self.iframe.rewritten)?;
         let log = serde_json::to_string_pretty(self)?;
         write_file(&dir.join("session.json"), log)?;
+        let path = dir.join("capture.json");
+        write_file(&path, serde_json::to_string_pretty(&self.capture_json())?)?;
+        Ok(path)
+    }
+
+    /// The session's `capture.json`.
+    fn capture_json(&self) -> CaptureJson<'_> {
         let mut capture = CaptureJson {
             iframe_html: &self.iframe.original,
             posts: Vec::new(),
@@ -309,9 +351,7 @@ impl Session {
                 });
             }
         }
-        let path = dir.join("capture.json");
-        write_file(&path, serde_json::to_string_pretty(&capture)?)?;
-        Ok(path)
+        capture
     }
 }
 
