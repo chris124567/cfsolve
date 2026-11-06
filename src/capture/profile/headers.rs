@@ -32,7 +32,8 @@ impl Headers {
     pub(super) fn observe<'r>(requests: impl IntoIterator<Item = &'r Request>) -> Self {
         let mut orders: BTreeMap<RequestKind, Tally<Vec<String>>> = BTreeMap::new();
         let mut identity: IndexMap<String, Tally<String>> = IndexMap::new();
-        for request in requests {
+        // A request whose header order wasn't seen teaches neither.
+        for request in requests.into_iter().filter(|request| request.ordered) {
             let Some(kind) = kind(request) else {
                 continue;
             };
@@ -242,5 +243,19 @@ mod tests {
                 ("user-agent", "Mozilla/5.0")
             ]
         );
+    }
+
+    /// A browser's own interception reports headers without their order: they teach none.
+    #[test]
+    fn unordered_requests_teach_no_order() {
+        let mut unordered = request(
+            "POST",
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/b/fo/1/2",
+            &[("sec-fetch-dest", "empty"), ("user-agent", "Mozilla/5.0")],
+        );
+        unordered.ordered = false;
+        let headers = Headers::observe([&unordered]);
+        assert!(headers.orders.is_empty());
+        assert!(headers.identity.is_empty());
     }
 }

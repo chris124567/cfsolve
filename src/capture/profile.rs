@@ -44,9 +44,8 @@ use crate::stage2::registry::{Kind, Operation};
 pub fn fill(profile: &mut Value, recordings: &[Recording]) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     for recording in recordings {
-        let dir = recording.dir.display();
         for skipped in &recording.skipped {
-            notes.push(format!("{dir}: left out {skipped}"));
+            notes.push(format!("{}: left out {skipped}", recording.label));
         }
     }
     let requests = recordings
@@ -62,9 +61,8 @@ pub fn fill(profile: &mut Value, recordings: &[Recording]) -> Result<Vec<String>
     };
     for recording in recordings {
         for (name, session) in &recording.sessions {
-            let path = recording.dir.join(name);
             for problem in reported.read(recording, session) {
-                notes.push(format!("{}: {problem:#}", path.display()));
+                notes.push(format!("{}/{name}: {problem:#}", recording.label));
             }
         }
     }
