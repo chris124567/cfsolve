@@ -58,6 +58,7 @@ pub struct SolveRequest {
 }
 
 struct MemorySink {
+    start: Instant,
     logs: Arc<Mutex<Vec<String>>>,
     artifacts_dir: Option<PathBuf>,
 }
@@ -73,7 +74,8 @@ impl Sink for MemorySink {
 
     fn progress(&self, message: &str) {
         if let Ok(mut list) = self.logs.lock() {
-            list.push(message.to_string());
+            let elapsed = self.start.elapsed().as_secs_f64();
+            list.push(format!("[+{elapsed:5.2}s] {message}"));
         }
     }
 }
@@ -268,6 +270,7 @@ async fn solve_challenge(req: SolveRequest, state: Arc<AppState>) -> Response<Bo
 
     let log_lines = Arc::new(Mutex::new(Vec::new()));
     let sink = MemorySink {
+        start: start_time,
         logs: log_lines.clone(),
         artifacts_dir: run_dir,
     };
