@@ -6,6 +6,16 @@ license = "MIT"
 default-run = "cfsolve"
 autotests = false
 
+# The integration tests are one target so a shared V8/engine harness warms up once
+# for all cases. Per-file filters select modules: `cargo test --test integration vm::`.
+[[test]]
+name = "integration"
+path = "tests/main.rs"
+
+[dev-dependencies]
+# The deobfuscator's differential tests compare its output's behavior in V8.
+v8 = "=152.2.0"
+
 # Without default features, the library is the solver alone: `Browser`, `Options`, `Outcome`
 # and `Error`. The tools in this repository use the rest.
 [features]
@@ -24,6 +34,7 @@ internals = [
 ]
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0.104"
 base64 = "0.22.1"
 chrono = "0.4.42"
@@ -52,6 +63,7 @@ swc_core = { version = "54.0.0", features = ["common", "ecma_ast", "ecma_visit",
 swc_ecma_transforms = "44.0.0"
 swc_ecma_utils = "25.0.0"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util", "signal"] }
+futures-util = "0.3"
 url = "2.5.8"
 # `Url` leaves an upstream proxy's credentials percent-encoded.
 percent-encoding = "2.3.2"
@@ -71,15 +83,21 @@ http-body-util = { version = "0.1", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "logging", "ring"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"], optional = true }
 rcgen = { version = "0.14", features = ["x509-parser"], optional = true }
+imbl = "7.0.2"
+
+# The address space `Allocator`'s chunks come from, reserved and committed on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory", "Win32_System_Performance"] }
+
+# Installs `cfsolve::Allocator` as its global allocator, so it runs in a process of its own.
+[[test]]
+name = "arena"
+path = "tests/arena.rs"
+required-features = ["internals"]
 
 # `CLOCK_MONOTONIC`, the time base Chrome's `performance.now()` is derived from.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
-
-# `QueryPerformanceCounter`, the time base Chrome's `performance.now()` is derived from on
-# Windows.
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
 
 # Chrome 154's ClientHello: ML-DSA and GREASE signature algorithms and the
 # trust_anchors extension, which the published crates cannot send. See the
@@ -88,6 +106,12 @@ windows-sys = { version = "0.61", features = ["Win32_System_Performance"] }
 btls-sys = { path = "vendor/btls-sys" }
 wreq = { path = "vendor/wreq" }
 http2 = { path = "vendor/http2" }
+
+# The solver is CPU-bound in per-request work (SWC rewrites, the VM disassembler), so
+# cross-crate inlining and one codegen unit matter to every solve's latency.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 # Full debug info for swc dominates link time and target/ size. Line tables
 # keep file:line in this crate's backtraces; dependencies get none.

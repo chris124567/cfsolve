@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use tokio::sync::oneshot;
 
 /// Stack size for recursive deobfuscation, matching the usual Linux main-thread stack.
-const STACK_SIZE: usize = 8 << 20;
+pub(crate) const STACK_SIZE: usize = 8 << 20;
 
 /// Runs `work` on a new thread named `name` and awaits its result without blocking the runtime.
 pub(crate) async fn run<T: Send + 'static>(

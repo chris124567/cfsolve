@@ -1,15 +1,39 @@
 //! A session's VM, found in its script and ready to decode instructions.
 
+use std::cell::Cell;
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use anyhow::Result;
 use swc_core::ecma::ast::{BlockStmt, Class, Script, Stmt};
 
 use super::HashMap;
-use super::dispatch::{Decoded, Dispatch};
+use super::dispatch::Dispatch;
 use super::extract::{self, Finder};
 use super::interpret::{self, Decrypted, Invocation, MAXIMUM_PATHS, Way};
 use super::output::{Cause, Failure, Instruction, Position};
 use super::session::Session;
 use super::value::Value;
+
+thread_local! {
+    static DISPATCH_NS: Cell<u128> = const { Cell::new(0) };
+    static EXPLORE_NS: Cell<u128> = const { Cell::new(0) };
+    static WAYS_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Count and time spent decoding dispatch opcodes versus exploring handler paths.
+pub(crate) fn take_ways_profile() -> (u64, u128, u128) {
+    (
+        WAYS_COUNT.with(|cell| cell.replace(0)),
+        DISPATCH_NS.with(|cell| cell.replace(0)),
+        EXPLORE_NS.with(|cell| cell.replace(0)),
+    )
+}
+
+fn profile_steps() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CFSOLVE_STEP_LOG").is_some())
+}
 
 /// The VM class, enclosing function body, opcode decoder, and statements executed before
 /// its scope is entered.
@@ -44,7 +68,7 @@ impl Definition {
 
 /// One session's VM, ready to decode instructions.
 pub struct Machine<'definition> {
-    definition: &'definition Definition,
+    pub(super) definition: &'definition Definition,
     pub(super) session: Session<'definition>,
 }
 
@@ -132,33 +156,44 @@ impl<'definition> Machine<'definition> {
         if pc as usize >= loaded.program.len() {
             return Err(fail(Cause::PastEnd));
         }
-        let Decoded { opcode, key: next } = self
+        let measure = profile_steps();
+        let started = Instant::now();
+        let decoded = self
             .definition
             .dispatch
             .decode(&self.session, loaded.program, pc, key)
             .map_err(|reason| fail(Cause::Undecoded { reason }))?;
+        if measure {
+            DISPATCH_NS.with(|cell| cell.set(cell.get() + started.elapsed().as_nanos()));
+        }
         let handler = self
             .session
             .handlers
-            .get(&opcode)
+            .get(&decoded.opcode)
             .copied()
-            .ok_or_else(|| fail(Cause::NoHandler { opcode }))?;
+            .ok_or_else(|| fail(Cause::NoHandler { opcode: decoded.opcode }))?;
         let invocation = Invocation {
             session: &self.session,
             program: loaded.program,
             fields: &loaded.fields,
             decrypted: &loaded.decrypted,
             pc: pc + 1,
-            key: next,
+            key: decoded.key,
             handler,
             known,
         };
+        let started = Instant::now();
         let ways = interpret::explore(&invocation).ok_or_else(|| {
             fail(Cause::TooManyPaths {
-                opcode,
+                opcode: decoded.opcode,
                 limit: MAXIMUM_PATHS,
             })
         })?;
+        if measure {
+            EXPLORE_NS.with(|cell| cell.set(cell.get() + started.elapsed().as_nanos()));
+            WAYS_COUNT.with(|cell| cell.set(cell.get() + 1));
+        }
+        let (opcode, ways) = (decoded.opcode, ways);
         // Paths where the handler throws reject these operands. If every path throws, the bytes
         // do not form an instruction.
         if ways.taken.is_empty() {

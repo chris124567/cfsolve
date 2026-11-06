@@ -32,6 +32,7 @@ const PROXY_CA: &str = "CFSOLVE_PROXY_CA";
 
 /// HTTP client configured from the browser fingerprint. Shared by all session requests to
 /// preserve cookies and transport settings.
+#[derive(Clone)]
 pub struct BrowserClient {
     pub(super) http: Client,
     /// The cookies the browser holds, `cf_clearance` among them once a challenge page clears.
@@ -142,6 +143,14 @@ impl BrowserClient {
     #[must_use]
     pub fn cookies(&self, url: &Url) -> Vec<Cookie<'static>> {
         self.jar.matches(url.as_str()).collect()
+    }
+
+    /// Removes every cookie from the client's jar, leaving it empty. A solve starts from a
+    /// clean cookie context even though the client (and its connection pool) is cached for
+    /// TLS reuse; stale cookies from a failed earlier solve must not steer later solves into
+    /// challenge variants the extractor cannot handle.
+    pub fn clear_cookies(&self) {
+        self.jar.clear();
     }
 
     /// Stores the cookie a `Set-Cookie` header from `url` sets.

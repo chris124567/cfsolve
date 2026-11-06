@@ -1,0 +1,4 @@
+# Keep CRLF out of shell scripts: `/bin/sh` cannot exec a shebang that ends in \r,
+# which broke local `docker build` builds of Windows checkouts.
+*.sh text eol=lf
+*.json text eol=lf

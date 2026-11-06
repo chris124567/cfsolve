@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::{fs, mem};
 
 use anyhow::{Context, Result, ensure};
@@ -29,10 +30,14 @@ use crate::stage2::registry::Facts;
 use crate::stage2::replay::Answers;
 
 /// A validated profile shared by solves. Each solve starts a fresh browser session.
+///
+/// Cloning is cheap: every field is behind an [`Arc`], so a solve can take an owned copy
+/// onto its own blocking thread.
+#[derive(Clone)]
 pub struct Browser {
-    pub(crate) transport: Transport,
-    pub(crate) page: Page,
-    pub(crate) solve: Solve,
+    pub(crate) transport: Arc<Transport>,
+    pub(crate) page: Arc<Page>,
+    pub(crate) solve: Arc<Solve>,
 }
 
 /// Browser settings needed by the page that contains the widget.
@@ -119,6 +124,15 @@ struct Fingerprint {
 }
 
 impl Browser {
+    /// Returns the User-Agent header from the browser transport profile.
+    #[must_use]
+    pub fn user_agent(&self) -> Option<&str> {
+        self.transport
+            .headers
+            .get(USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+    }
+
     /// Loads the fingerprint at `path` and the stored answers it names, relative to its directory.
     pub fn read(path: impl AsRef<Path>) -> Result<Self, Error> {
         let load = || {
@@ -193,15 +207,15 @@ impl Browser {
                 "the navigator has no numeric `hardwareConcurrency`: give it in the stored answers or `second.facts.navigator`",
             )?;
         Ok(Self {
-            transport,
-            page,
-            solve: Solve {
+            transport: Arc::new(transport),
+            page: Arc::new(page),
+            solve: Arc::new(Solve {
                 profile,
                 hardware_concurrency,
                 answers,
                 challenge_page_answers,
                 viewport: fingerprint.interaction,
-            },
+            }),
         })
     }
 }

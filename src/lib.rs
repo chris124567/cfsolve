@@ -35,6 +35,7 @@
     allow(dead_code, unreachable_pub, unused_imports)
 )]
 
+mod arena;
 mod browser;
 mod candidates;
 mod deep_stack;
@@ -43,6 +44,7 @@ mod embedding_page;
 mod engine;
 mod error;
 mod listing;
+pub(crate) mod perf_stamp;
 mod performance_clock;
 mod random_id;
 mod resource_timing;
@@ -68,7 +70,10 @@ pub mod stage2;
 #[doc(hidden)]
 pub mod vm;
 
+pub use arena::Allocator;
 pub use browser::Browser;
+#[doc(hidden)]
+pub use deobfuscate::Decoding;
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub use deobfuscate::{Deobfuscated, Unconverged, deobfuscate};

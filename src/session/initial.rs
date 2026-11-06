@@ -1,7 +1,10 @@
 //! Prepares the first payload: renders the embedding page, fetches and parses the iframe, and
 //! merges page parameters with iframe state.
 
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::mem;
+use std::sync::{LazyLock, RwLock};
 
 use anyhow::{Context, Result};
 use url::Url;
@@ -13,6 +16,7 @@ use crate::browser::Page;
 use crate::challenge::program::{ExtractedProgram, PreparedSession};
 use crate::challenge::state::{Intervals, ScriptState};
 use crate::challenge::{payload, source};
+use crate::deobfuscate::Decoding;
 use crate::embedding_page::extra_params::{self, ApiScript, LoaderResponse};
 use crate::embedding_page::page::{Layout, PageSignals, RenderedPage, Widget};
 use crate::engine::{self, Lines};
@@ -26,6 +30,18 @@ use crate::stage2::replay::Globals;
 use crate::{deep_stack, performance_clock};
 
 /// Default loader URL for pages that load Turnstile dynamically without a script tag.
+
+static DEOBFUSCATION_CACHE: LazyLock<RwLock<HashMap<[u8; 32], (String, CaseOpcodes)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static LOADER_CACHE: LazyLock<RwLock<HashMap<String, (ApiScript, u64, u64)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Prevents a cold burst from fetching and parsing the same loader once per request. The cache
+/// is checked again after acquiring this lock, so only the first miss does network work.
+static LOADER_FETCH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 const LOADER: &str = "https://challenges.cloudflare.com/turnstile/v0/api.js";
 
 /// Page context for the widget session.
@@ -43,6 +59,8 @@ pub(crate) struct Fetched {
     pub iframe: Iframe,
     /// The iframe's inline challenge script, as served.
     pub javascript: String,
+    /// The same script decoded for stack recovery.
+    pub decoding: Decoding,
     /// The deobfuscated script, parsed once.
     pub source: Source,
     /// Original VM dispatch-case positions used for stack recovery.
@@ -238,6 +256,16 @@ pub(crate) async fn fetch_loader(
     policy: ReferrerPolicy,
     facts: &Page,
 ) -> Result<(ApiScript, LoadTiming)> {
+    let url_str = url.as_str().to_string();
+    if let Some(cached) = cached_loader(&url_str) {
+        return Ok(cached);
+    }
+
+    let _fetch_guard = LOADER_FETCH_LOCK.lock().await;
+    if let Some(cached) = cached_loader(&url_str) {
+        return Ok(cached);
+    }
+
     let referer = policy.referrer(page, &url);
     let timer = Timer::start();
     let response = http::fetch_script(client, &url, load, page, referer.as_deref())
@@ -264,7 +292,35 @@ pub(crate) async fn fetch_loader(
         phases: facts.resource_timing.phases,
     };
     let script = ApiScript::from_source(url, &source, response, &facts.timeline, client.engine())?;
+    {
+        if let Ok(mut cache) = LOADER_CACHE.write() {
+            cache.insert(
+                url_str,
+                (script.clone(), network.encoded_bytes, network.decoded_bytes),
+            );
+        }
+    }
     Ok((script, timing))
+}
+
+/// Returns loader metadata with browser-like cached resource timing.
+fn cached_loader(url: &str) -> Option<(ApiScript, LoadTiming)> {
+    let cache = LOADER_CACHE.read().ok()?;
+    let (cached_script, encoded_bytes, _decoded_bytes) = cache.get(url)?;
+    let started_ms = performance_clock::epoch_ms();
+    let duration_ms = 15.0;
+    let mut script = cached_script.clone();
+    script.start_time_ms = started_ms as f64;
+    script.response.duration_ms = duration_ms;
+    let timing = LoadTiming {
+        url: url.to_owned(),
+        started_ms,
+        duration_ms,
+        waiting_ms: 10.0,
+        receiving_ms: 5.0,
+        body_bytes: *encoded_bytes,
+    };
+    Some((script, timing))
 }
 
 /// Fetches the iframe at `iframe_url` with the navigation referrer `referrer`.
@@ -276,6 +332,11 @@ pub(super) async fn fetch(
 ) -> Result<Fetched> {
     let timer = Timer::start();
     let iframe = http::fetch_iframe(client, iframe_url, referrer.as_deref()).await?;
+    crate::perf_stamp::stamp(&format!(
+        "http::fetch_iframe output=Iframe(html_bytes={}, encoded_bytes={})",
+        iframe.html.len(),
+        iframe.navigation.encoded_bytes
+    ));
     let navigation = timer.overall(iframe.url.as_str(), iframe.navigation.encoded_bytes);
     sink.artifact("iframe.html", iframe.html.as_bytes())?;
     let javascript = source::inline_javascript(&iframe.html)?;
@@ -287,12 +348,21 @@ pub(super) async fn fetch(
         iframe.html.len(),
         javascript.len()
     ));
+    // The stack probe's frames are read from the script as decoded, which its own thread
+    // decodes meanwhile.
+    let decoding = Decoding::start(javascript.clone())?;
     let (text, cases) = deobfuscate(sink, javascript.clone()).await?;
+    crate::perf_stamp::stamp(&format!(
+        "session::initial::deobfuscate output=JavaScript(bytes={})",
+        text.len()
+    ));
     sink.artifact("iframe.deobfuscated.js", text.as_bytes())?;
     let source = Source::try_new(&text).context("parsing the deobfuscated iframe")?;
+    crate::perf_stamp::stamp("script::Source::try_new output=Source");
     Ok(Fetched {
         iframe,
         javascript,
+        decoding,
         source,
         cases,
         navigation,
@@ -305,6 +375,19 @@ pub(super) async fn deobfuscate(
     sink: &dyn Sink,
     javascript: String,
 ) -> Result<(String, CaseOpcodes)> {
+    let mut hasher = Sha256::new();
+    hasher.update(javascript.as_bytes());
+    let key: [u8; 32] = hasher.finalize().into();
+
+    {
+        if let Ok(cache) = DEOBFUSCATION_CACHE.read() {
+            if let Some(cached) = cache.get(&key) {
+                sink.progress("Using cached deobfuscated JavaScript");
+                return Ok(cached.clone());
+            }
+        }
+    }
+
     let (deobfuscated, cases) = deep_stack::run("deobfuscation", move || {
         call_stack::deobfuscate_with_cases(javascript)
     })
@@ -312,7 +395,13 @@ pub(super) async fn deobfuscate(
     if let Some(unconverged) = deobfuscated.unconverged {
         sink.progress(&format!("Warning: {unconverged}"));
     }
-    Ok((deobfuscated.text, cases))
+    let res = (deobfuscated.text, cases);
+    {
+        if let Ok(mut cache) = DEOBFUSCATION_CACHE.write() {
+            cache.insert(key, res.clone());
+        }
+    }
+    Ok(res)
 }
 
 /// Merges collected page parameters into session options and recovers iframe state, returning

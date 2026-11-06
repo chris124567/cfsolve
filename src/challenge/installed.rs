@@ -57,6 +57,15 @@ pub struct Installed {
 pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
     let listing = source.disassemble(program)?;
     let initialization = initialization(&listing);
+    if std::env::var_os("CFSOLVE_DET_LOG").is_some() {
+        eprintln!(
+            "installed::read listing bytes={} instructions={} functions={} init={}",
+            program.len(),
+            listing.instructions.len(),
+            listing.functions.len(),
+            initialization.len()
+        );
+    }
     let mut frame: Frame<Held> = Frame::default();
     let mut objects: HashMap<u32, JsObject> = HashMap::new();
     let mut installed = Installed::default();
@@ -106,6 +115,9 @@ pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
                         installed.window.insert(key, json!([]));
                     }
                     (Known::Ext(Held::Window), Known::Ext(Held::Built(constant))) => {
+                        if std::env::var_os("CFSOLVE_DET_LOG").is_some() {
+                            eprintln!("installed::read built {key} = {constant}");
+                        }
                         installed.built.insert(key, constant);
                     }
                     (Known::Ext(Held::Options), Known::Object(id)) => {
@@ -118,6 +130,14 @@ pub fn read(source: &Source, program: &[u8]) -> Result<Installed> {
         }
     }
     audit::read(&listing, &mut installed);
+    if std::env::var_os("CFSOLVE_DET_LOG").is_some() {
+        eprintln!(
+            "installed::read summary built={:?} window_keys={:?} options={:?}",
+            installed.built,
+            installed.window.keys().collect::<Vec<_>>(),
+            installed.options.keys().collect::<Vec<_>>()
+        );
+    }
     Ok(installed)
 }
 

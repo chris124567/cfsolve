@@ -40,5 +40,6 @@ mod testing;
 mod unused_bindings;
 
 pub(crate) use encoded_strings::{Encoded, encode as encode_string, inline_strings};
+pub use pipeline::Decoding;
 pub use pipeline::{Deobfuscated, Unconverged, deobfuscate};
 pub(crate) use pipeline::{deobfuscate_with, read_decoded};

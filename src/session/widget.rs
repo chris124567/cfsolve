@@ -48,10 +48,10 @@ pub struct Clearance {
 }
 
 /// What a solve expects its page to be.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Expect<'widget> {
+#[derive(Clone, Debug)]
+pub(crate) enum Expect {
     /// A page with a Turnstile widget. Uses the supplied widget or the page's first widget.
-    Widget(Option<&'widget Widget>),
+    Widget(Option<Widget>),
     ChallengePage,
     /// Accepts either page type. Clears a challenge page or solves the page's first widget.
     Either,
@@ -90,7 +90,7 @@ pub(crate) async fn native(
     document: PageDocument,
     navigation: LoadTiming,
     page: &Page,
-    expect: Expect<'_>,
+    expect: Expect,
     solve: &Solve,
 ) -> Result<Outcome> {
     let landing = land(client, sink, document, navigation, page, expect).await?;
@@ -115,7 +115,7 @@ pub(crate) async fn send_first_payload(
     document: PageDocument,
     navigation: LoadTiming,
     page: &Page,
-    expect: Expect<'_>,
+    expect: Expect,
 ) -> Result<()> {
     let landing = land(client, sink, document, navigation, page, expect).await?;
     start_widget(client, sink, page, landing.embedding_page()).await?;
@@ -145,22 +145,22 @@ async fn land(
     document: PageDocument,
     navigation: LoadTiming,
     page: &Page,
-    expect: Expect<'_>,
+    expect: Expect,
 ) -> Result<Landing> {
     let status = document.status;
     let Some(challenge) = ChallengePage::parse(&document.html, &document.url)? else {
         if !status.is_success() {
             bail!(Error::Blocked { status });
         }
-        let widget = match expect {
-            Expect::Widget(widget) => widget,
+        let widget = match &expect {
+            Expect::Widget(widget) => widget.as_ref(),
             Expect::ChallengePage => bail!(Error::NotChallenged),
             Expect::Either => None,
         };
         let embedding_page = initial::render_page(client, sink, page, document, widget).await?;
         return Ok(Landing::Site(embedding_page));
     };
-    if let Expect::Widget(_) = expect {
+    if matches!(expect, Expect::Widget(_)) {
         bail!(Error::Challenged { status });
     }
     sink.progress(&format!(
@@ -194,11 +194,22 @@ async fn start_widget<'caller>(
         .referrer_policy
         .referrer(&embedding_page.page.url, &iframe_url);
     let fetched = initial::fetch(client, sink, iframe_url, referrer).await?;
+    crate::perf_stamp::stamp("session::initial::fetch output=Fetched");
     let prepared = PreparedSession::try_new(&fetched.source, &fetched.iframe.url)?;
+    crate::perf_stamp::stamp("challenge::PreparedSession::try_new output=PreparedSession");
     let (program, merged) = initial::merge(sink, &fetched, page, embedding_page, prepared)?;
+    crate::perf_stamp::stamp(&format!(
+        "session::initial::merge output=(ExtractedProgram, Merged(payload_fields={}))",
+        merged.first.len()
+    ));
     save_encoder(sink, &program)?;
     let encoder = program.session_encoder()?;
+    crate::perf_stamp::stamp("ExtractedProgram::session_encoder output=SessionEncoder");
     let body = encoder.encode(&merged.first);
+    crate::perf_stamp::stamp(&format!(
+        "SessionEncoder::encode output=String(bytes={})",
+        body.len()
+    ));
     save_request(sink, &program.request, &fetched.iframe.url, Some(&body))?;
     let channel = Channel {
         client,
@@ -208,7 +219,15 @@ async fn start_widget<'caller>(
         encoder: &encoder,
     };
     let returned = channel.post(body, Stage::Initial).await?;
+    crate::perf_stamp::stamp(&format!(
+        "Channel::post(Initial) output=PostResult(program_bytes={})",
+        returned.program.len()
+    ));
     let analysis = analyze_probes(sink, &fetched.source, &returned.program)?;
+    crate::perf_stamp::stamp(&format!(
+        "analyze_probes output=Analysis(probes={})",
+        analysis.plan().probes().len()
+    ));
     Ok(WidgetSession {
         client,
         sink,
@@ -233,6 +252,10 @@ fn analyze_probes(sink: &dyn Sink, source: &Source, program: &[u8]) -> Result<An
         .iter()
         .filter(|probe| probe.operation.is_some())
         .count();
+    crate::perf_stamp::stamp(&format!(
+        "Operation::recognize output=recognized({implemented}/{})",
+        probes.len()
+    ));
     sink.progress(&format!(
         "Recovered {} ordered probes; {implemented} have native collection implementations",
         probes.len()
@@ -359,7 +382,12 @@ impl WidgetSession<'_> {
     /// The program's message to the embedding page, and its listing.
     fn outcome(&self, returned: &PostResult, stage: Stage) -> Result<(ProgramOutcome, Listing)> {
         let listing = self.fetched.source.disassemble(&returned.program)?;
+        crate::perf_stamp::stamp(&format!(
+            "Source::disassemble output=Listing(instructions={})",
+            listing.instructions.len()
+        ));
         let outcome = ProgramOutcome::of(&listing);
+        crate::perf_stamp::stamp(&format!("ProgramOutcome::of output={outcome}"));
         self.sink
             .progress(&format!("{}: {outcome}", stage.response()));
         Ok((outcome, listing))
@@ -383,10 +411,18 @@ impl WidgetSession<'_> {
     /// Answers probes and any requested checkbox program, through the completion token.
     async fn solve(&self, embedding_page: &EmbeddingPage, solve: &Solve) -> Result<Completion> {
         let mut submission = probes::prepare(self, solve).await?;
+        crate::perf_stamp::stamp(&format!(
+            "session::probes::prepare output=ProbeSubmission(payload_fields={})",
+            submission.payload.plaintext.len()
+        ));
         let returned = self
             .channel()
             .submit(&submission.payload, Stage::Probes)
             .await?;
+        crate::perf_stamp::stamp(&format!(
+            "Channel::submit(Probes) output=PostResult(program_bytes={})",
+            returned.program.len()
+        ));
         // The checkbox program builds on the payload object as it stands after the send.
         let environment = self
             .merged
@@ -394,6 +430,7 @@ impl WidgetSession<'_> {
         let layout = &self.analysis.plan().payload;
         layout.after_send(&mut submission.payload.plaintext, environment)?;
         let (outcome, listing) = self.outcome(&returned, Stage::Probes)?;
+        crate::perf_stamp::stamp("WidgetSession::outcome output=(ProgramOutcome, Listing)");
         let checkbox_program = match outcome {
             ProgramOutcome::Complete { token } => return self.complete(token, listing, &returned),
             ProgramOutcome::Interaction => crate::stage2::interaction::recover(&listing)?,
@@ -408,6 +445,10 @@ impl WidgetSession<'_> {
             .position_in_embedding_page(&embedding_page.layout, &submission.geometry);
         let result =
             interaction::collect(self, &checkbox_program, &submission, solve, &viewport).await?;
+        crate::perf_stamp::stamp(&format!(
+            "session::interaction::collect output=InteractionResult(events={})",
+            result.input_events.len()
+        ));
         let final_payload = interaction::payload(
             &checkbox_program,
             &self.merged,
@@ -416,6 +457,10 @@ impl WidgetSession<'_> {
             &returned.fetch,
             &solve.profile.document,
         )?;
+        crate::perf_stamp::stamp(&format!(
+            "session::interaction::payload output=Submission(payload_fields={})",
+            final_payload.plaintext.len()
+        ));
         let returned = self
             .channel()
             .submit(&final_payload, Stage::Interaction)

@@ -109,7 +109,14 @@ impl Channel<'_> {
         let name = format!("{}payload.json", stage.prefix());
         self.sink.json(&name, &submission.plaintext)?;
         let body = self.encoder.encode(&submission.plaintext);
+        crate::perf_stamp::stamp(&format!(
+            "SessionEncoder::encode({stage:?}) output=String(bytes={})",
+            body.len()
+        ));
         timing::sleep_until(submission.send_at).await;
+        crate::perf_stamp::stamp(&format!(
+            "session::timing::sleep_until({stage:?}) output=()"
+        ));
         self.post(body, stage).await
     }
 
@@ -141,6 +148,10 @@ impl Channel<'_> {
         let (body, network) = http::read_encoded(response)
             .await
             .context("reading challenge POST response")?;
+        crate::perf_stamp::stamp(&format!(
+            "http::read_encoded({stage:?}) output=(body_bytes={}, status={status})",
+            body.len()
+        ));
         sink.json(&format!("{name}-network.json"), &network)?;
         let fetch = timer.phased(url.as_str(), waiting_ms, network.encoded_bytes);
         sink.artifact(&format!("{name}.bin"), &body)?;
@@ -155,6 +166,10 @@ impl Channel<'_> {
             ));
         }
         let text = codec::decode_response(&body, request.ray()?)?;
+        crate::perf_stamp::stamp(&format!(
+            "codec::decode_response({stage:?}) output=Text(bytes={})",
+            text.len()
+        ));
         sink.artifact(&format!("{name}.decoded.txt"), &text)?;
         let received_ms = performance_clock::epoch_ms();
         let program = STANDARD.decode(text).with_context(|| {
@@ -163,6 +178,10 @@ impl Channel<'_> {
                 stage.response().to_lowercase()
             )
         })?;
+        crate::perf_stamp::stamp(&format!(
+            "base64::decode({stage:?}) output=Program(bytes={})",
+            program.len()
+        ));
         Ok(PostResult {
             program,
             received_ms,

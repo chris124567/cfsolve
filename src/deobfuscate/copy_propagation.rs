@@ -15,7 +15,7 @@ use swc_core::ecma::ast::{
 };
 use swc_core::ecma::visit::{VisitMut, VisitMutWith};
 
-use super::analysis::hoisting::{self, Hoisted, Hoisting};
+use super::analysis::hoisting::{self, Hoisted, Hoisting, Persistent};
 use super::analysis::{Analysis, Bindings};
 use super::{HashMap, HashSet, removal};
 
@@ -38,7 +38,7 @@ struct PropagateCopies<'bindings> {
     bindings: &'bindings Bindings,
     /// Bindings with exactly one assignment that has run on every path to this node. Includes
     /// replacement values when known. Shares storage with declaration snapshots until changed.
-    hoisting: Hoisting<Rc<HashMap<Id, Option<Expr>>>>,
+    hoisting: Hoisting<Persistent<Id, Option<Rc<Expr>>>>,
     /// Single-write function declarations, which hold their value from the start of their
     /// scope.
     functions: HashSet<Id>,
@@ -55,7 +55,7 @@ impl VisitMut for PropagateCopies<'_> {
             && let Some(Some(value)) = self.hoisting.facts.get(&identifier.to_id())
         {
             *self.substituted.entry(identifier.to_id()).or_default() += 1;
-            *expression = value.clone();
+            *expression = (**value).clone();
             self.changed = true;
         }
     }
@@ -107,7 +107,7 @@ impl VisitMut for PropagateCopies<'_> {
 }
 
 impl Hoisted for PropagateCopies<'_> {
-    type Facts = Rc<HashMap<Id, Option<Expr>>>;
+    type Facts = Persistent<Id, Option<Rc<Expr>>>;
 
     fn hoisting(&mut self) -> &mut Hoisting<Self::Facts> {
         &mut self.hoisting
@@ -148,11 +148,11 @@ impl PropagateCopies<'_> {
         if !self.bindings.is_written_once(&target) || self.bindings.is_mapped_parameter(&target) {
             return;
         }
-        let value = self.is_stable(value).then(|| value.clone());
+        let value = self.is_stable(value).then(|| Rc::new(value.clone()));
         if value.is_some() {
             self.substituted.entry(target.clone()).or_default();
         }
-        Rc::make_mut(&mut self.hoisting.facts).insert(target, value);
+        self.hoisting.facts.insert(target, value);
     }
 
     /// Excludes regex literals, which have identity and state. A copied binding must already

@@ -16,6 +16,8 @@
 use std::mem;
 use std::rc::Rc;
 
+use imbl::shared_ptr::RcK;
+use rustc_hash::FxBuildHasher;
 use swc_core::ecma::ast::{BlockStmt, Decl, Function, Id, Ident, Stmt};
 use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
 
@@ -37,6 +39,19 @@ impl HoistFacts for HashSet<Id> {
 impl<V: Clone> HoistFacts for HashMap<Id, V> {
     fn meet(&mut self, other: &Self) {
         self.retain(|id, _| other.contains_key(id));
+    }
+}
+
+/// A persistent map: hoisting keeps a copy of the facts for every statement list and declaration
+/// it passes, which shares rather than copies one of these.
+pub(crate) type Persistent<K, V> = imbl::GenericHashMap<K, V, FxBuildHasher, RcK>;
+
+/// Facts about bindings, kept where every incoming path agrees on the binding.
+impl<V: Clone> HoistFacts for Persistent<Id, V> {
+    fn meet(&mut self, other: &Self) {
+        if !self.ptr_eq(other) {
+            self.retain(|id, _| other.contains_key(id));
+        }
     }
 }
 
