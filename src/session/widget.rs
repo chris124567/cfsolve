@@ -340,7 +340,8 @@ impl WidgetSession<'_> {
     #[must_use]
     pub(crate) fn clock_resolution(&self) -> Resolution {
         match (self.client.engine(), self.embedding) {
-            (Engine::Chromium, _) => Resolution::Chromium,
+            (Engine::Chromium, Embedding::Site) => Resolution::Chromium,
+            (Engine::Chromium, Embedding::ChallengePage) => Resolution::ChromiumFine,
             (Engine::WebKit, Embedding::Site) => Resolution::WebKitMillisecond,
             (Engine::WebKit, Embedding::ChallengePage) => Resolution::WebKitFine,
         }

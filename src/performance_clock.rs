@@ -1,9 +1,9 @@
 //! Computes `performance.now()` using browser clock rules.
 //!
 //! On Linux, Chrome reads `CLOCK_MONOTONIC` through `base::TimeTicks`, and on Windows
-//! `QueryPerformanceCounter`. It clamps the reading
-//! and time origin to 100 µs using jitter at each interval boundary, converts both to
-//! floating-point milliseconds, and subtracts. Conversion loses precision as uptime grows,
+//! `QueryPerformanceCounter`. It clamps the reading and time origin to 100 µs (5 µs in the
+//! widget iframe on Cloudflare's challenge page, in every Chrome 156 capture) using jitter at
+//! each interval boundary, converts both to floating-point milliseconds, and subtracts. Conversion loses precision as uptime grows,
 //! producing values such as `23.300000000745058`. Use this module for all reported readings and
 //! differences to preserve that rounding behavior.
 //!
@@ -27,8 +27,10 @@ fn epoch_us() -> i64 {
         .as_micros() as i64
 }
 
-/// The coarse resolution of contexts that are not cross-origin isolated.
-const INTERVAL_US: i64 = 100;
+/// Chrome's coarse resolution, for contexts that are not cross-origin isolated.
+const CHROMIUM_COARSE_US: i64 = 100;
+/// Chrome's fine resolution, which the widget iframe on Cloudflare's challenge page measures.
+const CHROMIUM_FINE_US: i64 = 5;
 
 /// WebKit's step on Cloudflare's challenge page, in seconds.
 const WEBKIT_FINE_STEP_S: f64 = 20e-6;
@@ -36,8 +38,10 @@ const WEBKIT_FINE_STEP_S: f64 = 20e-6;
 /// How a context's clock reports time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Resolution {
-    /// Chrome's 100 µs intervals with jitter at each boundary.
+    /// Chrome's 100 µs intervals with jitter at each boundary, in a site's widget iframe.
     Chromium,
+    /// Chrome's 5 µs intervals with jitter at each boundary, on Cloudflare's own challenge page.
+    ChromiumFine,
     /// WebKit's whole milliseconds, in a site's widget iframe.
     WebKitMillisecond,
     /// WebKit's 20 µs steps, on Cloudflare's own challenge page.
@@ -68,9 +72,9 @@ impl PerformanceClock {
     }
 
     fn with_origin(origin_us: i64, resolution: Resolution) -> Self {
-        let origin_us = match resolution {
-            Resolution::Chromium => clamp(origin_us),
-            Resolution::WebKitMillisecond | Resolution::WebKitFine => origin_us,
+        let origin_us = match resolution.chromium_interval_us() {
+            Some(interval_us) => clamp(origin_us, interval_us),
+            None => origin_us,
         };
         Self {
             origin_us,
@@ -95,7 +99,13 @@ impl PerformanceClock {
     fn at(&self, now_us: i64) -> f64 {
         let elapsed_us = now_us - self.origin_us;
         match self.resolution {
-            Resolution::Chromium => clamp(now_us) as f64 / 1000.0 - self.origin_us as f64 / 1000.0,
+            Resolution::Chromium | Resolution::ChromiumFine => {
+                let interval_us = self
+                    .resolution
+                    .chromium_interval_us()
+                    .expect("a Chromium clock");
+                clamp(now_us, interval_us) as f64 / 1000.0 - self.origin_us as f64 / 1000.0
+            }
             Resolution::WebKitMillisecond => elapsed_us.div_euclid(1000) as f64,
             Resolution::WebKitFine => {
                 let seconds = elapsed_us as f64 / 1e6;
@@ -111,6 +121,17 @@ impl PerformanceClock {
     }
 }
 
+impl Resolution {
+    /// The clamping interval of a Chromium clock.
+    fn chromium_interval_us(self) -> Option<i64> {
+        match self {
+            Self::Chromium => Some(CHROMIUM_COARSE_US),
+            Self::ChromiumFine => Some(CHROMIUM_FINE_US),
+            Self::WebKitMillisecond | Self::WebKitFine => None,
+        }
+    }
+}
+
 /// Implements `blink::TimeClamper::ClampTimeResolution` for nonnegative times. Rounds down
 /// until a fixed pseudorandom threshold in each interval, then rounds up. This prevents timing
 /// measurements from locating the boundary.
@@ -118,31 +139,31 @@ impl PerformanceClock {
 /// # Panics
 ///
 /// Panics if operating-system entropy is unavailable for the process secret.
-fn clamp(time_us: i64) -> i64 {
+fn clamp(time_us: i64, interval_us: i64) -> i64 {
     static SECRET: OnceLock<u64> = OnceLock::new();
     let secret = SECRET.get_or_init(|| {
         let mut bytes = [0; 8];
         getrandom::fill(&mut bytes).expect("drawing the time clamper secret");
         u64::from_le_bytes(bytes)
     });
-    clamp_with(time_us, *secret)
+    clamp_with(time_us, interval_us, *secret)
 }
 
-fn clamp_with(time_us: i64, secret: u64) -> i64 {
-    let remainder = time_us.rem_euclid(INTERVAL_US);
+fn clamp_with(time_us: i64, interval_us: i64, secret: u64) -> i64 {
+    let remainder = time_us.rem_euclid(interval_us);
     let boundary = time_us - remainder;
-    if remainder >= threshold(boundary, secret) {
-        boundary + INTERVAL_US
+    if remainder >= threshold(boundary, interval_us, secret) {
+        boundary + interval_us
     } else {
         boundary
     }
 }
 
-fn threshold(boundary_us: i64, secret: u64) -> i64 {
+fn threshold(boundary_us: i64, interval_us: i64, secret: u64) -> i64 {
     let hash = murmur3_fmix64(boundary_us as u64 ^ secret);
     // Match `TimeClamper::ToDouble` by scaling the top 53 bits to a fraction below one.
     let fraction = (hash >> 11) as f64 * (1.0 / (1u64 << 53) as f64);
-    (INTERVAL_US as f64 * fraction) as i64
+    (interval_us as f64 * fraction) as i64
 }
 
 fn murmur3_fmix64(mut value: u64) -> u64 {
@@ -194,16 +215,18 @@ mod tests {
     fn the_threshold_is_fixed_by_the_secret_and_boundary() {
         // With a fixed secret, each boundary has one threshold below which times round down.
         let boundary = 18_000_000_000;
-        for secret in [0, 1, 0xdead_beef] {
-            let cut = threshold(boundary, secret);
-            assert!((0..INTERVAL_US).contains(&cut));
-            for offset in 0..INTERVAL_US {
-                let expected = if offset >= cut {
-                    boundary + INTERVAL_US
-                } else {
-                    boundary
-                };
-                assert_eq!(clamp_with(boundary + offset, secret), expected);
+        for interval in [CHROMIUM_COARSE_US, CHROMIUM_FINE_US] {
+            for secret in [0, 1, 0xdead_beef] {
+                let cut = threshold(boundary, interval, secret);
+                assert!((0..interval).contains(&cut));
+                for offset in 0..interval {
+                    let expected = if offset >= cut {
+                        boundary + interval
+                    } else {
+                        boundary
+                    };
+                    assert_eq!(clamp_with(boundary + offset, interval, secret), expected);
+                }
             }
         }
     }
@@ -212,6 +235,7 @@ mod tests {
     fn a_new_context_starts_near_zero_and_never_runs_backwards() {
         for resolution in [
             Resolution::Chromium,
+            Resolution::ChromiumFine,
             Resolution::WebKitMillisecond,
             Resolution::WebKitFine,
         ] {
@@ -231,13 +255,33 @@ mod tests {
         let origin = epoch_ms() - 1500;
         let read = |resolution| PerformanceClock::from_epoch_origin(origin, resolution).now();
         let chromium = read(Resolution::Chromium);
+        let chromium_fine = read(Resolution::ChromiumFine);
         let millisecond = read(Resolution::WebKitMillisecond);
         let fine = read(Resolution::WebKitFine);
-        for reading in [chromium, millisecond, fine] {
+        for reading in [chromium, chromium_fine, millisecond, fine] {
             assert!((1499.0..1600.0).contains(&reading), "{reading}");
         }
         assert_eq!(millisecond.fract(), 0.0);
         let steps = fine / 0.02;
         assert!((steps - steps.round()).abs() < 1e-6, "{fine}");
+    }
+
+    /// Back-to-back readings of each clock differ by at least its step, as the clock probe
+    /// measures: 0.1 ms in a site's widget, 0.005 ms on Cloudflare's challenge page (Chrome 156
+    /// reports `0.004999995231628418` there, the step less the subtraction's rounding).
+    #[test]
+    fn back_to_back_readings_step_by_the_chromium_interval() {
+        for (resolution, step) in [
+            (Resolution::Chromium, 0.1),
+            (Resolution::ChromiumFine, 0.005),
+        ] {
+            let readings = PerformanceClock::started_now(resolution).back_to_back(200_000);
+            let smallest = readings
+                .iter()
+                .map(|[before, after]| after - before)
+                .filter(|difference| *difference > 0.0)
+                .fold(f64::INFINITY, f64::min);
+            assert!((smallest - step).abs() < 1e-6, "{resolution:?}: {smallest}");
+        }
     }
 }
