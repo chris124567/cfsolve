@@ -10,9 +10,13 @@ autotests = false
 # and `Error`. The tools in this repository use the rest.
 [features]
 default = ["internals"]
+# Recording a real browser's challenge payloads through any interception of its traffic, and
+# building a profile from the recording, without the capture proxy's TLS stack.
+capture = []
 # The analysis modules behind the solver (deobfuscation, the VM, payloads, and transport), and
 # the capture proxy, which records the challenge payloads a real browser sends.
 internals = [
+    "capture",
     "dep:bytes",
     "dep:http-body-util",
     "dep:hyper",

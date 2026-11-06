@@ -21,15 +21,17 @@ fn main() -> Result<()> {
     let capture = CapturedSession::read(Path::new(&path))?;
     let source = capture.source_beside(Path::new(&path))?;
     let program = capture.program()?;
-    let mut answers = Answers::capture(&source, &program, capture.probe_payload()?)?;
-    if let Some(path) = arguments.next() {
-        answers.measure_stylesheets(
+    let payload = capture.probe_payload()?;
+    let answers = match arguments.next() {
+        Some(path) => Answers::capture_measured(
             &source,
             &program,
+            payload,
             capture.iframe_html(),
             serde_json::from_str(&fs::read_to_string(path)?)?,
-        )?;
-    }
+        )?,
+        None => Answers::capture(&source, &program, payload)?,
+    };
     println!("{}", serde_json::to_string_pretty(&answers)?);
     Ok(())
 }

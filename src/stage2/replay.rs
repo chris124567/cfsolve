@@ -16,6 +16,7 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use super::analysis::{self, Analysis};
 pub use super::audit_globals::{Globals, Signature};
 use super::probes::worker_navigator;
 use super::records::{ArrangedFields, Probe, ProbePlan};
@@ -25,10 +26,10 @@ use super::reference::{
     STYLESHEETS_HASH, WORKER_NAVIGATOR_RESULT,
 };
 use super::registry::{AUDIT_PROBE, Kind, Operation, Treatment};
+use super::stylesheets;
 pub use super::stylesheets::Stylesheet;
 use super::trace::Trace;
 use super::vocabulary::{self, Vocabulary};
-use super::{analysis, stylesheets};
 use crate::http::ResponseMetrics;
 use crate::js::{JsObject, JsValue, Options, Payload, json};
 use crate::script::Source;
@@ -73,6 +74,30 @@ impl Answers {
         templates: Vec<Stylesheet>,
     ) -> Result<()> {
         let analysis = analysis::analyze(source, program)?;
+        self.measure_analyzed(&analysis, html, templates)
+    }
+
+    /// Builds stored answers as [`Self::capture`] does and attaches CSSOM measurements as
+    /// [`Self::measure_stylesheets`] does, analysing the program once for both.
+    pub fn capture_measured(
+        source: &Source,
+        program: &[u8],
+        payload: &Payload,
+        html: &str,
+        templates: Vec<Stylesheet>,
+    ) -> Result<Self> {
+        let analysis = analysis::analyze(source, program)?;
+        let mut answers = Self::capture_analyzed(&analysis, source, payload)?;
+        answers.measure_analyzed(&analysis, html, templates)?;
+        Ok(answers)
+    }
+
+    fn measure_analyzed(
+        &mut self,
+        analysis: &Analysis,
+        html: &str,
+        templates: Vec<Stylesheet>,
+    ) -> Result<()> {
         let (probe, excluded) = analysis
             .plan()
             .probes()
@@ -102,6 +127,10 @@ impl Answers {
     /// Builds stored answers from a captured iframe script, probe program, and second payload.
     pub fn capture(source: &Source, program: &[u8], payload: &Payload) -> Result<Self> {
         let analysis = analysis::analyze(source, program)?;
+        Self::capture_analyzed(&analysis, source, payload)
+    }
+
+    fn capture_analyzed(analysis: &Analysis, source: &Source, payload: &Payload) -> Result<Self> {
         let plan = analysis.plan();
         let vocabulary = plan.vocabulary();
         let globals = Globals::capture(source)?;

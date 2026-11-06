@@ -50,7 +50,7 @@ mod session;
 mod solver;
 
 // The analysis modules are public for the tools in this repository.
-#[cfg(feature = "internals")]
+#[cfg(feature = "capture")]
 #[doc(hidden)]
 pub mod capture;
 #[doc(hidden)]

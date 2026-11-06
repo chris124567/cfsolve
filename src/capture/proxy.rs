@@ -2,18 +2,17 @@
 //!
 //! Intercepted connections use per-host certificates signed by the proxy CA, serve HTTP/1.1 or
 //! HTTP/2, and forward requests through the emulated browser client; WebSocket upgrades are
-//! tunneled. The proxy replaces the modulus in iframe HTML and rewraps challenge POST seeds;
-//! other traffic passes through unchanged.
+//! tunneled. Its [`Recorder`] replaces the modulus in iframe HTML and rewraps challenge POST
+//! seeds; other traffic passes through unchanged.
 
 use std::convert::Infallible;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use base64::engine::general_purpose::STANDARD;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -29,18 +28,13 @@ use url::Url;
 
 use super::ca::CertificateAuthority;
 use super::head;
-use super::rsa::{self, ProxyKey};
-use super::sessions::{self, Iframe, Post, Sessions};
-use super::traffic::{Connection, Traffic};
+use super::recorder::{Posted, Recorder};
+use super::traffic::{Connection, SentHeaders};
 use super::upstream::{self, Stream, UpstreamProxy};
+use crate::challenge;
 use crate::http::{self, BrowserClient, Proxied};
-use crate::js::ast;
-use crate::{challenge, deobfuscate};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
-
-/// The host serving Turnstile iframes and receiving their challenge POSTs.
-pub const CHALLENGE_HOST: &str = "challenges.cloudflare.com";
 
 /// Local hostname for downloading the CA certificate at [`CA_PATH`]. Supports HTTP and, after
 /// the client trusts the CA, HTTPS. `GET /ssl` on the listening socket also serves the
@@ -55,7 +49,7 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Hostnames to intercept, lowercased, without ports.
     pub mitm_hosts: Vec<String>,
-    /// The host whose challenge POSTs need rewrapping: [`CHALLENGE_HOST`] or a loopback test
+    /// The host whose challenge POSTs need rewrapping: [`super::CHALLENGE_HOST`] or a loopback test
     /// origin.
     pub challenge_host: String,
     /// Whether intercepted requests go upstream over TLS. Loopback tests serve plain HTTP.
@@ -72,8 +66,7 @@ pub struct CaptureProxy {
     client: BrowserClient,
     acceptor: TlsAcceptor,
     ca: Arc<CertificateAuthority>,
-    sessions: Arc<Sessions>,
-    traffic: Mutex<Traffic>,
+    pub(super) recorder: Recorder,
 }
 
 impl CaptureProxy {
@@ -89,17 +82,12 @@ impl CaptureProxy {
             .with_cert_resolver(ca.clone());
         server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
+            recorder: Recorder::for_host(&config.challenge_host)?,
             config,
             client,
             acceptor: TlsAcceptor::from(Arc::new(server)),
             ca,
-            sessions: Arc::new(Sessions::new(ProxyKey::generate()?)),
-            traffic: Mutex::default(),
         })
-    }
-
-    fn traffic(&self) -> MutexGuard<'_, Traffic> {
-        self.traffic.lock().expect("the traffic log lock")
     }
 
     /// Listens until Ctrl-C or SIGTERM, then waits for extraction and writes session and
@@ -132,15 +120,15 @@ impl CaptureProxy {
         if stop == Stop::Asked {
             eprintln!("shutting down; finishing the session extractions (Ctrl-C again to skip)");
             tokio::select! {
-                () = proxy.sessions.finish_extractions() => {}
+                () = proxy.recorder.finish_extractions() => {}
                 _ = shutdown_requested() => eprintln!("skipped the unfinished extractions"),
             }
         } else {
             eprintln!("the console is closing; skipped the unfinished extractions");
         }
         eprintln!("writing the session logs");
-        proxy.sessions.write_all(&proxy.config.out_dir);
-        match proxy.traffic().write(&proxy.config.out_dir) {
+        proxy.recorder.sessions.write_all(&proxy.config.out_dir);
+        match proxy.recorder.traffic().write(&proxy.config.out_dir) {
             Ok(path) => eprintln!("traffic: {}", path.display()),
             Err(error) => eprintln!("traffic: writing the log failed: {error:#}"),
         }
@@ -260,7 +248,7 @@ impl CaptureProxy {
         } else {
             None
         };
-        let connection = self.traffic().connect(Connection {
+        let connection = self.recorder.traffic().connect(Connection {
             host: host.to_owned(),
             port,
             client_hello,
@@ -302,7 +290,15 @@ impl CaptureProxy {
             .path_and_query()
             .map_or("/", |path| path.as_str());
         let url = format!("{origin}{path}");
-        let logged = self.traffic().request(connection, &url, &request);
+        let headers = http::text_headers(request.headers())
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        let headers = SentHeaders::InOrder(headers);
+        let version = format!("{:?}", request.version());
+        let method = request.method().as_str();
+        let logged = self
+            .recorder
+            .request(Some(connection), method, &url, &version, headers);
         let routed = self.route(logged, &url, request).await;
         let response = routed.unwrap_or_else(|error| {
             eprintln!("{origin}: {error:#}");
@@ -311,7 +307,7 @@ impl CaptureProxy {
                 &format!("capture-proxy: {error:#}"),
             )
         });
-        self.traffic().answered(logged);
+        self.recorder.answered(logged);
         response
     }
 
@@ -330,7 +326,7 @@ impl CaptureProxy {
             .await
             .context("reading the request body")?
             .to_bytes();
-        if self.is_challenge_post(&parts.method, url) {
+        if self.recorder.is_challenge_post(parts.method.as_str(), url) {
             return self.post_challenge(url, headers, body).await;
         }
         let method = parts.method;
@@ -339,7 +335,9 @@ impl CaptureProxy {
             .proxy_fetch(method.clone(), url, headers, body)
             .await?;
         if let Some(kind) = kept(&method, url, &self.config.challenge_host, &upstream.headers) {
-            self.traffic().keep(logged, kind, decoded_body(&upstream));
+            self.recorder
+                .traffic()
+                .keep(logged, kind, decoded_body(&upstream));
         }
         let content_type = header_value(&upstream.headers, header::CONTENT_TYPE);
         let html = content_type.to_ascii_lowercase().contains("html");
@@ -352,69 +350,41 @@ impl CaptureProxy {
         Ok(passthrough(upstream))
     }
 
-    /// Checks for a challenge-platform `/fo/` POST on the challenge host. Requests to site
-    /// paths pass through unchanged, including orchestrator POSTs: those use a script whose
-    /// modulus the proxy has not replaced.
-    fn is_challenge_post(&self, method: &Method, url: &str) -> bool {
-        *method == Method::POST
-            && Url::parse(url).is_ok_and(|url| {
-                url.host_str() == Some(self.config.challenge_host.as_str())
-                    && challenge::is_post_path(url.path())
-            })
-    }
-
-    /// Unwraps a challenge POST's seed, rewraps it with the real modulus, and logs the payload.
-    /// Passes the response through unchanged. If no session can rewrap the POST, forwards it
-    /// unchanged and excludes that session from stored answers.
+    /// Rewraps a challenge POST's seed under the real modulus and logs the payload. Passes the
+    /// response through unchanged. Forwards a POST no session can take unchanged.
     async fn post_challenge(
         &self,
         url: &str,
         mut headers: HeaderMap,
         body: Bytes,
     ) -> Result<ProxyResponse> {
-        let parsed = Url::parse(url).context("parsing the POST URL")?;
-        let Some(session) = self.sessions.bind(&parsed) else {
-            return self.forward(url, headers, body).await;
-        };
-        let Ok(encrypted) = std::str::from_utf8(&body) else {
-            self.sessions.lock()[session].poison("the POST body is not UTF-8");
-            return self.forward(url, headers, body).await;
-        };
-        let mut post = Post {
-            url: url.to_owned(),
-            cf_chl: header_value(&headers, "cf-chl"),
-            encrypted_body: encrypted.to_owned(),
-            ..Post::default()
-        };
-        let rewrapped = match self.sessions.rewrap(session, encrypted) {
-            Ok(rewrapped) => rewrapped,
-            Err(error) => {
-                let error = format!("re-wrap failed: {error:#}");
-                let response = text_response(
+        let cf_chl = header_value(&headers, "cf-chl");
+        let post = match self.recorder.challenge_post(url, &cf_chl, &body) {
+            Posted::Rewrapped(post) => post,
+            Posted::Unbound => return self.forward(url, headers, body).await,
+            Posted::Rejected(error) => {
+                return Ok(text_response(
                     StatusCode::BAD_GATEWAY,
                     &format!("capture-proxy: rejecting a POST that opens under no key: {error}"),
-                );
-                post.error = Some(error);
-                self.sessions.lock()[session].record(post);
-                return Ok(response);
+                ));
             }
         };
-        post.seed = Some(hex(&rewrapped.seed));
-        post.padding = Some(rewrapped.padding);
-        headers.insert(header::CONTENT_LENGTH, rewrapped.body.len().into());
-        let upstream = self
+        headers.insert(header::CONTENT_LENGTH, post.body.len().into());
+        let forwarded = self
             .client
-            .proxy_fetch(Method::POST, url, headers, Bytes::from(rewrapped.body))
+            .proxy_fetch(Method::POST, url, headers, Bytes::from(post.body.clone()))
             .await
-            .context("forwarding the re-wrapped POST")
-            .inspect_err(|error| self.sessions.lock()[session].poison(&format!("{error:#}")))?;
-        post.response_body = String::from_utf8_lossy(&decoded_body(&upstream)).into_owned();
-        post.decoded_program = decode_program(&parsed, &post.response_body);
-        if post.decoded_program.is_none() {
-            eprintln!("{url}: the POST response did not decode; forwarding anyway");
+            .context("forwarding the re-wrapped POST");
+        match forwarded {
+            Ok(upstream) => {
+                self.recorder.answered_post(post, &decoded_body(&upstream));
+                Ok(passthrough(upstream))
+            }
+            Err(error) => {
+                self.recorder.failed_post(post, &format!("{error:#}"));
+                Err(error)
+            }
         }
-        self.sessions.lock()[session].record(post);
-        Ok(passthrough(upstream))
     }
 
     async fn forward(&self, url: &str, headers: HeaderMap, body: Bytes) -> Result<ProxyResponse> {
@@ -430,30 +400,15 @@ impl CaptureProxy {
     fn rewrite_iframe(&self, url: &str, upstream: &Proxied) -> Option<Vec<u8>> {
         let encoding = header_value(&upstream.headers, header::CONTENT_ENCODING);
         let html = String::from_utf8(http::decode_body(&upstream.body, &encoding).ok()?).ok()?;
-        let scanned = challenge::inline_javascript(&html).and_then(|javascript| {
-            let parsed = ast::parse_javascript("iframe.js", &javascript)?;
-            let strings = deobfuscate::inline_strings(&parsed.script);
-            let alphabet = sessions::scan_alphabet(&parsed.script, &strings)?;
-            let swapped = rsa::swap_modulus(&html, &strings, &self.sessions.proxy_key.modulus)?;
-            anyhow::Ok((alphabet, swapped))
-        });
-        let (alphabet, (rewritten, real_modulus)) = scanned
+        let rewritten = self
+            .recorder
+            .rewrite_iframe(url, &html)
             .inspect_err(|error| eprintln!("{url}: forwarding the original iframe: {error:#}"))
             .ok()?;
-        let encoded = http::encode_body(rewritten.as_bytes(), &encoding).ok()?;
-        let session = self.sessions.open(Iframe {
-            url: url.to_owned(),
-            real_modulus,
-            scanned_alphabet: alphabet,
-            upstream_encoded_bytes: upstream.body.len() as u64,
-            upstream_decoded_bytes: html.len() as u64,
-            observed_encoded_bytes: encoded.len() as u64,
-            // Replacement preserves every decoded byte offset.
-            observed_decoded_bytes: html.len() as u64,
-            original: html,
-            rewritten,
-        });
-        eprintln!("{url}: rewrote the modulus (session {session})");
+        let encoded = http::encode_body(rewritten.html.as_bytes(), &encoding).ok()?;
+        let upstream_encoded = upstream.body.len() as u64;
+        (self.recorder).note_encoding(&rewritten, upstream_encoded, encoded.len() as u64);
+        eprintln!("{url}: rewrote the modulus (session {})", rewritten.session);
         Some(encoded)
     }
 }
@@ -617,17 +572,6 @@ fn hex(bytes: &[u8]) -> String {
 fn decoded_body(response: &Proxied) -> Vec<u8> {
     let encoding = header_value(&response.headers, header::CONTENT_ENCODING);
     http::decode_body(&response.body, &encoding).unwrap_or_else(|_| response.body.to_vec())
-}
-
-/// Unmasks the challenge POST response for `url`, if the result is valid base64 text.
-fn decode_program(url: &Url, response_body: &str) -> Option<String> {
-    use base64::Engine;
-
-    let ray = challenge::ray(url).ok()?;
-    let program = challenge::decode_response(response_body.as_bytes(), ray).ok()?;
-    String::from_utf8(program)
-        .ok()
-        .filter(|program| STANDARD.decode(program).is_ok())
 }
 
 #[cfg(test)]
