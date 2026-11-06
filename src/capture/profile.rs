@@ -55,19 +55,65 @@ pub fn fill(profile: &mut Value, recordings: &[Recording]) -> Result<Vec<String>
     let script_fetch = section(profile, "/timeline/script_fetch")?
         .as_f64()
         .context("the profile's timeline has no script_fetch")?;
+    let sessions: Vec<(&Recording, &String, &CapturedSession)> = recordings
+        .iter()
+        .flat_map(|recording| {
+            let sessions = recording.sessions.iter();
+            sessions.map(move |(name, session)| (recording, name, session))
+        })
+        .collect();
     let mut reported = Reported {
         script_fetch,
         ..Reported::default()
     };
-    for recording in recordings {
-        for (name, session) in &recording.sessions {
-            for problem in reported.read(recording, session) {
-                notes.push(format!("{}/{name}: {problem:#}", recording.label));
-            }
+    // Each session's reading is seconds of deobfuscation and analysis, so sessions are read side
+    // by side, then taken in order.
+    for ((recording, name, _), (read, problems)) in
+        sessions.iter().zip(read_all(script_fetch, &sessions)?)
+    {
+        reported.absorb(read);
+        for problem in problems {
+            notes.push(format!("{}/{name}: {problem:#}", recording.label));
         }
     }
     reported.fill(profile, &mut notes)?;
     Ok(notes)
+}
+
+/// Reads each of `sessions` on a thread of its own (with a main thread's stack: deobfuscation
+/// recurses as deep as the scripts nest), as many at once as the machine runs in parallel.
+fn read_all(
+    script_fetch: f64,
+    sessions: &[(&Recording, &String, &CapturedSession)],
+) -> Result<Vec<(Reported, Vec<anyhow::Error>)>> {
+    const STACK_SIZE: usize = 8 << 20;
+    let parallel = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut read = Vec::with_capacity(sessions.len());
+    for batch in sessions.chunks(parallel) {
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = batch
+                .iter()
+                .map(|&(recording, _, session)| {
+                    std::thread::Builder::new()
+                        .name("profile-session".into())
+                        .stack_size(STACK_SIZE)
+                        .spawn_scoped(scope, move || {
+                            let mut reported = Reported {
+                                script_fetch,
+                                ..Reported::default()
+                            };
+                            let problems = reported.read(recording, session);
+                            (reported, problems)
+                        })
+                })
+                .collect::<std::io::Result<_>>()?;
+            for thread in threads {
+                read.push(thread.join().expect("reading a session panicked"));
+            }
+            anyhow::Ok(())
+        })?;
+    }
+    Ok(read)
 }
 
 /// Updates header orders and browser identity headers for the request types found in the traffic.
@@ -145,6 +191,23 @@ struct Reported {
 }
 
 impl Reported {
+    /// Adds a later session's measurements to these. The first session's media observations
+    /// stay.
+    fn absorb(&mut self, later: Reported) {
+        for (family, durations) in later.durations {
+            self.durations.entry(family).or_default().extend(durations);
+        }
+        self.startup_ms.extend(later.startup_ms);
+        self.pending_ms.extend(later.pending_ms);
+        self.benchmark.extend(later.benchmark);
+        self.media = self.media.take().or(later.media);
+        self.intervals.extend(later.intervals);
+        self.timelines.extend(later.timelines);
+        self.placements.extend(later.placements);
+        self.connections.extend(later.connections);
+        self.shadow_roots.extend(later.shadow_roots);
+    }
+
     /// Collects measurements from `session` and returns notes about data it could not read.
     fn read(&mut self, recording: &Recording, session: &CapturedSession) -> Vec<anyhow::Error> {
         let source = match session.source() {

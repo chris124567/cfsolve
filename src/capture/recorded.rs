@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -24,6 +25,10 @@ pub struct CapturedSession {
     iframe_html: String,
     posts: Vec<CapturedPost>,
     payloads: Vec<CapturedPayload>,
+    /// The iframe script deobfuscated, once [`Self::source`] has: deobfuscation takes seconds,
+    /// and a profile is built from several reads of a session.
+    #[serde(skip)]
+    deobfuscated: OnceLock<String>,
 }
 
 #[derive(Deserialize)]
@@ -50,9 +55,17 @@ impl CapturedSession {
         read_json(path)
     }
 
-    /// Returns the deobfuscated inline script from the iframe.
+    /// Returns the deobfuscated inline script from the iframe. The deobfuscation is kept for the
+    /// session's later reads.
     pub fn source(&self) -> Result<Source> {
-        Source::try_new(&deobfuscate::deobfuscate(self.javascript()?)?.text)
+        let text = match self.deobfuscated.get() {
+            Some(text) => text,
+            None => {
+                let text = deobfuscate::deobfuscate(self.javascript()?)?.text;
+                self.deobfuscated.get_or_init(|| text)
+            }
+        };
+        Source::try_new(text)
     }
 
     /// Like [`Self::source`], but reads the `iframe.deobfuscated.js` that `capture_session`
