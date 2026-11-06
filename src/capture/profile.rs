@@ -4,8 +4,9 @@
 //! Session payloads provide probe durations, startup and pending times, benchmark speeds, media
 //! observations, first-payload intervals, and loader timestamps. Most values use the median across
 //! sessions. Loader timestamps come from a single session chosen by median send time, so they
-//! remain consistent. Challenge-page sessions also place the widget on Cloudflare's page, and the
-//! network information probe reports `navigator.connection`.
+//! remain consistent. Challenge-page sessions also place the widget on Cloudflare's page, the
+//! network information probe reports `navigator.connection`, and the second payload publishes the
+//! browser's shadow-root report.
 //!
 //! Values that captures cannot provide stay unchanged: engine, TLS and HTTP/2 settings, request
 //! priorities, the viewport and site widget layout, interaction, resource timing phases,
@@ -141,6 +142,8 @@ struct Reported {
     /// `navigator.connection`'s properties, as each session's network information probe read
     /// them. Browsers without the API report none.
     connections: Vec<JsObject>,
+    /// The report of attaching a shadow root to the body, which the second payload publishes.
+    shadow_roots: Vec<String>,
 }
 
 impl Reported {
@@ -236,6 +239,18 @@ impl Reported {
         let plan = analysis.plan();
         let envelope = &plan.record_fields;
         let completion = &envelope.completion;
+        // The one published field only a browser computes.
+        let shadow_root = plan
+            .payload
+            .published
+            .iter()
+            .find(|(_, value)| value.is_none());
+        match shadow_root.and_then(|(field, _)| payload.get(field)?.as_str()) {
+            Some(report) => self.shadow_roots.push(report.to_owned()),
+            None => problems.push(anyhow::anyhow!(
+                "the second payload publishes no shadow-root report"
+            )),
+        }
         let (mut first_started, mut last_finished) = (i64::MAX, i64::MIN);
         for probe in plan.probes() {
             let record = payload
@@ -314,6 +329,7 @@ impl Reported {
     fn fill(mut self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
         self.fill_placement(profile, notes)?;
         self.fill_connection(profile, notes)?;
+        self.fill_shadow_root(profile, notes)?;
         let mut filled = |pointer: &str, value: Option<Value>, source: &str| -> Result<()> {
             let name = pointer.trim_start_matches('/').replace('/', ".");
             match value {
@@ -419,6 +435,23 @@ impl Reported {
         Ok(())
     }
 
+    /// Sets the shadow-root report the second payload publishes to the one seen most often.
+    fn fill_shadow_root(&self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+        if self.shadow_roots.is_empty() {
+            notes.push(
+                "second.document.shadow_root: kept the profile's; no session published one".into(),
+            );
+            return Ok(());
+        }
+        let report = most_common(self.shadow_roots.iter().collect());
+        *section(profile, "/second/document/shadow_root")? = Value::String(report.clone());
+        notes.push(format!(
+            "second.document.shadow_root: the most common of {} sessions",
+            self.shadow_roots.len()
+        ));
+        Ok(())
+    }
+
     /// Sets `navigator.connection` to each property's median (numbers) or most common value, and
     /// the image probe's effective type to match it.
     fn fill_connection(&self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
@@ -485,8 +518,8 @@ fn median_f64(mut values: Vec<f64>) -> Option<f64> {
 }
 
 /// Returns the value seen most often, the first seen among equals.
-fn most_common(values: Vec<&JsValue>) -> &JsValue {
-    let mut counts: Vec<(&JsValue, usize)> = Vec::new();
+fn most_common<T: PartialEq>(values: Vec<&T>) -> &T {
+    let mut counts: Vec<(&T, usize)> = Vec::new();
     for value in values {
         match counts.iter_mut().find(|(seen, _)| *seen == value) {
             Some((_, count)) => *count += 1,
@@ -575,7 +608,8 @@ mod tests {
     fn base() -> Value {
         serde_json::json!({
             "browser": {"inner_width": 1919, "inner_height": 992},
-            "second": {"facts": {}, "image": {"effective_type": "", "online": true}},
+            "second": {"facts": {}, "image": {"effective_type": "", "online": true},
+                "document": {"shadow_root": "{}"}},
         })
     }
 
@@ -629,5 +663,17 @@ mod tests {
         let mut unchanged = base();
         safari.fill_connection(&mut unchanged, &mut notes).unwrap();
         assert_eq!(unchanged, base());
+    }
+
+    #[test]
+    fn takes_the_shadow_root_report_seen_most_often() {
+        let chrome = r#"[null,"closed","<body></body>","",4,4,37,"function attachShadow() { [native code] }"]"#;
+        let reported = Reported {
+            shadow_roots: vec![chrome.into(), "odd".into(), chrome.into()],
+            ..Reported::default()
+        };
+        let (mut profile, mut notes) = (base(), Vec::new());
+        reported.fill_shadow_root(&mut profile, &mut notes).unwrap();
+        assert_eq!(profile["second"]["document"]["shadow_root"], chrome);
     }
 }
