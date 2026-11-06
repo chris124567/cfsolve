@@ -4,11 +4,13 @@
 //! Session payloads provide probe durations, startup and pending times, benchmark speeds, media
 //! observations, first-payload intervals, and loader timestamps. Most values use the median across
 //! sessions. Loader timestamps come from a single session chosen by median send time, so they
-//! remain consistent.
+//! remain consistent. Challenge-page sessions also place the widget on Cloudflare's page, the
+//! network information probe reports `navigator.connection`, and the second payload publishes the
+//! browser's shadow-root report.
 //!
 //! Values that captures cannot provide stay unchanged: engine, TLS and HTTP/2 settings, request
-//! priorities, page layout, interaction, resource timing phases, orchestrator pacing, and navigator
-//! properties. `build_profile` writes the stored answers.
+//! priorities, the viewport and site widget layout, interaction, resource timing phases,
+//! orchestrator pacing, and navigator properties. `build_profile` writes the stored answers.
 
 mod headers;
 
@@ -34,6 +36,7 @@ use crate::stage2::analysis;
 use crate::stage2::benchmark::WorkerCosts;
 use crate::stage2::probes::ice;
 use crate::stage2::probes::media::Measurement;
+use crate::stage2::reference::PARENT_INFO_WIDGET_POSITION;
 use crate::stage2::registry::{Kind, Operation};
 
 /// Updates measured profile values from `recordings`. Returns notes about the sources used and data
@@ -134,6 +137,13 @@ struct Reported {
     /// Loader timestamps from ordinary sites. Challenge pages load the loader late, so the solver
     /// uses the timestamps from ordinary sites.
     timelines: Vec<Timeline>,
+    /// The widget wrapper's top and right edges on Cloudflare's challenge page.
+    placements: Vec<(f64, f64)>,
+    /// `navigator.connection`'s properties, as each session's network information probe read
+    /// them. Browsers without the API report none.
+    connections: Vec<JsObject>,
+    /// The report of attaching a shadow root to the body, which the second payload publishes.
+    shadow_roots: Vec<String>,
 }
 
 impl Reported {
@@ -145,23 +155,32 @@ impl Reported {
         };
         let mut problems = Vec::new();
         let first = session.first_payload();
-        if let Err(error) = first.and_then(|first| self.read_first(&source, first, &mut problems)) {
+        let embedding = first.and_then(|first| self.read_first(&source, first, &mut problems));
+        let on_challenge_page = embedding.unwrap_or_else(|error| {
             problems.push(error.context("reading the first payload"));
-        }
-        if let Err(error) = self.read_records(recording, session, &source, &mut problems) {
+            false
+        });
+        let read = self.read_records(
+            recording,
+            session,
+            &source,
+            on_challenge_page,
+            &mut problems,
+        );
+        if let Err(error) = read {
             problems.push(error.context("reading the probe records"));
         }
         problems
     }
 
     /// Collects first-payload intervals and the loader timestamps passed from the site to the
-    /// iframe.
+    /// iframe. Returns whether the widget is on a challenge page.
     fn read_first(
         &mut self,
         source: &Source,
         payload: &Payload,
         problems: &mut Vec<anyhow::Error>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // Extraction only needs an iframe URL with the same origin as the POSTs.
         let iframe = Url::parse(&format!("https://{CHALLENGE_HOST}/"))?;
         let prepared = PreparedSession::try_new(source, &iframe)?;
@@ -192,7 +211,7 @@ impl Reported {
         }
         // The orchestrator passes its page data only to widgets on challenge pages.
         if message.get("chlPageData").is_some_and(js::truthy) {
-            return Ok(());
+            return Ok(true);
         }
         let times: ElapsedTimes = js::from_value(JsValue::Object(message))
             .context("the first payload lacks the loader's elapsed times")?;
@@ -200,16 +219,18 @@ impl Reported {
             implicit_render.context("the first payload lacks the loader's stack sample")?;
         let timeline = Timeline::from_times(&times, implicit_render, self.script_fetch);
         self.timelines.push(timeline);
-        Ok(())
+        Ok(false)
     }
 
-    /// Collects probe durations, benchmark speeds, the first media connection, and probe times
-    /// relative to the POSTs.
+    /// Collects probe durations, benchmark speeds, the first media connection, the widget's
+    /// placement on a challenge page, the network information, and probe times relative to the
+    /// POSTs.
     fn read_records(
         &mut self,
         recording: &Recording,
         session: &CapturedSession,
         source: &Source,
+        on_challenge_page: bool,
         problems: &mut Vec<anyhow::Error>,
     ) -> Result<()> {
         let program = session.program()?;
@@ -218,6 +239,18 @@ impl Reported {
         let plan = analysis.plan();
         let envelope = &plan.record_fields;
         let completion = &envelope.completion;
+        // The one published field only a browser computes.
+        let shadow_root = plan
+            .payload
+            .published
+            .iter()
+            .find(|(_, value)| value.is_none());
+        match shadow_root.and_then(|(field, _)| payload.get(field)?.as_str()) {
+            Some(report) => self.shadow_roots.push(report.to_owned()),
+            None => problems.push(anyhow::anyhow!(
+                "the second payload publishes no shadow-root report"
+            )),
+        }
         let (mut first_started, mut last_finished) = (i64::MAX, i64::MIN);
         for probe in plan.probes() {
             let record = payload
@@ -251,6 +284,26 @@ impl Reported {
                         Err(error) => problems.push(error.context("reading the media probe")),
                     }
                 }
+                // A site's widget is placed by the site's own page, which the profile does not
+                // describe.
+                Operation::ParentInfo {} if on_challenge_page => {
+                    let mut observed = record.clone();
+                    plan.vocabulary()
+                        .rewrite_to_reference(probe.position(), &mut observed);
+                    match placement(&observed) {
+                        Ok(placement) => self.placements.push(placement),
+                        Err(error) => problems.push(error.context("reading the widget placement")),
+                    }
+                }
+                Operation::NetworkInformation(fields) => {
+                    let mut observed = record.clone();
+                    plan.vocabulary()
+                        .rewrite_to_reference(probe.position(), &mut observed);
+                    let connection = fields.properties.iter().filter_map(|(field, property)| {
+                        Some((property.clone(), observed.get(field)?.clone()))
+                    });
+                    self.connections.push(connection.collect());
+                }
                 _ => {}
             }
             // The solver measures its own benchmark's duration.
@@ -274,6 +327,9 @@ impl Reported {
     }
 
     fn fill(mut self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+        self.fill_placement(profile, notes)?;
+        self.fill_connection(profile, notes)?;
+        self.fill_shadow_root(profile, notes)?;
         let mut filled = |pointer: &str, value: Option<Value>, source: &str| -> Result<()> {
             let name = pointer.trim_start_matches('/').replace('/', ".");
             match value {
@@ -344,6 +400,144 @@ impl Reported {
     }
 }
 
+impl Reported {
+    /// Places the widget on challenge pages at the median edges the sessions report. Cloudflare's
+    /// page centres its content in the viewport, so the left edge mirrors the right one in the
+    /// profile's `browser.inner_width`.
+    fn fill_placement(&self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+        if self.placements.is_empty() {
+            notes.push(
+                "browser.challenge_page: kept the profile's; no challenge page session placed it"
+                    .into(),
+            );
+            return Ok(());
+        }
+        let inner_width = section(profile, "/browser/inner_width")?
+            .as_f64()
+            .context("the profile's browser.inner_width, which places the widget's left edge, is not a number")?;
+        let top = median_f64(self.placements.iter().map(|(top, _)| *top).collect());
+        let right = median_f64(self.placements.iter().map(|(_, right)| *right).collect());
+        let (Some(top), Some(right)) = (top, right) else {
+            unreachable!("placements is not empty");
+        };
+        let placement =
+            serde_json::json!({"top": top, "left": inner_width - right, "right": right});
+        *section(profile, "/browser")?
+            .as_object_mut()
+            .context("the profile's browser section is not an object")?
+            .entry("challenge_page")
+            .or_insert(Value::Null) = placement;
+        notes.push(format!(
+            "browser.challenge_page: medians of {} challenge page sessions; left mirrors right in \
+             browser.inner_width",
+            self.placements.len()
+        ));
+        Ok(())
+    }
+
+    /// Sets the shadow-root report the second payload publishes to the one seen most often.
+    fn fill_shadow_root(&self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+        if self.shadow_roots.is_empty() {
+            notes.push(
+                "second.document.shadow_root: kept the profile's; no session published one".into(),
+            );
+            return Ok(());
+        }
+        let report = most_common(self.shadow_roots.iter().collect());
+        *section(profile, "/second/document/shadow_root")? = Value::String(report.clone());
+        notes.push(format!(
+            "second.document.shadow_root: the most common of {} sessions",
+            self.shadow_roots.len()
+        ));
+        Ok(())
+    }
+
+    /// Sets `navigator.connection` to each property's median (numbers) or most common value, and
+    /// the image probe's effective type to match it.
+    fn fill_connection(&self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+        let mut values: BTreeMap<&str, Vec<&JsValue>> = BTreeMap::new();
+        for connection in &self.connections {
+            // A property the browser lacks reads `null`, whether or not the profile names it.
+            let present = connection.iter().filter(|(_, value)| !value.is_null());
+            for (property, value) in present {
+                values.entry(property).or_default().push(value);
+            }
+        }
+        if values.is_empty() {
+            notes.push(
+                "second.facts.connection: kept the profile's; no session reported one".into(),
+            );
+            return Ok(());
+        }
+        let mut connection = serde_json::Map::new();
+        for (property, observed) in values {
+            let numbers: Option<Vec<f64>> = observed.iter().map(|value| value.as_f64()).collect();
+            let value = match numbers {
+                Some(numbers) => serde_json::json!(median_f64(numbers)),
+                None => serde_json::to_value(most_common(observed))?,
+            };
+            connection.insert(property.to_owned(), value);
+        }
+        let effective_type = connection.get("effectiveType").cloned();
+        section(profile, "/second/facts")?
+            .as_object_mut()
+            .context("the profile's second.facts is not an object")?
+            .insert("connection".into(), Value::Object(connection));
+        notes.push(format!(
+            "second.facts.connection: medians or most common values of {} sessions",
+            self.connections.len()
+        ));
+        if let Some(effective_type) = effective_type {
+            *section(profile, "/second/image/effective_type")? = effective_type;
+            notes.push("second.image.effective_type: the connection's".into());
+        }
+        Ok(())
+    }
+}
+
+/// Reads the widget wrapper's `top|right` from a parent-info record in reference names.
+fn placement(record: &JsObject) -> Result<(f64, f64)> {
+    let position = record
+        .get(PARENT_INFO_WIDGET_POSITION)
+        .and_then(JsValue::as_str)
+        .context("the record has no widget position")?;
+    let (top, right) = position
+        .split_once('|')
+        .with_context(|| format!("the widget position {position:?} is not top|right"))?;
+    let edge = |text: &str| {
+        text.parse::<f64>()
+            .with_context(|| format!("the widget position {position:?} has a non-numeric edge"))
+    };
+    Ok((edge(top)?, edge(right)?))
+}
+
+/// Returns the median, choosing the upper middle value for an even count.
+fn median_f64(mut values: Vec<f64>) -> Option<f64> {
+    values.sort_unstable_by(f64::total_cmp);
+    values.get(values.len() / 2).copied()
+}
+
+/// Returns the value seen most often, the first seen among equals.
+fn most_common<T: PartialEq>(values: Vec<&T>) -> &T {
+    let mut counts: Vec<(&T, usize)> = Vec::new();
+    for value in values {
+        match counts.iter_mut().find(|(seen, _)| *seen == value) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((value, 1)),
+        }
+    }
+    let best = counts
+        .iter()
+        .map(|(_, count)| *count)
+        .max()
+        .expect("a property has values");
+    counts
+        .into_iter()
+        .find(|(_, count)| *count == best)
+        .expect("the best count is seen")
+        .0
+}
+
 /// Returns the median of each interval across sessions.
 fn median_intervals(sessions: &[Intervals]) -> Option<Intervals> {
     let column = |interval: fn(&Intervals) -> i64| median(sessions.iter().map(interval).collect());
@@ -404,4 +598,82 @@ fn median(mut values: Vec<i64>) -> Option<i64> {
 /// zero.
 fn unsigned(duration: i64) -> u32 {
     u32::try_from(duration.max(0)).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::js::json;
+
+    fn base() -> Value {
+        serde_json::json!({
+            "browser": {"inner_width": 1919, "inner_height": 992},
+            "second": {"facts": {}, "image": {"effective_type": "", "online": true},
+                "document": {"shadow_root": "{}"}},
+        })
+    }
+
+    #[test]
+    fn places_the_widget_at_the_median_edges_centred_in_the_viewport() {
+        let reported = Reported {
+            placements: vec![(304.0, 1407.5), (300.0, 1407.5), (310.0, 1400.0)],
+            ..Reported::default()
+        };
+        let (mut profile, mut notes) = (base(), Vec::new());
+        reported.fill_placement(&mut profile, &mut notes).unwrap();
+        assert_eq!(
+            profile["browser"]["challenge_page"],
+            serde_json::json!({"top": 304.0, "left": 511.5, "right": 1407.5})
+        );
+        assert_eq!(
+            placement(&JsObject::from_iter([(
+                PARENT_INFO_WIDGET_POSITION.to_owned(),
+                json!("378|359")
+            )]))
+            .unwrap(),
+            (378.0, 359.0)
+        );
+        assert!(placement(&JsObject::new()).is_err());
+    }
+
+    #[test]
+    fn learns_the_connection_and_matches_the_image_probe_to_it() {
+        let session = |downlink: f64, rtt: f64| {
+            js::from_value::<JsObject>(json!({"downlink": downlink, "downlinkMax": null,
+                "effectiveType": "4g", "rtt": rtt, "saveData": false, "type": null}))
+            .unwrap()
+        };
+        let reported = Reported {
+            connections: vec![session(1.75, 100.0), session(1.45, 0.0), session(1.6, 0.0)],
+            ..Reported::default()
+        };
+        let (mut profile, mut notes) = (base(), Vec::new());
+        reported.fill_connection(&mut profile, &mut notes).unwrap();
+        assert_eq!(
+            profile["second"]["facts"]["connection"],
+            serde_json::json!({"downlink": 1.6, "effectiveType": "4g", "rtt": 0.0, "saveData": false})
+        );
+        assert_eq!(profile["second"]["image"]["effective_type"], "4g");
+
+        // Safari has no `navigator.connection`: its sessions leave the profile as it was.
+        let safari = Reported {
+            connections: vec![JsObject::new()],
+            ..Reported::default()
+        };
+        let mut unchanged = base();
+        safari.fill_connection(&mut unchanged, &mut notes).unwrap();
+        assert_eq!(unchanged, base());
+    }
+
+    #[test]
+    fn takes_the_shadow_root_report_seen_most_often() {
+        let chrome = r#"[null,"closed","<body></body>","",4,4,37,"function attachShadow() { [native code] }"]"#;
+        let reported = Reported {
+            shadow_roots: vec![chrome.into(), "odd".into(), chrome.into()],
+            ..Reported::default()
+        };
+        let (mut profile, mut notes) = (base(), Vec::new());
+        reported.fill_shadow_root(&mut profile, &mut notes).unwrap();
+        assert_eq!(profile["second"]["document"]["shadow_root"], chrome);
+    }
 }
