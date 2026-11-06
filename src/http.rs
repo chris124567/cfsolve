@@ -17,6 +17,6 @@ pub(crate) use header_order::RequestKind;
 pub use referrer::ReferrerPolicy;
 pub use requests::{
     FetchOptions, Iframe, PageDocument, ScriptLoad, fetch_from_worker, fetch_iframe, fetch_image,
-    fetch_orchestrator, fetch_page_image, fetch_script, navigate, open_websocket, post_challenge,
+    fetch_page_image, fetch_page_script, fetch_script, navigate, open_websocket, post_challenge,
     post_orchestrator, submit_form,
 };

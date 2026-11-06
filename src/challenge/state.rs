@@ -27,6 +27,9 @@ use crate::resource_timing::LoadTiming;
 pub struct ScriptState {
     /// Options assigned `Date.now()`.
     pub marks: Vec<Mark>,
+    /// Marks copied into other options when they are taken. A precursor interstitial's startup
+    /// takes its marks this way, so each pair holds one time.
+    pub copies: Vec<Difference>,
     pub counters: Option<Tally>,
     /// Recovered event mapping for the interaction tally. Keeps any recovery error until
     /// interaction code requests the mapping.
@@ -177,8 +180,14 @@ impl ScriptState {
             options,
             stack: Vec::new(),
             found: Vec::new(),
+            copies: Vec::new(),
         };
         script.visit_with(&mut scopes);
+        let copies = scopes
+            .copies
+            .into_iter()
+            .filter(|copy| scopes.found.iter().any(|mark| mark.option == copy.earlier))
+            .collect();
         let mut sender = Sender::default();
         script.visit_with(&mut sender);
         let post_log = sender.post_log()?;
@@ -206,13 +215,29 @@ impl ScriptState {
                 candidates::at_most_one_distinct(reductions, "resource timing reducer")?
                     .map(|fields| ResourceTiming { option, fields })
             }
-            None => None,
+            // A page orchestrator has no such function: the programs it runs read the option
+            // its reducer collects entries into.
+            None => {
+                let reducers = ast::in_declared_functions(script, |function| {
+                    let body = function.function.body.as_ref()?;
+                    let fields = reduced_timing::reduction(body)?;
+                    let collection = reduced_timing::collection(body);
+                    Some(collection.map(|option| option.map(|option| (option, fields))))
+                });
+                let collections: Vec<Option<_>> = reducers.into_iter().collect::<Result<_>>()?;
+                candidates::at_most_one_distinct(
+                    collections.into_iter().flatten(),
+                    "resource timing collection",
+                )?
+                .map(|(option, fields)| ResourceTiming { option, fields })
+            }
         };
         let counter_events = counters
             .as_ref()
             .map(|tally| CounterEvents::recover(script, tally));
         Ok(Self {
             marks: scopes.found,
+            copies,
             counters,
             counter_events,
             elapsed: elapsed.map(|(_, elapsed)| elapsed),
@@ -284,6 +309,12 @@ impl ScriptState {
             let start = *clock.entry(&difference.earlier).or_insert(start);
             clock.entry(&difference.later).or_insert(start + duration);
         }
+        // Copied marks are taken together at startup, so the payloads that report them, this
+        // one or a later program's, see no time between them.
+        for Difference { later, earlier } in &self.copies {
+            let start = *clock.entry(earlier).or_insert(merged_at + 1);
+            clock.entry(later).or_insert(start);
+        }
         clock
             .into_iter()
             .map(|(option, when)| (option.to_owned(), JsValue::from(when)))
@@ -346,6 +377,8 @@ struct Scopes<'options> {
     /// The enclosing functions, innermost last.
     stack: Vec<Scope>,
     found: Vec<Mark>,
+    /// Options assigned another option, as `later = earlier`.
+    copies: Vec<Difference>,
 }
 
 /// One function's timestamp options, and whether it holds the payload template.
@@ -378,11 +411,17 @@ impl Visit for Scopes<'_> {
     }
 
     fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let Some(option) = expression::option_assignment(&assignment.left)
-            && ast::is_date_now(&assignment.right)
-            && let Some(scope) = self.stack.last_mut()
-        {
-            scope.marks.push(option.to_owned());
+        if let Some(option) = expression::option_assignment(&assignment.left) {
+            if ast::is_date_now(&assignment.right)
+                && let Some(scope) = self.stack.last_mut()
+            {
+                scope.marks.push(option.to_owned());
+            } else if let Some(copied) = expression::option_key(assignment.right.unwrap_parens()) {
+                self.copies.push(Difference {
+                    later: option.to_owned(),
+                    earlier: copied.to_owned(),
+                });
+            }
         }
         assignment.visit_children_with(self);
     }
@@ -730,6 +769,31 @@ mod tests {
         let intervals = &crate::browser::Browser::safari().page.intervals;
         let at = script.timestamps(&differences, Some("merged"), 0, intervals);
         assert_eq!(JsValue::from(at).to_string(), r#"{"merged":0,"a":1,"b":8}"#);
+    }
+
+    /// A precursor interstitial's startup takes each mark and copies it at once, so later
+    /// payloads report no time between the two. Without `pi`, that startup never runs.
+    #[test]
+    fn stamps_a_mark_and_its_copy_together() {
+        let source = |options: &str| {
+            format!(
+                "(function() {{ window._cf_chl_opt = {{{options}}}; }})();
+                function begin() {{
+                    if (w._cf_chl_opt.pi) {{
+                        w._cf_chl_opt.a = Date.now();
+                        w._cf_chl_opt.b = w._cf_chl_opt.a;
+                        w._cf_chl_opt.c = w._cf_chl_opt.cType;
+                        return;
+                    }}
+                }}"
+            )
+        };
+        let intervals = &crate::browser::Browser::safari().page.intervals;
+        let script = ScriptState::from_javascript(&source("pi: true, cType: 'x'")).unwrap();
+        let at = script.timestamps(&[], None, 100, intervals);
+        assert_eq!(JsValue::from(at).to_string(), r#"{"a":101,"b":101}"#);
+        let script = ScriptState::from_javascript(&source("cType: 'x'")).unwrap();
+        assert!(script.copies.is_empty());
     }
 
     /// Builds from 2026-10-27 onward log each POST and include the log in every payload.

@@ -5,7 +5,7 @@ use serde::Serialize;
 use url::Url;
 use wreq::cookie::Cookie;
 
-use super::challenge_page::{self, OrchestratorSession};
+use super::challenge_page::{self, Begun, OrchestratorSession, PrecursorSession};
 use super::channel::{Channel, Origin, PostResult, Stage};
 use super::initial::{self, EmbeddingPage, Fetched, Merged};
 use super::timing::Timer;
@@ -93,13 +93,24 @@ pub(crate) async fn native(
     expect: Expect<'_>,
     solve: &Solve,
 ) -> Result<Outcome> {
-    let landing = land(client, sink, document, navigation, page, expect).await?;
-    let embedding_page = landing.embedding_page();
-    let session = start_widget(client, sink, page, embedding_page).await?;
-    let completion = session.solve(embedding_page, solve).await?;
-    match landing {
-        Landing::Site(_) => Ok(Outcome::Token(completion.token)),
-        Landing::ChallengePage(orchestrator, _) => {
+    let (orchestrator, embedding_page) =
+        match land(client, sink, document, navigation, page, expect).await? {
+            Landing::Site(embedding_page) => (None, embedding_page),
+            Landing::ChallengePage(orchestrator, embedding_page) => {
+                (Some(orchestrator), embedding_page)
+            }
+            // The precursor script takes the widget's place, so the orchestrator clears the page
+            // on its own.
+            Landing::Precursor(precursor) => {
+                let clearance = precursor.clear(client, sink).await?;
+                return Ok(Outcome::Cleared(clearance));
+            }
+        };
+    let session = start_widget(client, sink, page, &embedding_page).await?;
+    let completion = session.solve(&embedding_page, solve).await?;
+    match orchestrator {
+        None => Ok(Outcome::Token(completion.token)),
+        Some(orchestrator) => {
             let clearance = orchestrator.clear(&session, completion).await?;
             Ok(Outcome::Cleared(clearance))
         }
@@ -117,8 +128,17 @@ pub(crate) async fn send_first_payload(
     page: &Page,
     expect: Expect<'_>,
 ) -> Result<()> {
-    let landing = land(client, sink, document, navigation, page, expect).await?;
-    start_widget(client, sink, page, landing.embedding_page()).await?;
+    match land(client, sink, document, navigation, page, expect).await? {
+        Landing::Site(embedding_page) | Landing::ChallengePage(_, embedding_page) => {
+            start_widget(client, sink, page, &embedding_page).await?;
+        }
+        // A precursor interstitial renders no widget: the orchestrator's first payload was the
+        // page's first.
+        Landing::Precursor(_) => sink.progress(
+            "The orchestrator loads the precursor script instead of rendering a widget, so no \
+             widget payload was sent",
+        ),
+    }
     Ok(())
 }
 
@@ -128,17 +148,14 @@ enum Landing {
     Site(EmbeddingPage),
     /// A challenge page, whose orchestrator has rendered its widget.
     ChallengePage(Box<OrchestratorSession>, EmbeddingPage),
-}
-
-impl Landing {
-    fn embedding_page(&self) -> &EmbeddingPage {
-        let (Self::Site(embedding_page) | Self::ChallengePage(_, embedding_page)) = self;
-        embedding_page
-    }
+    /// A precursor interstitial, whose orchestrator loads the precursor script instead of
+    /// rendering a widget.
+    Precursor(Box<PrecursorSession>),
 }
 
 /// Checks the page against `expect` and rebuilds the embedding page of the widget it names. On
-/// a challenge page, first runs the orchestrator through widget creation.
+/// a challenge page, first runs the orchestrator through its first response, which renders the
+/// widget or loads the precursor script.
 async fn land(
     client: &BrowserClient,
     sink: &dyn Sink,
@@ -167,7 +184,7 @@ async fn land(
         "{} answered HTTP {status} with a challenge page; running its orchestrator",
         document.url
     ));
-    let (orchestrator, embedding_page) = challenge_page::begin(
+    let begun = challenge_page::begin(
         client,
         sink,
         page,
@@ -176,10 +193,12 @@ async fn land(
         document.referrer_policy,
     )
     .await?;
-    Ok(Landing::ChallengePage(
-        Box::new(orchestrator),
-        embedding_page,
-    ))
+    Ok(match begun {
+        Begun::Widget(orchestrator, embedding_page) => {
+            Landing::ChallengePage(orchestrator, *embedding_page)
+        }
+        Begun::Precursor(precursor) => Landing::Precursor(precursor),
+    })
 }
 
 /// Starts the session of the widget rendered by `embedding_page` by sending its first payload.

@@ -14,7 +14,7 @@ use url::Url;
 use crate::candidates;
 use crate::challenge::expression;
 use crate::js::ast::{self, ParsedScript};
-use crate::js::{JsValue, Options};
+use crate::js::{self, JsValue, Options};
 use crate::script::Source;
 
 /// Minimum property count distinguishing a payload template from an ordinary options object.
@@ -23,8 +23,14 @@ const PAYLOAD_FIELDS: usize = 20;
 /// for non-interactive widgets. The containing option name varies by session.
 const INITIAL_CHALLENGE: &str = "chl_api_";
 /// Challenge types used by page orchestrators. Count these only when no option has an iframe's
-/// `chl_api_` type. A page may require interaction but cannot be invisible.
-const PAGE_CHALLENGES: [&str; 3] = ["managed", "non-interactive", "interactive"];
+/// `chl_api_` type. A page may require interaction but cannot be invisible. A precursor
+/// interstitial is the managed check some sites show on every path before any clearance.
+const PAGE_CHALLENGES: [&str; 4] = [
+    "managed",
+    "non-interactive",
+    "interactive",
+    "precursor_interstitial",
+];
 /// Turnstile iframe modes echoed by the embedding page's summary.
 const WIDGET_MODES: [&str; 3] = ["managed", "non-interactive", "invisible"];
 
@@ -176,6 +182,14 @@ pub(crate) fn visit_taken_branches<V: Visit>(
     } else {
         conditional.visit_children_with(visitor);
     }
+}
+
+/// Whether `test` reads an option the page sets to a truthy value, as in `if (_cf_chl_opt.pi)`.
+#[must_use]
+pub(crate) fn is_set_option(test: &Expr, options: &Options) -> bool {
+    expression::option_key(test.unwrap_parens())
+        .and_then(|option| options.get(option))
+        .is_some_and(js::truthy)
 }
 
 /// Follows option renaming during orchestrator startup. Recognizes copies of

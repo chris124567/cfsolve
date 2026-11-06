@@ -2,8 +2,13 @@
 //! client's fetch measurements to that format. Depending on the build, entries contain rounded-down
 //! phase durations or the original timestamps.
 
-use swc_core::ecma::ast::{AssignTarget, BinaryOp, BlockStmt, Expr, SimpleAssignTarget};
+use anyhow::Result;
+use swc_core::ecma::ast::{
+    AssignTarget, BinaryOp, BlockStmt, Expr, MemberExpr, SimpleAssignTarget,
+};
+use swc_core::ecma::visit::{Visit, VisitWith};
 
+use crate::candidates;
 use crate::challenge::expression::{self, BuiltObject, ObjectField};
 use crate::js::{JsObject, JsValue, ast, json};
 use crate::resource_timing::{LoadTiming, Phases, ResourceMeasurement};
@@ -123,6 +128,27 @@ pub(super) fn reduction(body: &BlockStmt) -> Option<Vec<(String, Measure)>> {
     built
         .iter()
         .find_map(|object| reduced_fields(&object.fields, &measured))
+}
+
+/// The option a reducer's `body` pushes its entries into, as `_cf_chl_opt.<name>?.push(entry)`.
+/// A page orchestrator collects them there for the programs it runs to read.
+pub(super) fn collection(body: &BlockStmt) -> Result<Option<String>> {
+    struct Pushes(Vec<String>);
+
+    impl Visit for Pushes {
+        fn visit_member_expr(&mut self, member: &MemberExpr) {
+            if ast::member_str(&member.prop) == Some("push")
+                && let Some(option) = expression::option_key(member.obj.unwrap_parens())
+            {
+                self.0.push(option.to_owned());
+            }
+            member.visit_children_with(self);
+        }
+    }
+
+    let mut pushes = Pushes(Vec::new());
+    body.visit_with(&mut pushes);
+    candidates::at_most_one_distinct(pushes.0, "resource timing collection")
 }
 
 /// Recognizes a reduced entry when it has enough fields, includes the resource name, and uses

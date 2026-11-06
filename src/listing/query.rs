@@ -239,8 +239,44 @@ impl Index<'_> {
     #[must_use]
     pub(crate) fn option_read(&self, pc: u32, term: &Term) -> Option<String> {
         let option = self.member(pc, term)?;
-        let options = self.member(option.pc, &option.object)?;
-        (options.key == "_cf_chl_opt").then_some(option.key)
+        self.holds_options(option.pc, &option.object)
+            .then_some(option.key)
+    }
+
+    /// Whether `term` holds `window._cf_chl_opt` at `pc`: a read of it, or a copy of the object
+    /// the program has installed there, as `window._cf_chl_opt = window._cf_chl_opt || {}`
+    /// does. [`Index::dereference`] follows only the last of that assignment's two paths, the
+    /// new object.
+    #[must_use]
+    pub(crate) fn holds_options(&self, mut pc: u32, term: &Term) -> bool {
+        let mut term = term.clone();
+        for _ in 0..DEREFERENCE_FUEL {
+            if self
+                .member(pc, &term)
+                .is_some_and(|member| member.key == "_cf_chl_opt")
+            {
+                return true;
+            }
+            let Term::Reg(register) = term else {
+                return false;
+            };
+            let assigned = self.assigning_before(pc, register);
+            let installed = self.stores().iter().any(|store| {
+                store.key == "_cf_chl_opt"
+                    && store.value == Term::Reg(register)
+                    && store.pc < pc
+                    && assigned.is_none_or(|assigned| assigned < store.pc)
+                    && self.reads(store.pc, &Term::Reg(store.object), "window")
+            });
+            if installed {
+                return true;
+            }
+            let Some(next) = self.assignment(pc, register) else {
+                return false;
+            };
+            (pc, term) = next;
+        }
+        false
     }
 
     /// Finds a record's start, finish, and duration stores. Uses the first `finished - started`
@@ -274,5 +310,73 @@ impl Index<'_> {
             "record needs two wall-clock marks"
         );
         Ok([started, finished, duration])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::{Exit, Path, Position};
+
+    fn string(text: &str) -> Term {
+        Term::Const(Constant::String(text.into()))
+    }
+
+    fn get(object: u8, key: &str) -> Term {
+        Term::Get(Box::new(Term::Reg(object)), Box::new(string(key)))
+    }
+
+    /// One straight-line function from pc 0, an instruction per effect.
+    fn listing(effects: Vec<Effect>) -> Listing {
+        let mut listing = Listing {
+            functions: vec![Position::new(0, 0)],
+            ..Listing::default()
+        };
+        let count = u32::try_from(effects.len()).unwrap();
+        for (pc, effect) in (0..).zip(effects) {
+            let exit = if pc + 1 == count {
+                Exit::Return
+            } else {
+                Exit::Next { pc: pc + 1, key: 0 }
+            };
+            let path = Path {
+                conditions: Vec::new(),
+                effects: vec![effect],
+                exit,
+            };
+            let instruction = Instruction {
+                pc,
+                key: 0,
+                opcode: 0,
+                paths: vec![path],
+            };
+            listing.instructions.insert(pc, instruction);
+        }
+        listing
+    }
+
+    /// `options = window._cf_chl_opt || (window._cf_chl_opt = {})` leaves `{}` as the options
+    /// register's last assignment, so only the store says it holds the options.
+    #[test]
+    fn reads_options_through_the_object_the_program_installs() {
+        let listing = listing(vec![
+            Effect::Set(2, get(9, "window")),
+            Effect::Set(3, get(2, "_cf_chl_opt")),
+            Effect::Set(3, Term::Object(Vec::new())),
+            Effect::SetProperty {
+                object: Box::new(Term::Reg(2)),
+                key: Box::new(string("_cf_chl_opt")),
+                value: Box::new(Term::Reg(3)),
+            },
+            Effect::Set(4, Term::Reg(3)),
+            Effect::Set(5, get(4, "ray")),
+            Effect::Set(6, Term::Object(Vec::new())),
+            Effect::Set(7, get(6, "ray")),
+        ]);
+        let index = Index::new(&listing);
+        assert!(index.holds_options(6, &Term::Reg(4)));
+        assert_eq!(index.option_read(6, &Term::Reg(5)).as_deref(), Some("ray"));
+        assert!(!index.holds_options(8, &Term::Reg(6)));
+        assert_eq!(index.option_read(8, &Term::Reg(7)), None);
     }
 }

@@ -61,12 +61,13 @@ fn expression(known: Known<Held>) -> Option<Expression> {
 
 fn resolve(term: &Term, frame: &Frame<Held>, pool: &str) -> Option<Known<Held>> {
     let resolve = |term: &Term| resolve(term, frame, pool);
-    // Whether `callee` is the method `name` of the global `object`.
+    // Whether `callee` is the method `name` of the global `object`. Some builds keep the
+    // method's name in a register.
     let method = |callee: &Term, object: Held, name: &str| {
         let object = Some(Known::Ext(object));
         matches!(callee, Term::Get(receiver, key)
             if resolve(receiver) == object
-                && matches!(&**key, Term::Const(Constant::String(text)) if text == name))
+                && resolve(key).as_ref().and_then(Known::text) == Some(name))
     };
     Some(match term {
         Term::Cell(PAYLOAD_CELL) => read(Scope::Input, Vec::new()),
@@ -616,4 +617,27 @@ pub(in crate::stage2) fn scan(index: &Index<'_>, pool: &str) -> Scan {
         function.published = function.published.or(publication);
     }
     Scan(functions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Some builds load `JSON.parse` through a register holding `"parse"` before calling it.
+    #[test]
+    fn parses_json_through_a_method_named_in_a_register() {
+        let mut frame: Frame<Held> = Frame::default();
+        frame.set(25, Some(Known::Ext(Held::Json)));
+        frame.set(28, Some(Known::Literal(json!("parse"))));
+        let call = Term::Call {
+            callee: Box::new(Term::Get(Box::new(Term::Reg(25)), Box::new(Term::Reg(28)))),
+            this: None,
+            arguments: vec![Term::Const(Constant::String("[1]".into()))],
+        };
+        let parsed = resolve(&call, &frame, "");
+        assert!(
+            parsed == Some(Known::Literal(json!([1]))),
+            "JSON.parse was not folded"
+        );
+    }
 }
