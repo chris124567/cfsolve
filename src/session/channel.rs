@@ -113,9 +113,16 @@ impl Channel<'_> {
             "SessionEncoder::encode({stage:?}) output=String(bytes={})",
             body.len()
         ));
-        timing::sleep_until(submission.send_at).await;
+        // The probes' payload goes out shortly after its records are in — the pacing clamp
+        // keeps a short spread while every other stage waits for its scheduled time.
+        match stage {
+            Stage::Probes => {
+                timing::sleep_clamped(submission.send_at, timing::pacing_cap_ms()).await
+            }
+            _ => timing::sleep_until(submission.send_at).await,
+        }
         crate::perf_stamp::stamp(&format!(
-            "session::timing::sleep_until({stage:?}) output=()"
+            "session::timing::sleep_clamped({stage:?}) output=()"
         ));
         self.post(body, stage).await
     }

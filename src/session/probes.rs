@@ -325,7 +325,7 @@ async fn run_probes(
             )
         );
         let finished = if requests {
-            timing::sleep_until(timeline.next_start).await;
+            timing::sleep_clamped(timeline.next_start, timing::pacing_cap_ms()).await;
             request(session, probe, options, profile, observed, &mut fetches).await?;
             Some(performance_clock::epoch_ms())
         } else {
