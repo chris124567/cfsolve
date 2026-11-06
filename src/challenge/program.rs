@@ -166,6 +166,12 @@ impl<'source> PreparedSession<'source> {
         let initial_program = STANDARD
             .decode(initial_program.trim())
             .context("decoding the initial VM program")?;
+        if std::env::var_os("CFSOLVE_DET_LOG").is_some() {
+            eprintln!(
+                "program::try_new initial VM program decoded bytes={}",
+                initial_program.len()
+            );
+        }
         // The program installs the key transform as `window[name] = factory(secret)`.
         let installed = installed::read(source, &initial_program)?;
         let secret = installed.built.get(&root.key_transform).with_context(|| {

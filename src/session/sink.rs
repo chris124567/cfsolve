@@ -5,6 +5,11 @@ use serde::Serialize;
 
 /// Destination for session artifacts and progress messages.
 pub trait Sink: Send + Sync {
+    /// Optional process-local solve ID used to correlate concurrent progress and detail logs.
+    /// Implementations that do not need correlation can keep the default.
+    fn trace_id(&self) -> Option<u64> {
+        None
+    }
     /// Saves `contents` under artifact `name` as soon as it is available.
     fn artifact(&self, name: &str, contents: &[u8]) -> Result<()>;
     /// Receives progress messages during a solve, including diagnostics before a failure.

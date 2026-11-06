@@ -72,11 +72,12 @@ pub(crate) async fn collect(
     let queried = checkbox::queries(&fetched.source, options)?;
     let script_position = fetched.script_position()?;
     let geometry = call_stack::recover(
-        &fetched.javascript,
+        &fetched.decoding,
         &fetched.cases,
         plan.diagnostics.construct,
         plan.diagnostics.callback_arity,
-    )?;
+    )
+    .await?;
     let engine = session.client.engine();
     let stack = geometry.format(&script_position, engine);
     let clock = PerformanceClock::from_epoch_origin(
@@ -87,6 +88,7 @@ pub(crate) async fn collect(
     let setup_ms = performance_clock::epoch_ms();
     let mut observed = native::measure(viewport, &fetched.iframe.html, clock.now(), engine);
     let ready_ms = performance_clock::epoch_ms();
+    crate::perf_stamp::stamp("interaction::native::measure output=Measurement");
     let (client_x, client_y) = observed.click_point()?;
     let delay = Duration::from_millis(viewport.ready_delay_ms);
     let mut input_events = if viewport.touch {
@@ -136,6 +138,7 @@ pub(crate) async fn collect(
         solve.profile.facts.proof_worker.clone(),
     );
     timing::sleep_until(launch_ms).await;
+    crate::perf_stamp::stamp("session::timing::sleep_until(click) output=()");
     let launch_ms = performance_clock::epoch_ms();
     fields.insert(
         plan.initialization.proof_started.clone(),
@@ -147,6 +150,10 @@ pub(crate) async fn collect(
     })
     .await
     .context("the proof thread failed")??;
+    crate::perf_stamp::stamp(&format!(
+        "proof::search output=Search(workers={})",
+        search.workers
+    ));
     let elapsed = clock.now() - began;
     let finished_ms = performance_clock::epoch_ms();
     fields.extend(

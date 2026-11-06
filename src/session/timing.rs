@@ -4,6 +4,7 @@
 //! [`Instant`] durations for resource timing, and the iframe's performance clock for input and
 //! proof (see [`crate::performance_clock`]).
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use tokio::time;
@@ -59,6 +60,30 @@ impl Timer {
 /// Waits until `at_ms` in epoch milliseconds, returning immediately if that time has passed.
 pub(crate) async fn sleep_until(at_ms: i64) {
     let wait = at_ms - performance_clock::epoch_ms();
+    if wait > 0 {
+        time::sleep(Duration::from_millis(wait as u64)).await;
+    }
+}
+
+/// The longest wait the pacing clamp allows, in milliseconds. `CFSOLVE_PROBE_PACING_MS`
+/// overrides the default; a cap of `0` skips the wait entirely.
+#[must_use]
+pub(crate) fn pacing_cap_ms() -> i64 {
+    static CAP: OnceLock<i64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CFSOLVE_PROBE_PACING_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .filter(|cap| *cap >= 0)
+            .unwrap_or(120)
+    })
+}
+
+/// Waits until `at_ms` in epoch milliseconds, but for no more than `cap_ms`. The pacing
+/// clamp shortens the wait between a scheduled submission and its ready time without
+/// touching how the schedule itself is built.
+pub(crate) async fn sleep_clamped(at_ms: i64, cap_ms: i64) {
+    let wait = (at_ms - performance_clock::epoch_ms()).min(cap_ms);
     if wait > 0 {
         time::sleep(Duration::from_millis(wait as u64)).await;
     }

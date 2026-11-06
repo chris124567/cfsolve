@@ -123,10 +123,21 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     // Include `cf-chl-peek` when resolving hashed comparisons. The worker-fetch probe reads
     // this header but does not store its name as a program string.
     let machine = source.machine()?;
+    crate::perf_stamp::stamp("Source::machine output=Machine");
     let listing = machine.disassemble_from(program, &[machine.entry()], &["cf-chl-peek"])?;
+    crate::perf_stamp::stamp(&format!(
+        "Machine::disassemble_from output=Listing(instructions={}, failures={})",
+        listing.instructions.len(),
+        listing.failures.len()
+    ));
     let index = Index::new(&listing);
+    crate::perf_stamp::stamp("listing::Index::new output=Index");
     let (pool_pc, pool) = index.pool()?;
     let discovery = discovery::discover(&index, pool)?;
+    crate::perf_stamp::stamp(&format!(
+        "analysis::discovery::discover output=Discovery(probes={})",
+        discovery.probes.len()
+    ));
     let mut wrapper: BTreeSet<String> = discovery
         .probes
         .first()
@@ -214,6 +225,7 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
         });
     }
     let scan = payload::scan(&index, pool);
+    crate::perf_stamp::stamp("stage2::payload::scan output=Scan");
     let record_fields = envelope::recover(
         &index,
         &probes,
@@ -225,6 +237,11 @@ pub fn analyze(source: &Source, program: &[u8]) -> Result<Analysis> {
     let payload = scan.layout(&record_fields.counter)?;
     let controller_trace = Trace::recover(source)
         .and_then(|trace| controller_frame(&index, &evidence, trace.push.as_deref()?));
+    crate::perf_stamp::stamp(&format!(
+        "analysis::analyze output=Analysis(probes={}, instructions={})",
+        probes.len(),
+        listing.instructions.len()
+    ));
     Ok(Analysis {
         plan: ProbePlan {
             record_fields,

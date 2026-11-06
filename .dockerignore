@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.gemini/
+debug_solve*
+artifacts/
+cfsolve-go/
+node_modules/
+*.bat
+*.ps1
+*.ts
+rust-toolchain.toml
