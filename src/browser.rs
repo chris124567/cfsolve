@@ -178,7 +178,11 @@ impl Browser {
             );
         }
         facts.navigator = navigator(
-            answers.as_ref().map(|answers| &answers.navigator),
+            // Both sets of answers come from the same browser; a profile may store only one.
+            answers
+                .as_ref()
+                .or(challenge_page_answers.as_ref())
+                .map(|answers| &answers.navigator),
             mem::take(&mut facts.navigator),
             transport
                 .headers
@@ -416,6 +420,21 @@ mod tests {
         assert_eq!(solve.profile.image.effective_type, "4g");
         assert!(solve.profile.image.online);
         assert!(solve.answers.is_none());
+    }
+
+    /// A profile captured only on challenge pages takes its navigator from those answers.
+    #[test]
+    fn challenge_page_answers_alone_supply_the_navigator() {
+        let mut fingerprint = complete();
+        fingerprint["second"]["facts"]["navigator"] = serde_json::json!({});
+        let answers: Answers = serde_json::from_str(include_str!(
+            "../profiles/safari-26-ios/challenge-page-answers.json"
+        ))
+        .unwrap();
+        let browser = Browser::try_new(fingerprint, None, Some(answers)).unwrap();
+        let navigator = &browser.solve.profile.facts.navigator;
+        assert_eq!(navigator["platform"], "iPhone");
+        assert_eq!(browser.solve.hardware_concurrency, 4.0);
     }
 
     #[test]
