@@ -127,6 +127,8 @@ pub(crate) const PARENT_INFO_REFERRER: &str = "_31a6173d1692e77e5a1005d5";
 pub(crate) const PARENT_INFO_MISSING: &str = "_10450802c4fb954516e0c07b";
 pub(crate) const PARENT_INFO_REASONS: &str = "_cd7d13df270697c8781d261c";
 pub(crate) const PARENT_INFO_VISIBILITY: &str = "_4172551fe148377bcda1f7b5";
+/// The widget wrapper's `top|right` on the embedding page, from `getBoundingClientRect()`.
+pub(crate) const PARENT_INFO_WIDGET_POSITION: &str = "_5ef82acb130f4537ed9aac35";
 /// The output the embedding page's `pad` property is copied to.
 pub(crate) const PARENT_INFO_PAD: &str = "_e5caf599351485e860642415";
 /// Pairs of output fields and parent-info properties copied directly.
@@ -134,7 +136,7 @@ pub(crate) const PARENT_INFO_DIRECT: [(&str, &str); 16] = [
     ("_6e1dc8b6953acf52c04a8602", "vDuh"),
     ("_4f08666db7270b9f907f663c", "vDie"),
     ("_c8cb367a7b94d575149530e3", "xp"),
-    ("_5ef82acb130f4537ed9aac35", "wp"),
+    (PARENT_INFO_WIDGET_POSITION, "wp"),
     ("_62193c48d482daf2700a995c", "pfp"),
     ("_1c113a764991c259adfcf85b", "sL"),
     ("_3da484dbed1006c654fac96e", "ssL"),
