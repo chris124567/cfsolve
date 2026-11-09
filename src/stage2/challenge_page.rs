@@ -20,6 +20,7 @@ use crate::stage2::call_stack::MethodCall;
 use crate::stage2::payload::{
     self, Document, Environment, Expression, Layout, RecordTemplate, Recovered, Scope, State,
 };
+use crate::stage2::queries;
 use crate::vm::{Constant, Effect, Listing, Term};
 
 /// Widget parameters passed to `turnstile.render`, excluding callbacks.
@@ -220,7 +221,7 @@ impl Reader<'_> {
             scope,
             path: vec![name],
         };
-        if let Some(name) = self.index.option_read(pc, term) {
+        if let Some(name) = queries::option_read(self.index, pc, term) {
             return Some(read(Scope::Options, name));
         }
         let (at, value) = self.index.dereference(pc, term)?;
@@ -411,7 +412,7 @@ impl Reader<'_> {
             .position(|store| self.index.reads(store.pc, &store.value, started))
             .context("record's start is never copied")?;
         let closing: Vec<&Store> = stores[copy..].iter().collect();
-        let marks = self.index.clock_marks(&closing)?;
+        let marks = queries::clock_marks(self.index, &closing)?;
         ensure!(
             marks[0].pc == stores[copy].pc,
             "record's duration does not start at its copied start"

@@ -4,10 +4,10 @@
 mod cli;
 mod io;
 
-use std::env;
 use std::sync::Arc;
+use std::{env, fs};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cfsolve::{Browser, Options, Outcome};
 use tokio::runtime::Builder;
 
@@ -21,9 +21,14 @@ fn main() -> Result<()> {
     };
     // Load the browser before any network access.
     let browser = Browser::read(&arguments.fingerprint)?;
+    let trusted_root = arguments
+        .trust_ca
+        .map(|path| fs::read(&path).with_context(|| format!("reading {}", path.display())))
+        .transpose()?;
     let artifacts = Artifacts::try_new(arguments.directory)?;
     let options = Options {
         proxy: arguments.proxy,
+        trusted_root,
         sink: Some(Arc::new(artifacts)),
     };
     let runtime = Builder::new_multi_thread().enable_all().build()?;

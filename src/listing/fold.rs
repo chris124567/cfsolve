@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 
-use swc_core::ecma::ast::{BinaryOp, UnaryOp};
+use oxc::syntax::operator::{BinaryOperator, UnaryOperator};
 
 use crate::js::{JsValue, json};
 use crate::vm::dataflow::Facts;
@@ -200,14 +200,18 @@ pub(crate) fn feasible<X>(path: &Path, resolve: impl Fn(&Term) -> Option<Known<X
 /// known values count as defined, and comparisons between them stay undecided.
 fn truth<X>(condition: &Term, resolve: &impl Fn(&Term) -> Option<Known<X>>) -> Option<bool> {
     match condition {
-        Term::Unary(UnaryOp::Bang, inner) => truth(inner, resolve).map(|value| !value),
-        Term::Binary(operator @ (BinaryOp::EqEqEq | BinaryOp::NotEqEq), left, right) => {
+        Term::Unary(UnaryOperator::LogicalNot, inner) => truth(inner, resolve).map(|value| !value),
+        Term::Binary(
+            operator @ (BinaryOperator::StrictEquality | BinaryOperator::StrictInequality),
+            left,
+            right,
+        ) => {
             let equal = match (resolve(left)?, resolve(right)?) {
                 (Known::Undefined, Known::Undefined) => true,
                 (Known::Undefined, _) | (_, Known::Undefined) => false,
                 _ => return None,
             };
-            Some(equal == (*operator == BinaryOp::EqEqEq))
+            Some(equal == (*operator == BinaryOperator::StrictEquality))
         }
         _ => None,
     }
@@ -218,7 +222,7 @@ mod tests {
     use super::*;
     use crate::vm::Exit;
 
-    fn strict(operator: BinaryOp, left: Term, right: Term) -> Term {
+    fn strict(operator: BinaryOperator, left: Term, right: Term) -> Term {
         Term::Binary(operator, Box::new(left), Box::new(right))
     }
 
@@ -312,13 +316,19 @@ mod tests {
         frame.set(2, Some(Known::Decoder));
         frame.set(3, Some(Known::Literal(json!("a"))));
         let undefined = || Term::Const(Constant::Undefined);
-        let is_undefined = |register| strict(BinaryOp::EqEqEq, Term::Reg(register), undefined());
+        let is_undefined = |register| {
+            strict(
+                BinaryOperator::StrictEquality,
+                Term::Reg(register),
+                undefined(),
+            )
+        };
         let a = Term::Const(Constant::String("a".into()));
         let same_as_a = Term::Unary(
-            UnaryOp::Bang,
-            Box::new(strict(BinaryOp::NotEqEq, Term::Reg(3), a)),
+            UnaryOperator::LogicalNot,
+            Box::new(strict(BinaryOperator::StrictInequality, Term::Reg(3), a)),
         );
-        let loose = strict(BinaryOp::EqEq, Term::Reg(1), undefined());
+        let loose = strict(BinaryOperator::Equality, Term::Reg(1), undefined());
         // A condition, the outcome the path requires, and whether the path stays feasible.
         let cases = [
             // An undefined receiver selects the call without one and rules out the call with one.

@@ -10,26 +10,30 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use anyhow::{Context, Result, bail, ensure};
-use swc_core::atoms::Atom;
-use swc_core::ecma::ast::{
-    AssignExpr, AssignTarget, BinaryOp, BlockStmt, Class, Decl, Expr, Function, MemberProp,
-    ObjectLit, SimpleAssignTarget, Stmt,
+use oxc::ast::ast::{
+    AssignmentExpression, AssignmentTarget, BindingPattern, Expression, Function, MemberExpression,
+    ObjectExpression, Statement,
 };
+use oxc::semantic::SymbolId;
+use oxc::syntax::operator::BinaryOperator;
 
 use super::extract::{self, RunMethod};
-use super::interpret::{self, Branching, Frozen, Intrinsics, Plans, Run, Spare};
+use super::interpret::{self, Branching, Frozen, Intrinsics, Plans, Run, Spare, StringDecoder};
+use super::machine::Definition;
 use super::output::{Constant, Position, Term};
 use super::registers::Member;
 use super::value::Value;
 use super::{HashMap, convert};
-use crate::js::ast;
+use crate::js::ast::{self, Binding, Script};
 
 pub(crate) struct Session<'ast> {
+    /// The script defining the VM, which resolves its bindings.
+    pub script: Script<'ast>,
     /// Functions declared beside the class: handlers and their helpers.
-    pub functions: HashMap<Atom, &'ast Function>,
+    pub functions: HashMap<SymbolId, &'ast Function<'ast>>,
     /// Function values created lazily and shared across runs. Functions declared beside the
     /// class capture no state that a run can change.
-    pub function_values: RefCell<HashMap<Atom, Value<'ast>>>,
+    pub function_values: RefCell<HashMap<SymbolId, Value<'ast>>>,
     /// Lazily prepared handlers and helpers, including unsupported functions.
     pub compiled: Plans<'ast>,
     pub spare: RefCell<Spare<'ast>>,
@@ -37,19 +41,21 @@ pub(crate) struct Session<'ast> {
     pub frozen: Frozen,
     /// What exploration has learned about each handler's paths, by handler address.
     pub branching: RefCell<HashMap<usize, Branching>>,
-    pub bindings: HashMap<Atom, Value<'ast>>,
-    /// Names interrupted setup statements may have written, with their errors. Reading them
+    pub bindings: HashMap<Binding<'ast>, Value<'ast>>,
+    /// Bindings interrupted setup statements may have written, with their errors. Reading them
     /// stops interpretation.
-    pub unavailable: HashMap<Atom, String>,
+    pub unavailable: HashMap<Binding<'ast>, String>,
     pub layout: Layout,
     /// Handler state: registers, register mask, and state-register indices.
     pub state: HashMap<String, Value<'ast>>,
     /// Initial register stacks created by the constructor for handler execution.
     pub initial: Vec<(u8, Value<'ast>)>,
     /// Function used to decrypt string records stored in registers.
-    pub record_decoder: Option<&'ast Function>,
+    pub record_decoder: Option<&'ast Function<'ast>>,
     /// Script functions run natively.
     pub intrinsics: Intrinsics,
+    /// The record decoder, run natively, if it has the recognized shape.
+    pub string_decoder: Option<StringDecoder<'ast>>,
     /// The symbol the instance keeps its program under, if any.
     pub program_key: Option<Rc<()>>,
     /// Instance objects stored under the remaining symbols.
@@ -57,8 +63,9 @@ pub(crate) struct Session<'ast> {
     /// Other fields the constructor initializes, including the string-hash cache that hashed
     /// comparisons use.
     pub fields: HashMap<String, Value<'ast>>,
-    constructor: &'ast BlockStmt,
-    pub handlers: HashMap<u8, &'ast Function>,
+    /// The constructor's statements.
+    constructor: &'ast [Statement<'ast>],
+    pub handlers: HashMap<u8, &'ast Function<'ast>>,
     /// Where the program runner starts a program.
     pub entry: Position,
 }
@@ -73,34 +80,33 @@ pub(crate) struct Layout {
 }
 
 impl<'ast> Session<'ast> {
-    /// Evaluates the enclosing `prelude`, the setup in `body` that defines the VM `class`, and
-    /// the constructor.
-    pub(super) fn try_new(
-        body: &'ast BlockStmt,
-        class: &'ast Class,
-        prelude: &'ast [Stmt],
-    ) -> Result<Self> {
-        let run = extract::method(class, "run").context("the VM class has no run method")?;
+    /// Evaluates the setup before and beside the VM class `definition` finds, then the
+    /// constructor.
+    pub(super) fn try_new(definition: &Definition<'ast>) -> Result<Self> {
+        let &Definition {
+            script,
+            body,
+            class,
+            ref prelude,
+            ref functions,
+            ref run,
+            ..
+        } = definition;
         let constructor = extract::constructor(class)?;
-        let functions = extract::functions(&body.stmts);
-        let run = extract::run_method(&functions, run)?;
-        let handlers = extract::handlers(&functions, &run.dispatch)?;
-        let record_decoder =
-            extract::record_decoder(body).and_then(|name| functions.get(&name).copied());
+        let handlers = extract::handlers(script, functions, &run.dispatch)?;
+        let record_decoder = extract::record_decoder(script, body)
+            .and_then(|symbol| functions.get(&symbol).copied());
         let mut session = Self {
-            functions,
+            functions: functions.clone(),
             handlers,
             entry: extract::entry(body)?,
             record_decoder,
-            ..Self::unevaluated(constructor)
+            ..Self::unevaluated(script, constructor)
         };
-        (session.bindings, session.unavailable) = interpret::setup(&session, prelude, &body.stmts);
+        (session.bindings, session.unavailable) =
+            interpret::setup(&session, prelude, &body.statements);
         let constructed = construct(&mut Run::method(&session), constructor);
-        Recovered {
-            state: session.state,
-            layout: session.layout,
-            initial: session.initial,
-        } = state(&run, &constructed)?;
+        recover_state(&mut session, run, &constructed)?;
         session.symbol_fields = constructed.objects;
         session.program_key = match &constructed.programs[..] {
             [] => None,
@@ -109,15 +115,17 @@ impl<'ast> Session<'ast> {
         };
         session.fields = concrete(constructed.fields);
         session.intrinsics = interpret::intrinsics(&session);
+        session.string_decoder = StringDecoder::recognize(&session);
         session.frozen = Frozen::of(&session.bindings);
         Ok(session)
     }
 
-    fn unevaluated(constructor: &'ast BlockStmt) -> Self {
+    fn unevaluated(script: Script<'ast>, constructor: &'ast [Statement<'ast>]) -> Self {
         Self {
+            script,
             functions: HashMap::default(),
             function_values: RefCell::default(),
-            compiled: Default::default(),
+            compiled: Plans::default(),
             spare: RefCell::default(),
             frozen: Frozen::default(),
             branching: RefCell::default(),
@@ -130,6 +138,7 @@ impl<'ast> Session<'ast> {
             initial: Vec::new(),
             record_decoder: None,
             intrinsics: Intrinsics::default(),
+            string_decoder: None,
             fields: HashMap::default(),
             constructor,
             handlers: HashMap::default(),
@@ -142,13 +151,31 @@ impl<'ast> Session<'ast> {
     pub(super) fn constructed(&self, program: &[u8]) -> HashMap<String, Value<'ast>> {
         concrete(construct(&mut Run::constructor(self, program), self.constructor).fields)
     }
+
+    /// The function declared beside the class that `binding` refers to.
+    pub(crate) fn function(&self, binding: Binding<'ast>) -> Option<&'ast Function<'ast>> {
+        match binding {
+            Binding::Symbol(symbol) => self.functions.get(&symbol).copied(),
+            Binding::Global(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
-impl Session<'_> {
-    /// Creates an empty session for interpreter tests.
-    pub(crate) fn empty() -> Self {
-        Self::unevaluated(Box::leak(Box::default()))
+impl<'ast> Session<'ast> {
+    /// Creates an empty session over `script` for interpreter tests. Declares the script's
+    /// function declarations beside the class.
+    pub(crate) fn empty(script: Script<'ast>) -> Self {
+        Self {
+            functions: extract::functions(&script.program.body),
+            ..Self::unevaluated(script, &[])
+        }
+    }
+
+    /// The function the script declares as `name`.
+    pub(crate) fn declared(&self, name: &str) -> &'ast Function<'ast> {
+        let symbol = self.script.scoping.get_root_binding(name.into());
+        self.functions[&symbol.expect("the function is declared")]
     }
 }
 
@@ -177,13 +204,16 @@ struct RegisterWrite<'a> {
     value: Value<'a>,
 }
 
+/// Locals holding copies of instance fields, by binding.
+type Copies<'a> = HashMap<Binding<'a>, String>;
+
 /// Evaluates object literal properties. Uses null for properties computed from program bytes, such
 /// as the word array used by a faster string decoder. This makes handlers use byte-by-byte decoding
 /// instead.
-fn object_fields<'a>(run: &mut Run<'a, '_>, object: &'a ObjectLit) -> Value<'a> {
+fn object_fields<'a>(run: &mut Run<'a, '_>, object: &'a ObjectExpression<'a>) -> Value<'a> {
     let properties = ast::key_values(object)
         .filter_map(|property| {
-            let name = ast::key_str(&property.key)?.to_owned();
+            let name = ast::key_str(&property.key, property.computed)?.to_owned();
             let value = run
                 .expression(&property.value)
                 .ok()
@@ -197,43 +227,52 @@ fn object_fields<'a>(run: &mut Run<'a, '_>, object: &'a ObjectLit) -> Value<'a> 
 /// Evaluates constructor field assignments in order through `run`, including nested blocks. Follows
 /// field copies through locals to find the source fields for the program counter and dispatch key
 /// indices.
-fn construct<'a>(run: &mut Run<'a, '_>, constructor: &'a BlockStmt) -> Constructed<'a> {
+fn construct<'a>(run: &mut Run<'a, '_>, constructor: &'a [Statement<'a>]) -> Constructed<'a> {
     let mut constructed = Constructed::default();
     let mut copies = HashMap::default();
-    construct_statements(run, &constructor.stmts, &mut constructed, &mut copies);
+    construct_statements(run, constructor, &mut constructed, &mut copies);
     constructed
 }
 
 fn construct_statements<'a>(
     run: &mut Run<'a, '_>,
-    statements: &'a [Stmt],
+    statements: &'a [Statement<'a>],
     constructed: &mut Constructed<'a>,
-    copies: &mut HashMap<Atom, String>,
+    copies: &mut Copies<'a>,
 ) {
     for statement in statements {
         match statement {
-            Stmt::Block(block) => construct_statements(run, &block.stmts, constructed, copies),
-            Stmt::Expr(statement) => {
-                construct_expression(run, &statement.expr, constructed, copies);
+            Statement::BlockStatement(block) => {
+                construct_statements(run, &block.body, constructed, copies);
+            }
+            Statement::ExpressionStatement(statement) => {
+                construct_expression(run, &statement.expression, constructed, copies);
             }
             // In `var copy = (local = this.field, this.other)`, `copy` receives the final operand,
             // `this.other`.
-            Stmt::Decl(Decl::Var(declaration)) => {
-                for declarator in &declaration.decls {
+            Statement::VariableDeclaration(declaration) if !declaration.kind.is_using() => {
+                for declarator in &declaration.declarations {
                     let Some(init) = &declarator.init else {
                         continue;
                     };
                     construct_expression(run, init, constructed, copies);
-                    let Some(name) = declarator.name.as_ident() else {
+                    let BindingPattern::BindingIdentifier(name) = &declarator.id else {
                         continue;
                     };
-                    let value = match init.unwrap_parens() {
-                        Expr::Seq(sequence) if let Some(last) = sequence.exprs.last() => {
-                            last.unwrap_parens()
+                    let value = match init.without_parentheses() {
+                        Expression::SequenceExpression(sequence)
+                            if let Some(last) = sequence.expressions.last() =>
+                        {
+                            last.without_parentheses()
                         }
                         value => value,
                     };
-                    track_copy(&name.sym, value, copies);
+                    track_copy(
+                        run.source(),
+                        Binding::Symbol(name.symbol_id()),
+                        value,
+                        copies,
+                    );
                 }
             }
             _ => {}
@@ -244,27 +283,41 @@ fn construct_statements<'a>(
 /// Visits assignments in `expr` in evaluation order, including sequence operands.
 fn construct_expression<'a>(
     run: &mut Run<'a, '_>,
-    expr: &'a Expr,
+    expr: &'a Expression<'a>,
     constructed: &mut Constructed<'a>,
-    copies: &mut HashMap<Atom, String>,
+    copies: &mut Copies<'a>,
 ) {
     match expr {
-        Expr::Paren(paren) => construct_expression(run, &paren.expr, constructed, copies),
-        Expr::Seq(sequence) => {
-            for expr in &sequence.exprs {
+        Expression::ParenthesizedExpression(paren) => {
+            construct_expression(run, &paren.expression, constructed, copies);
+        }
+        Expression::SequenceExpression(sequence) => {
+            for expr in &sequence.expressions {
                 construct_expression(run, expr, constructed, copies);
             }
         }
-        Expr::Assign(assign) => construct_assignment(run, assign, constructed, copies),
-        Expr::Call(call) => {
-            let (file, index, value) = match (ast::method_call(expr, "write"), &call.args[..]) {
-                (Some((file, _)), [index, value]) => (file, index, value),
-                (None, [file, index, value]) => (&*file.expr, index, value),
+        Expression::AssignmentExpression(assign) => {
+            construct_assignment(run, assign, constructed, copies);
+        }
+        Expression::CallExpression(call) => {
+            let (file, index, value) = match (ast::method_call(expr, "write"), &call.arguments[..])
+            {
+                (Some((file, _)), [index, value]) => (
+                    file,
+                    ast::argument_expression(index),
+                    ast::argument_expression(value),
+                ),
+                (None, [file, index, value]) => (
+                    ast::argument_expression(file),
+                    ast::argument_expression(index),
+                    ast::argument_expression(value),
+                ),
                 _ => return,
             };
-            if let Some(file) = file.as_ident().and_then(|name| copies.get(&name.sym))
-                && let Some((mask, register)) = masked_index(&index.expr, copies)
-                && let Ok(value) = run.expression(&value.expr)
+            if let Expression::Identifier(file) = file
+                && let Some(file) = copies.get(&run.source().binding(file))
+                && let Some((mask, register)) = masked_index(run.source(), index, copies)
+                && let Ok(value) = run.expression(value)
             {
                 constructed.registers.push(RegisterWrite {
                     file: file.clone(),
@@ -280,13 +333,19 @@ fn construct_expression<'a>(
 
 /// Extracts the mask field and register from `<mask> ^ <register>`. The mask can be a field access
 /// or a local copy of one.
-fn masked_index(index: &Expr, copies: &HashMap<Atom, String>) -> Option<(String, u8)> {
-    let xor = index.unwrap_parens().as_bin()?;
-    if xor.op != BinaryOp::BitXor {
+fn masked_index<'a>(
+    script: Script<'a>,
+    index: &Expression<'a>,
+    copies: &Copies<'a>,
+) -> Option<(String, u8)> {
+    let Expression::BinaryExpression(xor) = index.without_parentheses() else {
+        return None;
+    };
+    if xor.operator != BinaryOperator::BitwiseXOR {
         return None;
     }
-    let field = |expr: &Expr| copied_field(expr.unwrap_parens(), copies);
-    let register = |expr: &Expr| convert::byte(ast::number(expr)?);
+    let field = |expr: &Expression<'a>| copied_field(script, expr.without_parentheses(), copies);
+    let register = |expr: &Expression<'a>| convert::byte(ast::number(expr)?);
     match (field(&xor.left), field(&xor.right)) {
         (Some(mask), None) => Some((mask, register(&xor.right)?)),
         (None, Some(mask)) => Some((mask, register(&xor.left)?)),
@@ -296,21 +355,29 @@ fn masked_index(index: &Expr, copies: &HashMap<Atom, String>) -> Option<(String,
 
 fn construct_assignment<'a>(
     run: &mut Run<'a, '_>,
-    assign: &'a AssignExpr,
+    assign: &'a AssignmentExpression<'a>,
     constructed: &mut Constructed<'a>,
-    copies: &mut HashMap<Atom, String>,
+    copies: &mut Copies<'a>,
 ) {
-    match &assign.left {
-        AssignTarget::Simple(SimpleAssignTarget::Member(target)) if target.obj.is_this() => {
-            if let Some(field) = ast::member_str(&target.prop).map(str::to_owned) {
+    let script = run.source();
+    if let AssignmentTarget::AssignmentTargetIdentifier(name) = &assign.left {
+        track_copy(script, script.binding(name), &assign.right, copies);
+        return;
+    }
+    let Some(target) = assign.left.as_member_expression() else {
+        return;
+    };
+    match target.object() {
+        Expression::ThisExpression(_) => {
+            if let Some(field) = ast::member_str(target).map(str::to_owned) {
                 if let Ok(value) = run.expression(&assign.right) {
                     constructed.fields.insert(field, value);
                 }
-            } else if let MemberProp::Computed(key) = &target.prop
-                && let Ok(Value::Symbol(symbol)) = run.expression(&key.expr)
+            } else if let MemberExpression::ComputedMemberExpression(target) = target
+                && let Ok(Value::Symbol(symbol)) = run.expression(&target.expression)
             {
-                match &*assign.right {
-                    Expr::Object(object) => {
+                match &assign.right {
+                    Expression::ObjectExpression(object) => {
                         let value = object_fields(run, object);
                         constructed.objects.push((symbol, value));
                     }
@@ -318,38 +385,41 @@ fn construct_assignment<'a>(
                 }
             }
         }
+        Expression::Super(_) => {}
         // `registers.<index> = <copy of a field>`.
-        AssignTarget::Simple(SimpleAssignTarget::Member(target)) => {
-            let field = copied_field(&assign.right, copies);
-            match ast::member_str(&target.prop).and_then(Member::of) {
+        _ => {
+            let field = copied_field(script, &assign.right, copies);
+            match ast::member_str(target).and_then(Member::of) {
                 Some(Member::PcIndex) => constructed.pc = field,
                 Some(Member::KeyIndex) => constructed.key = field,
                 _ => {}
             }
         }
-        AssignTarget::Simple(SimpleAssignTarget::Ident(name)) => {
-            track_copy(&name.sym, &assign.right, copies);
-        }
-        _ => {}
     }
 }
 
-/// Records the source field if assigning `value` makes local `name` a copy of that field.
-fn track_copy(name: &Atom, value: &Expr, copies: &mut HashMap<Atom, String>) {
-    match copied_field(value, copies) {
-        Some(field) => copies.insert(name.clone(), field),
-        None => copies.remove(name),
+/// Records the source field if assigning `value` makes local `binding` a copy of that field.
+fn track_copy<'a>(
+    script: Script<'a>,
+    binding: Binding<'a>,
+    value: &Expression<'a>,
+    copies: &mut Copies<'a>,
+) {
+    match copied_field(script, value, copies) {
+        Some(field) => copies.insert(binding, field),
+        None => copies.remove(&binding),
     };
 }
 
 /// Resolves the field read by `expr`, either directly as `this.field` or through a local copy.
-fn copied_field(expr: &Expr, copies: &HashMap<Atom, String>) -> Option<String> {
+fn copied_field<'a>(
+    script: Script<'a>,
+    expr: &Expression<'a>,
+    copies: &Copies<'a>,
+) -> Option<String> {
     match expr {
-        Expr::Member(member) if member.obj.is_this() => {
-            ast::member_str(&member.prop).map(str::to_owned)
-        }
-        Expr::Ident(name) => copies.get(&name.sym).cloned(),
-        _ => None,
+        Expression::Identifier(name) => copies.get(&script.binding(name)).cloned(),
+        expr => extract::this_field(expr).map(str::to_owned),
     }
 }
 
@@ -359,17 +429,14 @@ fn concrete<'a>(mut fields: HashMap<String, Value<'a>>) -> HashMap<String, Value
     fields
 }
 
-/// The handler state, register layout and initial register stacks [`state`] recovers.
-struct Recovered<'a> {
-    state: HashMap<String, Value<'a>>,
-    layout: Layout,
-    initial: Vec<(u8, Value<'a>)>,
-}
-
-/// Recovers state-field values and register layout. The constructor computes indices as
-/// `this.<mask> ^ <register>` with a random mask per run. Uses zero for the mask during
-/// analysis.
-fn state<'a>(names: &RunMethod<'_>, constructed: &Constructed<'a>) -> Result<Recovered<'a>> {
+/// Recovers the session's handler state, register layout, and initial register stacks. The
+/// constructor computes indices as `this.<mask> ^ <register>` with a random mask per run. Uses
+/// zero for the mask during analysis.
+fn recover_state<'a>(
+    session: &mut Session<'a>,
+    names: &RunMethod<'_>,
+    constructed: &Constructed<'a>,
+) -> Result<()> {
     let fields = &constructed.fields;
     let pc = constructed
         .pc
@@ -408,7 +475,7 @@ fn state<'a>(names: &RunMethod<'_>, constructed: &Constructed<'a>) -> Result<Rec
     // Keep external objects, such as the global object, dependent on their registers so listing
     // readers can recognize how the program accesses them.
     let state_registers = [layout.pc, layout.key, layout.program, layout.cells];
-    let initial = constructed
+    session.initial = constructed
         .registers
         .iter()
         .filter(|write| {
@@ -420,11 +487,9 @@ fn state<'a>(names: &RunMethod<'_>, constructed: &Constructed<'a>) -> Result<Rec
         .map(|write| (write.register, write.value.clone()))
         .collect();
     state.extend(mask.map(|mask| (mask, Value::Number(0.0))));
-    Ok(Recovered {
-        state,
-        layout,
-        initial,
-    })
+    session.state = state;
+    session.layout = layout;
+    Ok(())
 }
 
 /// Extracts the register and optional mask field from `this.<mask> ^ <register>` or a bare
@@ -435,7 +500,7 @@ fn masked(value: &Value<'_>) -> Option<(Option<String>, u8)> {
         Value::Symbolic(term) => &**term,
         _ => return None,
     };
-    let Term::Binary(BinaryOp::BitXor, left, right) = term else {
+    let Term::Binary(BinaryOperator::BitwiseXOR, left, right) = term else {
         return None;
     };
     match (&**left, &**right) {

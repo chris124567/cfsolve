@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail, ensure};
+use oxc::syntax::operator::BinaryOperator;
 use serde::{Deserialize, Serialize};
-use swc_core::ecma::ast::BinaryOp;
 
 use super::{click, diagnostics, initialization, ui};
 use crate::candidates;
@@ -15,6 +15,7 @@ use crate::stage2::payload::{
     self, Document, Environment, Layout, RecordTemplate, Recovered, State,
 };
 use crate::stage2::proof::{Proof, ProofFields};
+use crate::stage2::queries;
 use crate::stage2::records::{ArrangedFields, COMPLETED_STATUS, Completion};
 use crate::vm::{Constant, Effect, Listing, Term};
 
@@ -251,7 +252,7 @@ fn envelope(index: &Index<'_>, record: &RecordTemplate) -> Result<Completion> {
         .iter()
         .filter(|store| store.object == removed.object && epilogue.contains(&store.pc))
         .collect();
-    let [started, finished, duration] = index.clock_marks(&marked)?;
+    let [started, finished, duration] = queries::clock_marks(index, &marked)?;
     Ok(Completion {
         status: status.key.clone(),
         message: message.key.clone(),
@@ -302,7 +303,7 @@ fn proof_fields(index: &Index<'_>, config_pc: u32) -> Result<ProofFields> {
         let destination = match value {
             Term::Cell(_) => &mut hashes,
             Term::Reg(_) => &mut workers,
-            Term::Binary(BinaryOp::Sub, _, _) => &mut elapsed,
+            Term::Binary(BinaryOperator::Subtraction, _, _) => &mut elapsed,
             _ if index.is_date_now(store.pc, &store.value) => &mut finished,
             _ => bail!("unrecognized proof callback write {}", store.key),
         };
@@ -361,7 +362,7 @@ fn prefix_option(index: &Index<'_>, before: u32) -> Result<(u32, String)> {
         };
         for effect in instruction.effects() {
             if let Effect::Set(_, value) = effect
-                && let Some(key) = index.option_read(previous, value)
+                && let Some(key) = queries::option_read(index, previous, value)
             {
                 options.push((previous, key));
             }

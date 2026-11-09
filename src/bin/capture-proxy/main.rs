@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     let runtime = Builder::new_multi_thread().enable_all().build()?;
     let result = runtime.block_on(async {
         // Use the same upstream proxy for forwarded requests and tunnels.
-        let client = transport.client(arguments.upstream_proxy.as_deref())?;
+        let client = transport.client(arguments.upstream_proxy.as_deref(), None)?;
         CaptureProxy::try_new(config, client, ca)?.run().await
     });
     // Exit without waiting for an extraction still in progress.

@@ -3,12 +3,12 @@
 
 use std::rc::Rc;
 
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
 use super::{Held, Installed};
+use crate::challenge;
 use crate::js::{JsValue, json};
 use crate::listing::fold::{Frame, Known};
-use crate::stage2::vocabulary;
 use crate::vm::{Effect, Listing, Term};
 
 pub(super) fn read(listing: &Listing, installed: &mut Installed) {
@@ -24,7 +24,7 @@ pub(super) fn read(listing: &Listing, installed: &mut Installed) {
                         && let Some(text) = known.text()
                         && let Some(function) = text.strip_prefix("function ")
                         && let Some((name, _)) = function.split_once('(')
-                        && vocabulary::is_hex_name(name)
+                        && challenge::is_hex_name(name)
                     {
                         installed.audit.insert(name.into(), "N".into());
                         installed
@@ -44,17 +44,18 @@ pub(super) fn read(listing: &Listing, installed: &mut Installed) {
                     && *index >= 0.0
                     && index.fract() == 0.0
                 {
-                    let native = if let Some(Known::Ext(Held::NativeFunction(name))) = &value {
-                        Some(format!("function {name}() {{ [native code] }}"))
-                    } else {
-                        None
+                    let native = match &value {
+                        Some(Known::Ext(Held::NativeFunction(name))) => {
+                            Some(format!("function {name}() {{ [native code] }}"))
+                        }
+                        _ => None,
                     };
                     array.borrow_mut().insert(*index as usize, native);
                 }
                 if !matches!(object, Known::Ext(Held::Window)) {
                     return;
                 }
-                let Some(name) = key.text().filter(|name| vocabulary::is_hex_name(name)) else {
+                let Some(name) = key.text().filter(|name| challenge::is_hex_name(name)) else {
                     return;
                 };
                 let (role, audit) = match value {
@@ -115,12 +116,12 @@ fn evaluate(frame: &Frame<Held>, value: &Term) -> Option<Known<Held>> {
                 return Some(Known::Literal(json!(text)));
             }
         }
-        Term::Binary(BinaryOp::Sub, _, right)
+        Term::Binary(BinaryOperator::Subtraction, _, right)
             if matches!(frame.resolve(right), Some(Known::Ext(Held::Clock))) =>
         {
             return Some(Known::Ext(Held::ClockDelta));
         }
-        Term::Binary(BinaryOp::Add, left, right) => {
+        Term::Binary(BinaryOperator::Addition, left, right) => {
             if let (Some(left), Some(right)) = (string(left), string(right)) {
                 return Some(Known::Literal(json!(format!("{left}{right}"))));
             }

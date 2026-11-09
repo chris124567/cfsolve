@@ -9,45 +9,64 @@
 //! identifier. Both forms access the same property. A computed `__proto__` key stays computed: it
 //! defines a property, while a named key sets the prototype.
 
-use swc_core::ecma::ast::{IdentName, MemberExpr, MemberProp, Program, Prop, PropName};
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use oxc::allocator::TakeIn;
+use oxc::ast::ast::{IdentifierName, MemberExpression, ObjectProperty, Program, PropertyKey};
+use oxc::ast_visit::{VisitMut, walk_mut};
+use oxc::span::GetSpan;
+use oxc::str::Ident;
+use oxc::syntax::identifier::is_identifier_name;
 
 use super::analysis::Analysis;
-use crate::js::ast;
+use super::ast;
 
-pub(super) fn run(program: &mut Program, _: &mut Analysis) -> bool {
-    let mut members = NameStaticMembers { changed: false };
-    program.visit_mut_with(&mut members);
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let mut members = StaticMembers {
+        analysis,
+        changed: false,
+    };
+    members.visit_program(program);
     members.changed
 }
 
-struct NameStaticMembers {
+struct StaticMembers<'b, 'a> {
+    analysis: &'b Analysis<'a>,
     changed: bool,
 }
 
-impl VisitMut for NameStaticMembers {
-    fn visit_mut_member_expr(&mut self, member: &mut MemberExpr) {
-        member.visit_mut_children_with(self);
-
-        if let MemberProp::Computed(property) = &member.prop
-            && let Some(property_name) = ast::static_str(&property.expr)
-            && swc_ecma_utils::is_valid_ident(property_name)
+impl<'a> VisitMut<'a> for StaticMembers<'_, 'a> {
+    fn visit_member_expression(&mut self, member: &mut MemberExpression<'a>) {
+        walk_mut::walk_member_expression(self, member);
+        if let MemberExpression::ComputedMemberExpression(computed) = member
+            && let Some(name) = ast::static_str(&computed.expression)
+            && is_identifier_name(name)
         {
-            member.prop = MemberProp::Ident(IdentName::new(property_name.into(), property.span));
+            let builder = &self.analysis.ast;
+            let name = Ident::from_str_in(name, builder);
+            let property = IdentifierName::new(computed.expression.span(), name, builder);
+            let object = computed.object.take_in(builder);
+            *member = MemberExpression::new_static_member_expression(
+                computed.span,
+                object,
+                property,
+                computed.optional,
+                builder,
+            );
             self.changed = true;
         }
     }
 
-    fn visit_mut_prop(&mut self, property: &mut Prop) {
-        property.visit_mut_children_with(self);
-
-        if let Prop::KeyValue(property) = property
-            && let PropName::Computed(key) = &property.key
-            && let Some(name) = ast::static_str(&key.expr)
-            && swc_ecma_utils::is_valid_ident(name)
-            && name != "__proto__"
+    fn visit_object_property(&mut self, property: &mut ObjectProperty<'a>) {
+        walk_mut::walk_object_property(self, property);
+        if let Some(name) = ast::key(&property.key, property.computed)
+            && is_identifier_name(name)
+            && !matches!(property.key, PropertyKey::StaticIdentifier(_))
+            && !(name == "__proto__" && property.computed)
         {
-            property.key = PropName::Ident(IdentName::new(name.into(), key.span));
+            let builder = &self.analysis.ast;
+            let name = Ident::from_str_in(name, builder);
+            let key = IdentifierName::boxed(property.key.span(), name, builder);
+            property.key = PropertyKey::StaticIdentifier(key);
+            property.computed = false;
             self.changed = true;
         }
     }
@@ -60,14 +79,10 @@ mod tests {
     #[test]
     fn uses_cooked_static_template_properties() {
         let output =
-            testing::transform(r#"obj[`lo\u0067`](); obj?.[`name`]; obj[`a-b`]; obj[`${key}`];"#);
+            testing::transform(r#"obj[`log`](); obj?.[`name`]; obj[`a-b`]; obj[`${key}`];"#);
         let expected = ["obj.log()", "obj?.name", "obj[`a-b`]", "obj[`${key}`]"];
-        testing::assert_contains(&output, &expected, &[]);
+        testing::assert_contains(&output, &expected);
         let output = testing::transform(r#"f({ ["add"]: 1, [`a-b`]: 2, ["__proto__"]: 3 });"#);
-        testing::assert_contains(
-            &output,
-            &[],
-            &["add: 1", "[`a-b`]: 2", r#"["__proto__"]: 3"#],
-        );
+        testing::assert_contains(&output, &["add: 1", "[`a-b`]: 2", r#"["__proto__"]: 3"#]);
     }
 }

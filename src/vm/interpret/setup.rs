@@ -2,17 +2,20 @@
 
 use std::mem;
 
-use swc_core::atoms::Atom;
-use swc_core::ecma::ast::{Expr, Pat, SimpleAssignTarget, Stmt, UpdateExpr, VarDeclarator};
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast::ast::{
+    AssignmentExpression, BindingPattern, Expression, SimpleAssignmentTarget, Statement,
+    UpdateExpression, VariableDeclarator,
+};
+use oxc::ast_visit::{Visit, walk};
 
-use super::run::{Frame, Run, Stop};
+use super::run::{CallScope, Frame, Run, Stop};
+use crate::js::ast::{Binding, Script};
 use crate::vm::HashMap;
 use crate::vm::session::Session;
 use crate::vm::value::{Env, Scope, Value};
 
 /// Runs the enclosing scope's `prelude`, then the VM's setup `statements`. Returns setup
-/// bindings and errors associated with names that interrupted statements may have written.
+/// bindings and errors associated with bindings that interrupted statements may have written.
 ///
 /// Setup can read prelude values, but handlers cannot assume they remain unchanged. Prelude
 /// bindings and failures are therefore excluded from the session. Functions created during
@@ -20,12 +23,15 @@ use crate::vm::value::{Env, Scope, Value};
 #[must_use]
 pub(crate) fn setup<'a>(
     session: &Session<'a>,
-    prelude: &'a [Stmt],
-    statements: &'a [Stmt],
-) -> (HashMap<Atom, Value<'a>>, HashMap<Atom, String>) {
+    prelude: &[&'a Statement<'a>],
+    statements: &'a [Statement<'a>],
+) -> (
+    HashMap<Binding<'a>, Value<'a>>,
+    HashMap<Binding<'a>, String>,
+) {
     let mut run = Run::new(session, &[], Vec::new(), None);
     let around = Env::scope(HashMap::default(), None);
-    run.run_setup(around.clone(), prelude);
+    run.run_setup(around.clone(), prelude.iter().copied());
     run.unavailable.to_mut().clear();
     let own = Env::scope(HashMap::default(), Some(around.clone()));
     run.run_setup(own.clone(), statements);
@@ -36,20 +42,27 @@ pub(crate) fn setup<'a>(
 
 impl<'ast> Run<'ast, '_> {
     /// Runs setup `statements` in `scope`, which functions declared beside the class share until
-    /// setup ends. Records the names interrupted statements may have written.
-    fn run_setup(&mut self, scope: Scope<'ast>, statements: &'ast [Stmt]) {
+    /// setup ends. Records the bindings interrupted statements may have written.
+    fn run_setup(
+        &mut self,
+        scope: Scope<'ast>,
+        statements: impl IntoIterator<Item = &'ast Statement<'ast>>,
+    ) {
         self.frames.push(Frame {
             this: Value::Undefined,
-            scope: scope.clone(),
+            scope: CallScope::Own(scope.clone()),
         });
         self.setup = Some(scope);
         for statement in statements {
-            let mut written = Written::default();
-            statement.visit_with(&mut written);
+            let mut written = Written {
+                script: self.session.script,
+                bindings: Vec::new(),
+            };
+            written.visit_statement(statement);
             match self.statement(statement) {
                 Ok(_) => {
-                    for name in written.0 {
-                        self.unavailable.to_mut().remove(&name);
+                    for binding in written.bindings {
+                        self.unavailable.to_mut().remove(&binding);
                     }
                 }
                 Err(stop) => {
@@ -57,14 +70,18 @@ impl<'ast> Run<'ast, '_> {
                         Stop::Throw(value) => format!("it throws {}", value.expr()),
                         Stop::Unsupported(reason) => reason,
                     };
-                    for name in written.0 {
+                    for binding in written.bindings {
                         // Global-object members are not tracked, so writes to them do not
                         // invalidate a tracked binding.
-                        if let Ok(Value::Namespace(_)) = self.lookup(&name) {
+                        if let Ok(Value::Namespace(_)) = self.lookup(binding) {
                             continue;
                         }
-                        self.frame().scope.borrow_mut().variables.remove(&name);
-                        self.unavailable.to_mut().insert(name, reason.clone());
+                        self.frame_mut()
+                            .own_scope()
+                            .borrow_mut()
+                            .variables
+                            .remove(&binding);
+                        self.unavailable.to_mut().insert(binding, reason.clone());
                     }
                 }
             }
@@ -72,42 +89,60 @@ impl<'ast> Run<'ast, '_> {
     }
 }
 
-/// Names a statement may declare, assign, or mutate through property writes.
-#[derive(Default)]
-struct Written(Vec<Atom>);
+/// Bindings a statement may declare, assign, or mutate through property writes.
+struct Written<'a> {
+    script: Script<'a>,
+    bindings: Vec<Binding<'a>>,
+}
 
-impl Visit for Written {
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Pat::Ident(name) = &declarator.name {
-            self.0.push(name.id.sym.clone());
+impl<'a> Visit<'a> for Written<'a> {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(name) = &declarator.id {
+            self.bindings.push(Binding::Symbol(name.symbol_id()));
         }
-        declarator.visit_children_with(self);
+        walk::walk_variable_declarator(self, declarator);
     }
 
-    fn visit_simple_assign_target(&mut self, target: &SimpleAssignTarget) {
-        match target {
-            SimpleAssignTarget::Ident(name) => self.0.push(name.id.sym.clone()),
-            SimpleAssignTarget::Member(member) => self.root(&member.obj),
-            _ => {}
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let Some(target) = assignment.left.as_simple_assignment_target() {
+            self.target(target);
         }
-        target.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
-    fn visit_update_expr(&mut self, update: &UpdateExpr) {
-        self.root(&update.arg);
-        update.visit_children_with(self);
+    fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
+        self.target(&update.argument);
+        walk::walk_update_expression(self, update);
     }
 }
 
-impl Written {
-    /// Returns the root name of a member-expression chain.
-    fn root(&mut self, mut expr: &Expr) {
+impl<'a> Written<'a> {
+    /// Records an assigned name, or the root of an assigned member.
+    fn target(&mut self, target: &SimpleAssignmentTarget<'a>) {
+        match target {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(name) => {
+                self.bindings.push(self.script.binding(name));
+            }
+            target => {
+                if let Some(member) = target.as_member_expression() {
+                    self.root(member.object());
+                }
+            }
+        }
+    }
+
+    /// Records the binding at the root of a member-expression chain.
+    fn root(&mut self, mut expression: &Expression<'a>) {
         loop {
-            match expr {
-                Expr::Ident(name) => return self.0.push(name.sym.clone()),
-                Expr::Member(member) => expr = &member.obj,
-                Expr::Paren(paren) => expr = &paren.expr,
-                _ => return,
+            match expression {
+                Expression::Identifier(name) => {
+                    return self.bindings.push(self.script.binding(name));
+                }
+                Expression::ParenthesizedExpression(paren) => expression = &paren.expression,
+                other => match other.as_member_expression() {
+                    Some(member) => expression = member.object(),
+                    None => return,
+                },
             }
         }
     }

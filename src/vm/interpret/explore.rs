@@ -2,10 +2,11 @@
 
 use std::{mem, ptr};
 
-use swc_core::ecma::ast::Function;
+use oxc::ast::ast::Function;
 
 use super::copies::Copies;
 use super::intrinsic;
+use super::plan::Routine;
 use super::run::{Decrypted, Run, Snapshot, Stop};
 use crate::vm::dispatch::Decoded;
 use crate::vm::output::Path;
@@ -24,7 +25,7 @@ pub(crate) struct Invocation<'session, 'ast> {
     pub pc: u32,
     /// The dispatch key the opcode byte leaves.
     pub key: u8,
-    pub handler: &'ast Function,
+    pub handler: &'ast Function<'ast>,
     /// The instance fields the constructor derives from the program.
     pub fields: &'session HashMap<String, Value<'ast>>,
     /// Strings decrypted from the program so far.
@@ -65,7 +66,8 @@ pub(crate) fn explore<'ast>(invocation: &Invocation<'_, 'ast>) -> Option<Ways<'a
     let plan = if special {
         None
     } else {
-        session.compiled.slots(handler)
+        Routine::function(handler)
+            .and_then(|routine| session.compiled.slots(session.script, routine))
     };
     // A run that thaws a shared session object leaves no results; explore again with the
     // object copied.
@@ -196,22 +198,17 @@ pub(crate) struct Branching {
 pub(crate) fn decode<'ast>(
     session: &Session<'ast>,
     program: &[u8],
-    decoder: &'ast Function,
+    decoder: Routine<'ast>,
     arguments: Vec<Value<'ast>>,
     pc: u32,
     key: u8,
 ) -> Result<Decoded, String> {
-    let decoder = Callable::Script {
-        name: None,
-        function: decoder,
-        scope: None,
-    };
     // A run that thaws a shared session object decodes again with the object copied.
     let (outcome, next) = loop {
         let mut run = Run::new(session, program, Vec::new(), Some(Copies::default()));
         run.sharing = true;
         run.start_at(pc, key);
-        let outcome = run.invoke(&decoder, Value::Undefined, arguments.clone());
+        let outcome = run.routine(decoder, None, Value::Undefined, arguments.clone());
         let next = run.register_value(session.layout.key);
         for scope in run.scopes() {
             scope.borrow_mut().variables.clear();

@@ -144,8 +144,7 @@ fn last_record(payload: &JsObject) -> Option<&JsObject> {
 }
 
 fn short(value: &JsValue) -> String {
-    let text = value.stringify().unwrap_or_else(|| "undefined".into());
-    text.chars().take(240).collect()
+    value.to_string().chars().take(240).collect()
 }
 
 fn kind(value: &JsValue) -> String {

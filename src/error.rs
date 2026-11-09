@@ -2,11 +2,11 @@
 //! retains the details.
 
 use std::error::Error as StdError;
-use std::fmt;
+use std::{fmt, io};
 
 use wreq::StatusCode;
 
-use crate::session::Stage;
+use crate::session::{SinkFailed, Stage};
 
 /// A failed solve, or a profile that cannot solve.
 #[derive(Debug)]
@@ -36,24 +36,35 @@ pub enum Error {
         /// Rejection details, including request context.
         error: anyhow::Error,
     },
+    /// The [`Sink`](crate::Sink) failed to save an artifact, so the solve stopped rather than
+    /// lose its diagnostics.
+    Sink(anyhow::Error),
     /// The solver cannot handle this page or challenge, for example because it uses a new
     /// challenge build. Retrying will not help.
     Unsupported(anyhow::Error),
 }
 
 impl Error {
-    /// Classifies a failure using a wrapped `Error`, if present, or the first recognized marker
-    /// or network error in the chain.
+    /// Classifies a failure using a wrapped `Error`, if present, a sink failure, or the first
+    /// recognized marker or transport error in the chain. Other failures are [`Unsupported`].
+    ///
+    /// I/O errors count as network failures: once the sink's own failures are set apart, they
+    /// come from reading response bodies, such as a truncated compressed body.
+    ///
+    /// [`Unsupported`]: Self::Unsupported
     pub(crate) fn classify(error: anyhow::Error) -> Self {
         let error = match error.downcast::<Self>() {
             Ok(error) => return error,
             Err(error) => error,
         };
+        if error.downcast_ref::<SinkFailed>().is_some() {
+            return Self::Sink(error);
+        }
         for cause in error.chain() {
             if let Some(&Refused { stage, .. }) = cause.downcast_ref() {
                 return Self::Rejected { stage, error };
             }
-            if cause.is::<wreq::Error>() {
+            if cause.is::<wreq::Error>() || cause.is::<io::Error>() {
                 return Self::Network(error);
             }
         }
@@ -67,6 +78,7 @@ impl fmt::Display for Error {
             Self::Config(error)
             | Self::Network(error)
             | Self::Rejected { error, .. }
+            | Self::Sink(error)
             | Self::Unsupported(error) => fmt::Display::fmt(error, formatter),
             Self::Blocked { status } => write!(formatter, "the page answered HTTP {status}"),
             Self::Challenged { status } => write!(
@@ -87,6 +99,7 @@ impl StdError for Error {
             Self::Config(error)
             | Self::Network(error)
             | Self::Rejected { error, .. }
+            | Self::Sink(error)
             | Self::Unsupported(error) => error.source(),
             Self::Blocked { .. } | Self::Challenged { .. } | Self::NotChallenged => None,
         }
@@ -138,5 +151,27 @@ mod tests {
         assert_eq!(blocked.to_string(), "the page answered HTTP 403 Forbidden");
         let unknown = Error::classify(anyhow::anyhow!("no orchestrator path"));
         assert!(matches!(unknown, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn sets_apart_sink_and_transport_failures() {
+        struct Full;
+        impl crate::Sink for Full {
+            fn artifact(&self, _: &str, _: &[u8]) -> anyhow::Result<()> {
+                Err(io::Error::from(io::ErrorKind::StorageFull).into())
+            }
+            fn progress(&self, _: &str) {}
+        }
+        let sink: &dyn crate::Sink = &Full;
+        let failed = sink
+            .save("page.html", b"")
+            .unwrap_err()
+            .context("loading the page");
+        let failed = Error::classify(failed);
+        assert!(matches!(failed, Error::Sink(_)));
+        assert!(failed.to_string().starts_with("loading the page"));
+        let truncated = anyhow::Error::new(io::Error::from(io::ErrorKind::UnexpectedEof))
+            .context("decoding the response body");
+        assert!(matches!(Error::classify(truncated), Error::Network(_)));
     }
 }

@@ -13,11 +13,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use rustc_hash::FxHashSet as HashSet;
-use swc_core::atoms::Atom;
-
-use crate::vm::HashMap;
+use crate::js::ast::Binding;
 use crate::vm::value::Value;
+use crate::vm::{HashMap, HashSet};
 
 #[derive(Default)]
 pub(crate) struct Frozen {
@@ -32,7 +30,7 @@ pub(crate) struct Frozen {
 impl Frozen {
     /// Groups the objects reachable from `bindings` and shares those of groups that reach no
     /// function with captured state.
-    pub(crate) fn of(bindings: &HashMap<Atom, Value<'_>>) -> Self {
+    pub(crate) fn of(bindings: &HashMap<Binding<'_>, Value<'_>>) -> Self {
         let mut groups = Groups::default();
         for value in bindings.values() {
             let mut reached = Reached::default();

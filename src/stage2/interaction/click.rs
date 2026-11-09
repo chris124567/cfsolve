@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
 use indexmap::IndexMap;
+use oxc::syntax::operator::BinaryOperator;
 use serde::{Deserialize, Serialize};
-use swc_core::ecma::ast::BinaryOp;
 
 use crate::js::{self, JsObject, JsValue};
 use crate::listing::Index;
@@ -125,7 +125,7 @@ fn read(index: &Index<'_>, pc: u32, argument: &Term, event: Event, element: u32)
                 "elementFromPoint" => "element_from_point",
                 "floor" => {
                     let (at, difference) = index.dereference(pc, arguments.first()?)?;
-                    let Term::Binary(BinaryOp::Sub, point, _) = difference else {
+                    let Term::Binary(BinaryOperator::Subtraction, point, _) = difference else {
                         return None;
                     };
                     let coordinate = index.member(at, &point)?;

@@ -9,6 +9,7 @@ use crate::listing::fold::{Frame, Known};
 use crate::listing::query::Store;
 use crate::listing::{Index, query};
 use crate::stage2::payload::RecordLiteral;
+use crate::stage2::queries;
 use crate::stage2::records::{Completion, Envelope, INITIAL_STATUS, Probe};
 use crate::vm::{Effect, Term};
 
@@ -93,7 +94,7 @@ pub(super) fn recover(
         .iter()
         .filter(|store| finish.contains(&store.pc))
         .collect();
-    let [started, finished, duration] = index.clock_marks(&finishing)?;
+    let [started, finished, duration] = queries::clock_marks(index, &finishing)?;
     Ok(Envelope {
         counter,
         token,

@@ -30,5 +30,6 @@ pub use output::{
     Cause, Constant, Effect, Exit, Failure, Hidden, Instruction, Listing, Path, Position, Term,
 };
 
-/// FxHash maps for the VM's small keys.
+/// FxHash maps and sets for the VM's small keys.
 pub(crate) type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
+pub(crate) type HashSet<T> = rustc_hash::FxHashSet<T>;

@@ -8,165 +8,119 @@
 //! ```
 //!
 //! The helper must be assigned once and forward parameters in order, except for swapping the
-//! method and receiver. The method must be read from the receiver's local binding. This keeps
+//! method and receiver. The method must be read from the same receiver binding. This keeps
 //! the same `this` value as a regular method call. Calls must supply exactly one argument per
 //! parameter, without spreads, so the method receives the same arguments.
 
-use swc_core::common::util::take::Take;
-use swc_core::ecma::ast::{
-    CallExpr, Callee, Expr, ExprOrSpread, FnDecl, Function, Id, MemberExpr, Pat, Program, Stmt,
-    VarDeclarator,
-};
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::allocator::{CloneIn, GetAllocator, Vec};
+use oxc::ast::ast::{Argument, Expression, Function, Program};
+use oxc::ast_visit::{VisitMut, walk_mut};
+use oxc::span::GetSpan;
 
-use super::HashMap;
-use super::analysis::{Analysis, Bindings, Globals, names};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::{HashMap, ast};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let globals = analysis.globals;
-    let bindings = analysis.bindings(program);
-    let mut helpers = Helpers::default();
-    program.visit_with(&mut helpers);
-    helpers.0.retain(|id, _| bindings.is_written_once(id));
-    if helpers.0.is_empty() {
-        return false;
-    }
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let helpers = ast::functions(program, analysis, &|function| is_helper(function, analysis));
     let mut restore = Restore {
-        helpers: &helpers.0,
-        bindings,
-        globals,
+        analysis,
+        helpers: &helpers,
         changed: false,
     };
-    program.visit_mut_with(&mut restore);
+    restore.visit_program(program);
     restore.changed
 }
 
-/// Checks for a helper of the form `function(self, method, ...rest) { return (function()
-/// {}).call.call(method, self, ...rest); }` with plain parameters.
-fn is_helper(function: &Function) -> bool {
-    let is_call = |member: &MemberExpr| ast::member_str(&member.prop) == Some("call");
-    if let Some(parameters) = names::parameter_ids(&function.params)
+/// Matches `function (receiver, method, ...rest) { return f.call.call(method, receiver, ...rest); }`
+/// where `f` is a function literal.
+fn is_helper(function: &Function<'_>, analysis: &Analysis<'_>) -> bool {
+    if let Some(parameters) = ast::parameters(function)
         && parameters.len() >= 2
-        && !function.is_async
-        && !function.is_generator
-        && let Some([Stmt::Return(returned)]) = function.body.as_ref().map(|body| &body.stmts[..])
-        && let Some(call) = returned.arg.as_deref().and_then(Expr::as_call)
-        && let Some(callee) = call.callee.as_expr().and_then(|callee| callee.as_member())
-        && let Some(inner) = callee.obj.as_member()
-        && is_call(callee)
-        && is_call(inner)
-        && matches!(inner.obj.unwrap_parens(), Expr::Fn(_) | Expr::Arrow(_))
+        && !function.r#async
+        && !function.generator
+        && let Some(Expression::CallExpression(call)) =
+            ast::returned(function).map(Expression::get_inner_expression)
+        && let Some(outer) = call.callee.as_member_expression()
+        && let Some(inner) = outer.object().as_member_expression()
+        && outer
+            .static_property_name()
+            .is_some_and(|name| name == "call")
+        && inner
+            .static_property_name()
+            .is_some_and(|name| name == "call")
+        && matches!(
+            inner.object().get_inner_expression(),
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+        )
     {
-        let passed = call.args.iter().map(|argument| {
-            let id = argument
-                .expr
-                .as_ident()
-                .filter(|_| argument.spread.is_none())?
-                .to_id();
-            parameters.iter().position(|parameter| *parameter == id)
+        let forwarded = call.arguments.iter().map(|argument| {
+            let id = analysis.expression_id(argument.as_expression()?)?;
+            parameters.iter().position(|&parameter| parameter == id)
         });
-        let swapped = [1, 0].into_iter().chain(2..parameters.len()).map(Some);
-        passed.eq(swapped)
-    } else {
-        false
+        return forwarded.eq([1, 0].into_iter().chain(2..parameters.len()).map(Some));
     }
+    false
 }
 
-/// Helpers by binding, with the number of parameters they forward.
-#[derive(Default)]
-struct Helpers(HashMap<Id, usize>);
-
-impl Visit for Helpers {
-    fn visit_expr(&mut self, expression: &Expr) {
-        if let Some((id, Expr::Fn(function))) = ast::assignment(expression)
-            && is_helper(&function.function)
-        {
-            self.0.insert(id, function.function.params.len());
-        }
-        expression.visit_children_with(self);
-    }
-
-    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        if is_helper(&declaration.function) {
-            self.0
-                .insert(declaration.ident.to_id(), declaration.function.params.len());
-        }
-        declaration.visit_children_with(self);
-    }
-
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Pat::Ident(name) = &declarator.name
-            && let Some(Expr::Fn(function)) = declarator.init.as_deref()
-            && is_helper(&function.function)
-        {
-            self.0.insert(name.to_id(), function.function.params.len());
-        }
-        declarator.visit_children_with(self);
-    }
-}
-
-struct Restore<'a> {
-    helpers: &'a HashMap<Id, usize>,
-    bindings: &'a Bindings,
-    globals: Globals,
+struct Restore<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    helpers: &'b HashMap<Id, &'a Function<'a>>,
     changed: bool,
 }
 
-impl Restore<'_> {
-    /// Rewrites `helper(receiver, receiver.method, ...rest)` as a method call.
-    fn method_call(&self, arguments: &mut Vec<ExprOrSpread>, parameters: usize) -> Option<Expr> {
-        // The helper forwards every parameter, including missing ones as undefined, and ignores
-        // extra arguments after evaluating them. Only a matching, spread-free call forwards the
-        // same arguments directly to the method.
-        if arguments.len() != parameters
-            || arguments.iter().any(|argument| argument.spread.is_some())
+impl<'a> Restore<'_, 'a> {
+    /// Rewrites `helper(receiver, receiver.method, ...rest)` as `receiver.method(...rest)`.
+    fn restore(&self, expression: &Expression<'a>) -> Option<Expression<'a>> {
+        let (callee, arguments) = ast::direct_call(expression)?;
+        let helper = self.helpers.get(&self.analysis.id(callee)?)?;
+        if arguments.len() != helper.params.items.len() || arguments.iter().any(Argument::is_spread)
         {
             return None;
         }
-        let [receiver, method, ..] = &mut arguments[..] else {
+        let [receiver, method, rest @ ..] = arguments else {
             return None;
         };
-        let Expr::Member(member) = &mut *method.expr else {
-            return None;
-        };
-        let object = member.obj.as_ident()?.to_id();
-        let (target, unread) = match &*receiver.expr {
-            Expr::Ident(identifier) => (identifier.to_id(), false),
-            assignment => {
-                let (target, _) = ast::assignment(assignment)?;
-                // The method access below is the only read of the assigned local.
-                let unread = self.bindings.references(&target) == 1
-                    && target.1 != self.globals.unresolved
-                    && !self.bindings.is_mapped_parameter(&target);
-                (target, unread)
+        let receiver = receiver.as_expression()?;
+        let method = method.as_expression()?;
+        let object = self
+            .analysis
+            .expression_id(method.as_member_expression()?.object())?;
+        let (target, receiver) = match self.analysis.expression_id(receiver) {
+            Some(id) => (id, receiver),
+            None => {
+                let (id, value) = self.analysis.assignment(receiver)?;
+                let bindings = &self.analysis.bindings;
+                let unread = bindings.references(&id) == 1 && !bindings.is_mapped_parameter(&id);
+                (id, if unread { value } else { receiver })
             }
         };
         if target != object {
             return None;
         }
-        let mut receiver = receiver.expr.take();
-        if unread {
-            receiver = receiver.expect_assign().right;
-        }
-        member.obj = receiver;
-        Some(Expr::Call(CallExpr {
-            callee: Callee::Expr(method.expr.take()),
-            args: arguments.split_off(2),
-            ..Default::default()
-        }))
+        let allocator = self.analysis.allocator();
+        let mut method = method.clone_in_with_semantic_ids(allocator);
+        let member = method.as_member_expression_mut()?;
+        *member.object_mut() = receiver.clone_in_with_semantic_ids(allocator);
+        let rest = rest
+            .iter()
+            .map(|argument| argument.clone_in_with_semantic_ids(allocator));
+        let rest = Vec::from_iter_in(rest, self.analysis);
+        Some(Expression::new_call_expression(
+            expression.span(),
+            method,
+            None,
+            rest,
+            false,
+            self.analysis,
+        ))
     }
 }
 
-impl VisitMut for Restore<'_> {
-    fn visit_mut_expr(&mut self, expression: &mut Expr) {
-        expression.visit_mut_children_with(self);
-        if let Expr::Call(call) = expression
-            && let Some(callee) = call.callee.as_expr().and_then(|callee| callee.as_ident())
-            && let Some(&parameters) = self.helpers.get(&callee.to_id())
-            && let Some(replacement) = self.method_call(&mut call.args, parameters)
-        {
-            *expression = replacement;
+impl<'a> VisitMut<'a> for Restore<'_, 'a> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+        if let Some(restored) = self.restore(expression) {
+            *expression = restored;
             self.changed = true;
         }
     }
@@ -188,11 +142,9 @@ mod tests {
              call(x, ...methods, 1);
              call(x, x.send, 1);",
             super::run,
-            /* fix= */ true,
         );
         testing::assert_contains(
             &output,
-            &[],
             &[
                 "call(x, x.send);",
                 "call(x, x.send, 1, effect());",
@@ -218,11 +170,9 @@ mod tests {
                 call(x, x.y.z, 9, 10);
             }",
             super::run,
-            /* fix= */ true,
         );
         testing::assert_contains(
             &output,
-            &[],
             &[
                 "x.send(1, 2);",
                 "g().open(3, 4);",
@@ -240,7 +190,6 @@ mod tests {
             let output = testing::rewrite(
                 &format!("var call = {helper}; call(x, x.send, 1);"),
                 super::run,
-                /* fix= */ true,
             );
             assert!(output.contains("call(x, x.send"), "{output}");
         }

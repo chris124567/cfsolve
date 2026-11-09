@@ -14,15 +14,15 @@ use std::ops::ControlFlow;
 
 use anyhow::{Result, bail};
 use indexmap::IndexSet;
+use oxc::syntax::operator::BinaryOperator;
 use rustc_hash::FxBuildHasher;
-use swc_core::ecma::ast::BinaryOp;
 
 use super::interpret::Way;
 use super::machine::{Loaded, Machine};
 use super::output::{Constant, Effect, Exit, Hidden, Instruction, Listing, Path, Position, Term};
 use super::value::Value;
 use super::{HashMap, convert, dataflow, packed_names};
-use crate::candidates;
+use crate::{candidates, profiling};
 
 impl Machine<'_> {
     /// Follows entry paths, created functions, and installed exception handlers.
@@ -70,6 +70,7 @@ impl Machine<'_> {
         listing.failures.sort_unstable_by_key(|failure| failure.pc);
         fuse_method_calls(&mut listing);
         packed_names::fold(&mut listing);
+        profiling::report("VM");
         Ok(listing)
     }
 }
@@ -353,7 +354,10 @@ fn compared(condition: &Term, field: &str) -> Option<f64> {
     let mut number = None;
     condition.visit(&mut |term| {
         if let Term::Binary(
-            BinaryOp::EqEqEq | BinaryOp::NotEqEq | BinaryOp::EqEq | BinaryOp::NotEq,
+            BinaryOperator::StrictEquality
+            | BinaryOperator::StrictInequality
+            | BinaryOperator::Equality
+            | BinaryOperator::Inequality,
             left,
             right,
         ) = term

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
 use crate::candidates;
 use crate::listing::Index;
@@ -77,7 +77,9 @@ fn value_role(index: &Index<'_>, store: &Store) -> Option<&'static str> {
     }
     match index.dereference(pc, value)? {
         // The decoded size less a Server-Timing duration.
-        (at, Term::Binary(BinaryOp::Sub, left, _)) if index.reads(at, &left, "decodedBodySize") => {
+        (at, Term::Binary(BinaryOperator::Subtraction, left, _))
+            if index.reads(at, &left, "decodedBodySize") =>
+        {
             Some(ENVIRONMENT_AUDIT_REDUCTION)
         }
         // A touch-support check given the probe frame's document.

@@ -1,242 +1,235 @@
-//! Counts binding reads and writes and tracks simple assigned values, so rewrites can identify
-//! single assignments and follow copies to their source.
+//! Counts binding writes and reads in the current tree.
 
 use std::mem;
 
-use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignOp, ClassDecl, Expr, FnDecl, ForHead, Function, Id, Ident, Param,
-    Program, Prop, UpdateExpr, VarDeclarator,
+use oxc::ast::ast::{
+    AssignmentExpression, AssignmentTarget, BindingPattern, Class, ClassType, Expression,
+    ForStatementLeft, FormalParameters, Function, FunctionType, IdentifierReference,
+    MemberExpression, Program, SimpleAssignmentTarget, UpdateExpression, VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
-use swc_ecma_utils::DestructuringFinder;
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::Scoping;
+use oxc::syntax::operator::AssignmentOperator;
+use oxc::syntax::scope::ScopeFlags;
 
-use crate::deobfuscate::{HashMap, HashSet};
+use super::Id;
+use crate::deobfuscate::{HashMap, HashSet, ast};
 
-/// Tracks writes and references by resolved [`Id`]. Names are not enough
-/// because the obfuscator reuses them across scopes.
+/// Writes and value reads by binding identity, since spelling alone does not identify a local
+/// across scopes.
 ///
-/// Writes include assignments, updates, initialized declarations, `for-in` and `for-of`
-/// targets, and function or class declarations. Parameters and catch clauses do not count:
-/// helpers may use parameter slots whose incoming values are never read. An assigned value can
-/// be used for substitution only when its binding has exactly one write.
+/// Writes include assignments, updates, initialized declarations, `for-in` and `for-of` targets,
+/// and function or class declarations. Parameters and catch bindings do not count as writes:
+/// helpers may use parameter slots whose incoming values are never read.
 #[derive(Default)]
-pub(crate) struct Bindings {
-    writes: HashMap<Id, Vec<Write>>,
-    references: HashMap<Id, usize>,
-    /// Bindings that receive a copy of each binding's value.
-    copies: HashMap<Id, Vec<Id>>,
-    /// Parameters of functions and arrows.
+pub(in crate::deobfuscate) struct Bindings {
+    writes: HashMap<Id, usize>,
+    /// Counted from reference flags, including the object read in `binding.property`.
+    reads: HashMap<Id, usize>,
+    /// The source of each plain copy assignment `target = source`.
+    copies: HashMap<Id, Id>,
+    /// Function and arrow parameters, including bindings inside destructuring patterns.
     parameters: HashSet<Id>,
-    /// Parameters of functions that use `arguments`.
+    /// Parameters of functions that use `arguments`. In sloppy mode, `arguments[i]` can observe
+    /// parameter writes, so passes must preserve those stores and parameter bindings.
     mapped: HashSet<Id>,
-    /// Whether the function being visited refers to its `arguments`.
-    uses_arguments: bool,
-}
-
-/// One write, and the assigned value when analysis can follow it.
-enum Write {
-    /// `binding = other` or `var binding = other`.
-    Copy(Id),
-    Other,
 }
 
 impl Bindings {
-    #[must_use]
-    pub(crate) fn collect(program: &Program) -> Self {
-        let mut bindings = Self::default();
-        program.visit_with(&mut bindings);
-        bindings
+    pub(super) fn collect(program: &Program<'_>, scoping: &Scoping) -> Self {
+        let mut collect = Collect {
+            scoping,
+            bindings: Self::default(),
+            arguments: false,
+        };
+        collect.visit_program(program);
+        collect.bindings
     }
 
-    #[must_use]
-    pub(crate) fn write_count(&self, id: &Id) -> usize {
-        self.writes.get(id).map_or(0, Vec::len)
+    pub(in crate::deobfuscate) fn write_count(&self, id: &Id) -> usize {
+        self.writes.get(id).copied().unwrap_or(0)
     }
 
-    /// Checks for exactly one write, allowing later reads to use that assigned value.
-    #[must_use]
-    pub(crate) fn is_written_once(&self, id: &Id) -> bool {
+    pub(in crate::deobfuscate) fn references(&self, id: &Id) -> usize {
+        self.reads.get(id).copied().unwrap_or(0)
+    }
+
+    pub(in crate::deobfuscate) fn is_written_once(&self, id: &Id) -> bool {
         self.write_count(id) == 1
     }
 
-    /// Returns the number of value reads, including reads through `binding.property`.
-    #[must_use]
-    pub(crate) fn references(&self, id: &Id) -> usize {
-        self.references.get(id).copied().unwrap_or(0)
+    /// Checks for a local binding that is never assigned and that `arguments` does not alias, so
+    /// every read sees the value it was declared or called with.
+    pub(in crate::deobfuscate) fn is_never_written(&self, id: &Id) -> bool {
+        !id.is_global() && self.write_count(id) == 0 && !self.is_mapped_parameter(id)
     }
 
-    /// Returns whether the binding is a function or arrow parameter that can hold an argument.
-    #[must_use]
-    pub(crate) fn is_parameter(&self, id: &Id) -> bool {
+    pub(in crate::deobfuscate) fn is_parameter(&self, id: &Id) -> bool {
         self.parameters.contains(id)
     }
 
-    /// Checks whether this is a parameter of a function using `arguments`. In sloppy mode,
-    /// `arguments[i]` can observe parameter writes and changes to the parameter list.
-    #[must_use]
-    pub(crate) fn is_mapped_parameter(&self, id: &Id) -> bool {
+    pub(in crate::deobfuscate) fn is_mapped_parameter(&self, id: &Id) -> bool {
         self.mapped.contains(id)
     }
 
-    /// Returns the source binding when `id` has exactly one write that copies it.
-    #[must_use]
-    pub(crate) fn copy_source(&self, id: &Id) -> Option<&Id> {
-        match self.writes.get(id)?.as_slice() {
-            [Write::Copy(source)] => Some(source),
-            _ => None,
-        }
+    /// Returns the source of a plain copy assignment if it is the binding's only write.
+    pub(in crate::deobfuscate) fn copy_source(&self, id: &Id) -> Option<&Id> {
+        self.copies.get(id).filter(|_| self.is_written_once(id))
     }
 
-    /// Follows [`Self::copy_source`] to the original binding in a copy chain. This identifies
-    /// the first binding assigned a helper object.
-    #[must_use]
-    pub(crate) fn root(&self, id: &Id) -> Id {
-        let mut current = id.clone();
+    /// Checks whether another single-write binding copies this binding's value.
+    pub(in crate::deobfuscate) fn is_copied(&self, id: &Id) -> bool {
+        self.copies
+            .iter()
+            .any(|(alias, source)| source == id && self.is_written_once(alias))
+    }
+
+    /// Follows single-write copies to their original binding, stopping at cycles.
+    pub(in crate::deobfuscate) fn root(&self, id: &Id) -> Id {
+        let mut id = *id;
         let mut seen = HashSet::default();
-        while let Some(source) = self.copy_source(&current) {
-            if !seen.insert(current.clone()) {
+        while let Some(&next) = self.copy_source(&id) {
+            if !seen.insert(id) {
                 break;
             }
-            current = source.clone();
+            id = next
         }
-        current
-    }
-
-    /// The [`Self::root`] of every binding that has a copy source.
-    #[must_use]
-    pub(crate) fn roots(&self) -> HashMap<Id, Id> {
-        let copies = self
-            .writes
-            .keys()
-            .filter(|id| self.copy_source(id).is_some());
-        copies.map(|id| (id.clone(), self.root(id))).collect()
-    }
-
-    /// Checks whether another binding copies `id` (see [`Self::copy_source`]).
-    #[must_use]
-    pub(crate) fn is_copied(&self, id: &Id) -> bool {
-        self.copies
-            .get(id)
-            .is_some_and(|copies| copies.iter().any(|copy| self.copy_source(copy) == Some(id)))
-    }
-
-    fn write<N: VisitWith<DestructuringFinder<Id>>>(&mut self, target: &N) {
-        for id in swc_ecma_utils::find_pat_ids::<_, Id>(target) {
-            self.writes.entry(id).or_default().push(Write::Other);
-        }
-    }
-
-    /// A write of `value` to the plain identifier `id`.
-    fn write_value(&mut self, id: Id, value: &Expr) {
-        let write = if let Some(source) = value.as_ident() {
-            self.copies
-                .entry(source.to_id())
-                .or_default()
-                .push(id.clone());
-            Write::Copy(source.to_id())
-        } else {
-            Write::Other
-        };
-        self.writes.entry(id).or_default().push(write);
-    }
-
-    fn reference(&mut self, id: Id) {
-        *self.references.entry(id).or_default() += 1;
+        id
     }
 }
 
-impl Visit for Bindings {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        match assignment.left.as_ident() {
-            Some(target) if assignment.op == AssignOp::Assign => {
-                self.write_value(target.to_id(), &assignment.right);
+struct Collect<'s> {
+    scoping: &'s Scoping,
+    bindings: Bindings,
+    /// Whether the current function mentions `arguments`.
+    arguments: bool,
+}
+
+impl Collect<'_> {
+    fn write(&mut self, id: Id, value: Option<&Expression<'_>>) {
+        *self.bindings.writes.entry(id).or_default() += 1;
+        let source = value
+            .and_then(Expression::get_identifier_reference)
+            .and_then(|reference| Id::of(reference, self.scoping));
+        if let Some(source) = source {
+            self.bindings.copies.insert(id, source);
+        }
+    }
+
+    fn write_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        for id in pattern_ids(pattern) {
+            self.write(id, None)
+        }
+    }
+}
+
+fn pattern_ids(pattern: &BindingPattern<'_>) -> impl Iterator<Item = Id> {
+    let bindings = pattern.get_binding_identifiers().into_iter();
+    bindings.filter_map(|binding| binding.symbol_id.get().map(Id::Local))
+}
+
+/// Visits only target bindings; computed member operands and default values execute separately.
+struct Targets<'b, 's>(&'b mut Collect<'s>);
+
+impl<'a> Visit<'a> for Targets<'_, '_> {
+    fn visit_identifier_reference(&mut self, reference: &IdentifierReference<'a>) {
+        if let Some(id) = Id::of(reference, self.0.scoping) {
+            self.0.write(id, None)
+        }
+    }
+
+    fn visit_member_expression(&mut self, _: &MemberExpression<'a>) {}
+
+    fn visit_expression(&mut self, _: &Expression<'a>) {}
+}
+
+impl<'a> Visit<'a> for Collect<'_> {
+    fn visit_identifier_reference(&mut self, reference: &IdentifierReference<'a>) {
+        self.arguments |= ast::is_arguments(reference);
+        if let Some(id) = Id::of(reference, self.scoping) {
+            let reference_id = reference.reference_id.get().expect("resolved reference");
+            if self.scoping.get_reference(reference_id).is_read() {
+                *self.bindings.reads.entry(id).or_default() += 1
             }
-            _ => self.write(&assignment.left),
         }
-        assignment.visit_children_with(self);
     }
 
-    fn visit_update_expr(&mut self, update: &UpdateExpr) {
-        if let Expr::Ident(id) = &*update.arg {
-            self.write(id);
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left {
+            if let Some(id) = Id::of(target, self.scoping) {
+                let copied = assignment.operator == AssignmentOperator::Assign;
+                self.write(id, copied.then_some(&assignment.right))
+            }
+        } else {
+            Targets(self).visit_assignment_target(&assignment.left);
         }
-        update.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment)
     }
 
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Some(init) = &declarator.init {
-            match declarator.name.as_ident() {
-                Some(name) => self.write_value(name.to_id(), init),
-                None => self.write(&declarator.name),
+    fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
+        if let SimpleAssignmentTarget::AssignmentTargetIdentifier(target) = &update.argument
+            && let Some(id) = Id::of(target, self.scoping)
+        {
+            self.write(id, None)
+        }
+        walk::walk_update_expression(self, update)
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(value) = &declarator.init {
+            match ast::pattern_id(&declarator.id) {
+                Some(id) => self.write(id, Some(value)),
+                None => self.write_pattern(&declarator.id),
             }
         }
-        declarator.visit_children_with(self);
+        walk::walk_variable_declarator(self, declarator)
     }
 
-    /// Loop heads assign on every iteration, whether or not they declare.
-    fn visit_for_head(&mut self, head: &ForHead) {
-        self.write(head);
-        head.visit_children_with(self);
+    fn visit_for_statement_left(&mut self, left: &ForStatementLeft<'a>) {
+        if let ForStatementLeft::VariableDeclaration(declaration) = left {
+            for declarator in &declaration.declarations {
+                self.write_pattern(&declarator.id)
+            }
+        } else if let Some(target) = left.as_assignment_target() {
+            Targets(self).visit_assignment_target(target)
+        }
+        walk::walk_for_statement_left(self, left)
     }
 
-    fn visit_fn_decl(&mut self, function: &FnDecl) {
-        self.write(&function.ident);
-        function.visit_children_with(self);
-    }
-
-    fn visit_class_decl(&mut self, class: &ClassDecl) {
-        self.write(&class.ident);
-        class.visit_children_with(self);
-    }
-
-    fn visit_function(&mut self, function: &Function) {
-        // A nested function has its own `arguments`; an arrow shares its enclosing function's.
-        let outer = mem::take(&mut self.uses_arguments);
-        function.visit_children_with(self);
-        if mem::replace(&mut self.uses_arguments, outer) {
-            self.mapped.extend(
-                function
-                    .params
-                    .iter()
-                    .flat_map(|param| swc_ecma_utils::find_pat_ids::<_, Id>(&param.pat)),
-            );
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if function.r#type == FunctionType::FunctionDeclaration
+            && let Some(id) = ast::function_id(function)
+        {
+            self.write(id, None)
+        }
+        let outer = mem::take(&mut self.arguments);
+        walk::walk_function(self, function, flags);
+        if mem::replace(&mut self.arguments, outer) {
+            for parameter in &function.params.items {
+                self.bindings.mapped.extend(pattern_ids(&parameter.pattern));
+            }
         }
     }
 
-    fn visit_param(&mut self, parameter: &Param) {
-        self.parameters
-            .extend(swc_ecma_utils::find_pat_ids::<_, Id>(&parameter.pat));
-        parameter.visit_children_with(self);
-    }
-
-    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        self.parameters
-            .extend(swc_ecma_utils::find_pat_ids::<_, Id>(&arrow.params));
-        arrow.visit_children_with(self);
-    }
-
-    fn visit_ident(&mut self, identifier: &Ident) {
-        self.uses_arguments |= identifier.sym == "arguments";
-    }
-
-    fn visit_expr(&mut self, expression: &Expr) {
-        if let Expr::Ident(id) = expression {
-            self.reference(id.to_id());
+    fn visit_class(&mut self, class: &Class<'a>) {
+        if class.r#type == ClassType::ClassDeclaration
+            && let Some(symbol) = class.id.as_ref().and_then(|id| id.symbol_id.get())
+        {
+            self.write(Id::Local(symbol), None)
         }
-        expression.visit_children_with(self);
+        walk::walk_class(self, class)
     }
 
-    fn visit_prop(&mut self, property: &Prop) {
-        if let Prop::Shorthand(id) = property {
-            self.reference(id.to_id());
+    fn visit_formal_parameters(&mut self, parameters: &FormalParameters<'a>) {
+        for pattern in parameters.iter_bindings() {
+            self.bindings.parameters.extend(pattern_ids(pattern));
         }
-        property.visit_children_with(self);
+        walk::walk_formal_parameters(self, parameters)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Bindings;
     use crate::deobfuscate::testing;
 
     #[test]
@@ -249,20 +242,29 @@ mod tests {
                 for (const [a, b] of list) {}
                 return once.x + escaped.y + m.z + m[\"w\"] + mutated.x + { param };
             }",
-            |program, id| {
-                let writes = Bindings::collect(program);
-                assert!(writes.is_written_once(&id("once")));
-                assert!(!writes.is_written_once(&id("twice")));
-                assert!(writes.is_written_once(&id("escaped")));
-                assert!(!writes.is_written_once(&id("counted")));
-                assert!(writes.is_written_once(&id("declared")));
-                assert!(writes.is_written_once(&id("g")));
-                assert!(writes.is_written_once(&id("a")));
-                assert!(!writes.is_written_once(&id("m")));
-                assert_eq!(writes.references(&id("m")), 3);
-                assert_eq!(writes.references(&id("escaped")), 2);
-                assert_eq!(writes.references(&id("param")), 1);
-                assert_eq!(writes.references(&id("mutated")), 2);
+            |_, analysis, id| {
+                let bindings = &analysis.bindings;
+                assert!(bindings.is_written_once(&id("once")));
+                assert!(!bindings.is_written_once(&id("twice")));
+                assert!(bindings.is_written_once(&id("escaped")));
+                assert!(!bindings.is_written_once(&id("counted")));
+                assert!(bindings.is_written_once(&id("declared")));
+                assert!(bindings.is_written_once(&id("g")));
+                assert!(bindings.is_written_once(&id("a")));
+                assert!(!bindings.is_written_once(&id("m")));
+                assert_eq!(bindings.references(&id("m")), 3);
+                assert_eq!(bindings.references(&id("escaped")), 2);
+                assert_eq!(bindings.references(&id("param")), 1);
+                assert_eq!(bindings.references(&id("mutated")), 2);
+            },
+        );
+        // Compound assignments and destructuring loop heads are writes.
+        testing::check(
+            "function f(a,b,c){a+=b;c=1;for([c] of list){}}",
+            |_, analysis, id| {
+                assert_eq!(analysis.bindings.copy_source(&id("a")), None);
+                assert_eq!(analysis.bindings.write_count(&id("a")), 1);
+                assert_eq!(analysis.bindings.write_count(&id("c")), 2);
             },
         );
     }
@@ -276,8 +278,8 @@ mod tests {
                 h = {}; p = h; var q = p;
                 return late;
             }",
-            |program, id| {
-                let bindings = Bindings::collect(program);
+            |_, analysis, id| {
+                let bindings = &analysis.bindings;
                 assert_eq!(bindings.root(&id("q")), id("h"));
                 assert_eq!(bindings.root(&id("late")), id("d"));
                 assert_eq!(bindings.root(&id("mixed")), id("mixed"));
@@ -286,8 +288,8 @@ mod tests {
         testing::check(
             "function f(a, [b]) { return () => arguments[0]; }
              function g(c) { return function () { return arguments; }; }",
-            |program, id| {
-                let bindings = Bindings::collect(program);
+            |_, analysis, id| {
+                let bindings = &analysis.bindings;
                 assert!(bindings.is_mapped_parameter(&id("a")));
                 assert!(bindings.is_mapped_parameter(&id("b")));
                 assert!(!bindings.is_mapped_parameter(&id("c")));

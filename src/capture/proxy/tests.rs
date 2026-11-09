@@ -46,7 +46,7 @@ impl Loopback {
     async fn start(mitm_hosts: Vec<String>) -> Self {
         let profile = Path::new("profiles/safari-26-ios.json");
         let transport = Transport::read(profile).unwrap();
-        let client = transport.client(None).unwrap();
+        let client = transport.client(None, None).unwrap();
         let config = Config {
             listen: "127.0.0.1:0".parse().unwrap(),
             mitm_hosts,

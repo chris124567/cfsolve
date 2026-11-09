@@ -2,23 +2,27 @@
 
 use std::ptr;
 
-use swc_core::atoms::{Atom, atom};
-use swc_core::ecma::ast::{ArrowExpr, Decl, Function, Pat, Stmt};
+use oxc::ast::ast::{
+    ArrowFunctionExpression, FormalParameters, Function, Statement, VariableDeclaration,
+};
 
 use super::access::Key;
-use super::run::{Evaluation, Frame, RecordKey, RecordPart, Run, Stop};
-use super::{intrinsic, plan};
-use crate::vm::HashMap;
+use super::intrinsic::{self, Intrinsic};
+use super::plan::{self, Routine};
+use super::run::{CallScope, Evaluation, Frame, RecordKey, RecordPart, Run, Stop};
+use crate::js::ast::Binding;
+use crate::profiling;
 use crate::vm::output::Term;
 use crate::vm::value::{Callable, Env, Scope, Value};
+use crate::vm::{HashMap, extract};
 
 impl<'ast> Run<'ast, '_> {
     /// Creates a function capturing its current scope, such as a closure factory's machine and
     /// layout.
     pub(super) fn function_value(
         &mut self,
-        name: Option<Atom>,
-        function: &'ast Function,
+        name: Option<&'ast str>,
+        function: &'ast Function<'ast>,
     ) -> Value<'ast> {
         Value::function(Callable::Script {
             name,
@@ -28,7 +32,10 @@ impl<'ast> Run<'ast, '_> {
     }
 
     /// Creates an arrow function capturing both the current scope and `this`.
-    pub(super) fn arrow_value(&mut self, arrow: &'ast ArrowExpr) -> Value<'ast> {
+    pub(super) fn arrow_value(
+        &mut self,
+        arrow: &'ast ArrowFunctionExpression<'ast>,
+    ) -> Value<'ast> {
         let this = self.frame().this.clone();
         let scope = Some(self.closure_scope());
         Value::function(Callable::Arrow { arrow, this, scope })
@@ -105,6 +112,14 @@ impl<'ast> Run<'ast, '_> {
         this: Value<'ast>,
         mut arguments: Vec<Value<'ast>>,
     ) -> Evaluation<'ast, Value<'ast>> {
+        if let Callable::Script { function, .. } = callable
+            && let Some(&intrinsic) = self.session.intrinsics.get(&intrinsic::address(function))
+            && let Some(value) = intrinsic.call(self, &arguments)
+        {
+            arguments.clear();
+            self.spare.arguments.push(arguments);
+            return Ok(value);
+        }
         match callable {
             // Evaluate helpers with symbolic arguments when their control flow can be followed,
             // such as validation or forwarding wrappers. Record an unresolved call otherwise,
@@ -118,7 +133,7 @@ impl<'ast> Run<'ast, '_> {
                 // containers can change during it, so calls without them are kept (`Err`) and
                 // recorded only when the attempt fails.
                 let call = |arguments: &[Value<'ast>]| Term::Call {
-                    callee: Box::new(Term::Global(name.to_string())),
+                    callee: Box::new(Term::Global((*name).to_owned())),
                     this: None,
                     arguments: arguments.iter().map(Value::expr).collect(),
                 };
@@ -144,13 +159,19 @@ impl<'ast> Run<'ast, '_> {
                 function, scope, ..
             } => self.script(function, scope.as_ref(), this, arguments),
             Callable::Arrow { arrow, this, scope } => {
-                let locals = parameters(arrow.params.iter(), arguments, 0)?;
+                let locals = parameters(&arrow.params, arguments, 0)?;
                 let scope = self.call_scope(locals, scope.as_ref());
-                let body = self.session.compiled.scoped(*arrow, plan::scoped_arrow);
+                let script = self.session.script;
+                let body = self
+                    .session
+                    .compiled
+                    .scoped(ptr::from_ref(*arrow).addr(), || {
+                        plan::scoped_arrow(script, arrow)
+                    });
                 self.body(
                     Frame {
                         this: this.clone(),
-                        scope,
+                        scope: CallScope::Own(scope),
                     },
                     &body,
                     &mut [],
@@ -193,31 +214,48 @@ impl<'ast> Run<'ast, '_> {
                 this,
                 arguments: bound,
             } => {
-                let all: Vec<Value<'ast>> = match bound.is_empty() {
-                    true => arguments,
-                    false => bound.iter().cloned().chain(arguments).collect(),
+                let all: Vec<Value<'ast>> = if bound.is_empty() {
+                    arguments
+                } else {
+                    bound.iter().cloned().chain(arguments).collect()
                 };
                 self.apply(target.clone(), this.clone(), all)
             }
         }
     }
 
-    /// Calls a script function: natively if it has an intrinsic that accepts the arguments,
-    /// from the program's cache if it decrypts a string record decrypted before, or else
-    /// interpreted.
+    /// Calls a script function, timing it when profiling.
     pub(super) fn script(
         &mut self,
-        function: &'ast Function,
+        function: &'ast Function<'ast>,
         scope: Option<&Scope<'ast>>,
         this: Value<'ast>,
         arguments: Vec<Value<'ast>>,
     ) -> Evaluation<'ast, Value<'ast>> {
-        if let Some(intrinsic) = self.session.intrinsics.get(&intrinsic::address(function)) {
+        let started = profiling::start();
+        let result = self.run_script(function, scope, this, arguments);
+        profiling::record(started, || format!("function@{}", function.span.start));
+        result
+    }
+
+    /// Calls a script function: natively if it computes BLAKE3 compression on arguments the
+    /// native version accepts, from the program's cache if it decrypts a string record decrypted
+    /// before, or else interpreted.
+    fn run_script(
+        &mut self,
+        function: &'ast Function<'ast>,
+        scope: Option<&Scope<'ast>>,
+        this: Value<'ast>,
+        arguments: Vec<Value<'ast>>,
+    ) -> Evaluation<'ast, Value<'ast>> {
+        if let Some(Intrinsic::Blake3Compress) =
+            self.session.intrinsics.get(&intrinsic::address(function))
+        {
             // Intrinsics may write to their arguments.
             for argument in &arguments {
                 self.writable(argument)?;
             }
-            if let Some(value) = intrinsic.call(&arguments) {
+            if let Some(value) = intrinsic::blake3_compress(&arguments) {
                 return Ok(value);
             }
         }
@@ -233,7 +271,15 @@ impl<'ast> Run<'ast, '_> {
             if let Some(text) = decrypted.borrow().get(&key) {
                 return Ok(text.clone());
             }
-            let text = self.interpret(function, scope, this, arguments)?;
+            let native = self
+                .session
+                .string_decoder
+                .as_ref()
+                .and_then(|decoder| decoder.decrypt(self, record));
+            let text = match native {
+                Some(text) => text,
+                None => self.interpret(function, scope, this, arguments)?,
+            };
             // A run that thawed a shared object may have computed the text differently.
             if matches!(text, Value::String(_)) && !self.thawed {
                 decrypted.borrow_mut().insert(key, text.clone());
@@ -243,34 +289,50 @@ impl<'ast> Run<'ast, '_> {
         self.interpret(function, scope, this, arguments)
     }
 
-    /// Runs a function through its slot plan if it has one, or else through its scoped plan.
+    /// Runs a function through its routine (see [`Run::routine`]).
     fn interpret(
         &mut self,
-        function: &'ast Function,
+        function: &'ast Function<'ast>,
         scope: Option<&Scope<'ast>>,
         this: Value<'ast>,
         arguments: Vec<Value<'ast>>,
     ) -> Evaluation<'ast, Value<'ast>> {
+        let routine =
+            Routine::function(function).ok_or_else(|| Stop::unsupported("declared function"))?;
+        self.routine(routine, scope, this, arguments)
+    }
+
+    /// Runs a routine through its slot plan if it has one, or else through its scoped plan.
+    pub(super) fn routine(
+        &mut self,
+        routine: Routine<'ast>,
+        scope: Option<&Scope<'ast>>,
+        this: Value<'ast>,
+        arguments: Vec<Value<'ast>>,
+    ) -> Evaluation<'ast, Value<'ast>> {
+        let script = self.session.script;
         if self.setup.is_none()
-            && let Some(plan) = self.session.compiled.slots(function)
+            && let Some(plan) = self.session.compiled.slots(script, routine)
         {
             return self.call_plan(&plan, scope, this, arguments);
         }
-        let body = function
-            .body
-            .as_ref()
-            .ok_or_else(|| Stop::unsupported("declared function"))?;
-        let patterns = function.params.iter().map(|parameter| &parameter.pat);
         let all = Value::array(arguments.clone());
         // Room for `arguments` and the variables the body declares.
-        let mut locals = parameters(patterns, arguments, 1 + declared(&body.stmts))?;
-        locals.insert(atom!("arguments"), all);
+        let mut locals = parameters(routine.parameters, arguments, 1 + declared(routine))?;
+        locals.insert(Binding::Global("arguments"), all);
         let scope = self.call_scope(locals, scope);
         let body = self
             .session
             .compiled
-            .scoped(body, |body| plan::scoped_body(&body.stmts));
-        self.body(Frame { this, scope }, &body, &mut [])
+            .scoped(routine.address, || plan::scoped_routine(script, routine));
+        self.body(
+            Frame {
+                this,
+                scope: CallScope::Own(scope),
+            },
+            &body,
+            &mut [],
+        )
     }
 
     /// Creates a call scope with `locals`, nested in the function's captured scope. Functions
@@ -278,7 +340,7 @@ impl<'ast> Run<'ast, '_> {
     /// afterward. Unresolved names fall back to session bindings.
     fn call_scope(
         &self,
-        locals: HashMap<Atom, Value<'ast>>,
+        locals: HashMap<Binding<'ast>, Value<'ast>>,
         closed: Option<&Scope<'ast>>,
     ) -> Scope<'ast> {
         let outer = closed.or(self.setup.as_ref()).cloned();
@@ -330,31 +392,33 @@ fn record_key(record: &Value<'_>) -> Option<RecordKey> {
 }
 
 /// Binds call arguments to parameters and reserves `room` additional local slots.
-fn parameters<'ast, 'pattern>(
-    patterns: impl Iterator<Item = &'pattern Pat>,
+fn parameters<'ast>(
+    parameters: &FormalParameters<'_>,
     arguments: Vec<Value<'ast>>,
     room: usize,
-) -> Evaluation<'ast, HashMap<Atom, Value<'ast>>> {
+) -> Evaluation<'ast, HashMap<Binding<'ast>, Value<'ast>>> {
+    let names =
+        extract::parameters(parameters).ok_or_else(|| Stop::unsupported("a parameter pattern"))?;
     let mut arguments = arguments.into_iter();
-    let capacity = patterns.size_hint().0 + room;
+    let capacity = names.len() + room;
     let mut locals = HashMap::with_capacity_and_hasher(capacity, Default::default());
-    for pattern in patterns {
-        let Pat::Ident(name) = pattern else {
-            return Err(Stop::unsupported("a parameter pattern"));
-        };
+    for name in names {
         let argument = arguments.next().unwrap_or(Value::Undefined);
-        locals.insert(name.id.sym.clone(), argument);
+        locals.insert(Binding::Symbol(name.symbol_id()), argument);
     }
     Ok(locals)
 }
 
-/// Counts top-level `var` declarations in `statements` to reserve local storage for a call.
-fn declared(statements: &[Stmt]) -> usize {
-    statements
+/// Counts top-level variable declarations in `routine` to reserve local storage for a call.
+fn declared(routine: Routine<'_>) -> usize {
+    let count = |declaration: &VariableDeclaration<'_>| declaration.declarations.len();
+    let statements = routine.statements.iter().map(|statement| match statement {
+        Statement::VariableDeclaration(declaration) => count(declaration),
+        _ => 0,
+    });
+    let declarations = routine
+        .declarations
         .iter()
-        .map(|statement| match statement {
-            Stmt::Decl(Decl::Var(declaration)) => declaration.decls.len(),
-            _ => 0,
-        })
-        .sum()
+        .map(|declaration| count(declaration));
+    statements.chain(declarations).sum()
 }

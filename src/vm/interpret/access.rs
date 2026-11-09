@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::rc::Rc;
 
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
 use super::builtin::{self, Builtin};
 use super::run::{Evaluation, Run, Stop};
@@ -58,8 +58,28 @@ impl<'key> Key<'key, '_> {
     /// The key as property-name text (see [`semantics::property_key`]).
     pub(super) fn property(&self) -> Option<String> {
         match self {
-            Self::Name(name) => Some(name.clone().into_owned()),
+            Self::Name(name) => Some(name.to_string()),
             Self::Value(value) => semantics::property_key(value),
+        }
+    }
+
+    /// Calls `visit` with the property-name text (see [`Self::property`]), without allocating
+    /// for names and small integers, the usual keys of object lookups.
+    fn with_property<R>(&self, visit: impl FnOnce(&str) -> R) -> Option<R> {
+        match self {
+            Self::Name(name) => Some(visit(name)),
+            // Integers below 10^15 are exact in i64 and print as plain digits; -0 prints as 0.
+            Self::Value(Value::Number(number)) if number.fract() == 0.0 && number.abs() < 1e15 => {
+                use std::io::Write;
+
+                let mut buffer = [0; 20];
+                let mut unwritten = &mut buffer[..];
+                write!(unwritten, "{}", *number as i64).expect("20 bytes hold any i64");
+                let length = 20 - unwritten.len();
+                let text = std::str::from_utf8(&buffer[..length]).expect("digits are ASCII");
+                Some(visit(text))
+            }
+            Self::Value(value) => semantics::property_key(value).map(|name| visit(&name)),
         }
     }
 
@@ -178,24 +198,21 @@ impl<'ast> Run<'ast, '_> {
                 (None, Some(_)) => Value::Undefined,
                 _ => return Err(unsupported("string member", key)),
             },
-            Value::Object(properties) => {
-                let name = key
-                    .property()
-                    .ok_or_else(|| unsupported("object key", key))?;
-                properties
-                    .borrow()
-                    .iter()
-                    .find(|(key, _)| **key == *name)
-                    .map_or(Value::Undefined, |(_, value)| value.clone())
-            }
-            Value::Map(_) => match name.and_then(|name| builtin::method("Map.prototype", name)) {
-                Some(method) => method,
-                None => return Err(unsupported("map member", key)),
-            },
-            Value::Set(_) => match name.and_then(|name| builtin::method("Set.prototype", name)) {
-                Some(method) => method,
-                None => return Err(unsupported("set member", key)),
-            },
+            Value::Object(properties) => key
+                .with_property(|name| {
+                    properties
+                        .borrow()
+                        .iter()
+                        .find(|(key, _)| key == name)
+                        .map_or(Value::Undefined, |(_, value)| value.clone())
+                })
+                .ok_or_else(|| unsupported("object key", key))?,
+            Value::Map(_) => name
+                .and_then(|name| builtin::method("Map.prototype", name))
+                .ok_or_else(|| unsupported("map member", key))?,
+            Value::Set(_) => name
+                .and_then(|name| builtin::method("Set.prototype", name))
+                .ok_or_else(|| unsupported("set member", key))?,
             Value::Function(function) => match (&**function, name) {
                 (_, Some("call")) => Value::function(Callable::Call(object.clone())),
                 (_, Some("apply")) => Value::function(Callable::Apply(object.clone())),
@@ -211,10 +228,8 @@ impl<'ast> Run<'ast, '_> {
                 _ => Value::symbolic(Term::Get(Box::new((**expr).clone()), Box::new(key.expr()))),
             },
             Value::Undefined | Value::Null => {
-                let key = key.expr();
-                return Err(Stop::throw(Value::string(&format!(
-                    "TypeError: reading {key}"
-                ))));
+                let error = format!("TypeError: reading {}", key.expr());
+                return Err(Stop::throw(Value::string(&error)));
             }
             Value::Bool(_) | Value::Number(_) | Value::Symbol(_) => {
                 return Err(unsupported("member of a primitive", key));
@@ -303,17 +318,19 @@ impl<'ast> Run<'ast, '_> {
                 elements[index] = value;
             }
             Value::Object(properties) => {
-                let name = key
-                    .property()
+                let existing = key
+                    .with_property(|name| {
+                        properties
+                            .borrow()
+                            .iter()
+                            .position(|(existing, _)| existing == name)
+                    })
                     .ok_or_else(|| unsupported("object key", key))?;
                 self.writable(object)?;
                 let mut properties = properties.borrow_mut();
-                match properties
-                    .iter_mut()
-                    .find(|(existing, _)| **existing == *name)
-                {
-                    Some((_, slot)) => *slot = value,
-                    None => properties.push((name, value)),
+                match existing {
+                    Some(index) => properties[index].1 = value,
+                    None => properties.push((key.property().expect("the key has a name"), value)),
                 }
             }
             Value::Symbolic(_) | Value::Namespace(_) => self.effects.push(Effect::SetProperty {
@@ -322,10 +339,8 @@ impl<'ast> Run<'ast, '_> {
                 value: Box::new(value.expr()),
             }),
             Value::Undefined | Value::Null => {
-                let key = key.expr();
-                return Err(Stop::throw(Value::string(&format!(
-                    "TypeError: setting {key}"
-                ))));
+                let error = format!("TypeError: setting {}", key.expr());
+                return Err(Stop::throw(Value::string(&error)));
             }
             _ => return Err(unsupported("setting a member", key)),
         }
@@ -351,9 +366,6 @@ impl<'ast> Run<'ast, '_> {
 
     /// Decrypts a string record using the same logic as the register file's `read` method.
     fn decrypted(&mut self, record: Value<'ast>) -> Evaluation<'ast, Value<'ast>> {
-        if !matches!(record, Value::Array(_)) {
-            return Ok(record);
-        }
         let decoder = self
             .session
             .record_decoder
@@ -394,27 +406,30 @@ impl<'ast> Run<'ast, '_> {
 /// Parses a canonical numeric property key so `a["0"]` matches `a[0]`. Noncanonical strings
 /// such as `"01"` and `"-0"` remain named properties.
 fn key_index(name: &str) -> Option<f64> {
-    use swc_ecma_utils::number::ToJsString;
-
     // Most property keys are names rather than numeric strings.
     let first = name.bytes().next()?;
     if !(first.is_ascii_digit() || matches!(first, b'-' | b'I' | b'N')) {
         return None;
     }
     let number = js::string_number(name);
-    (number.to_js_string() == name).then_some(number)
+    (semantics::number_text(number) == name).then_some(number)
 }
 
 /// Decodes `value` stored with `tag`, matching the value returned by the register reader.
 fn stored(tag: Stored, value: Value<'_>) -> Value<'_> {
     match tag {
-        Stored::Integer(upper) => {
-            semantics::binary_value(BinaryOp::BitXor, Value::Number(f64::from(upper)), value)
-        }
+        Stored::Integer(upper) => semantics::binary_value(
+            BinaryOperator::BitwiseXOR,
+            Value::Number(f64::from(upper)),
+            value,
+        ),
         Stored::Boolean(upper) => {
-            let bits =
-                semantics::binary_value(BinaryOp::BitXor, value, Value::Number(f64::from(upper)));
-            semantics::binary_value(BinaryOp::NotEqEq, bits, Value::Number(0.0))
+            let bits = semantics::binary_value(
+                BinaryOperator::BitwiseXOR,
+                value,
+                Value::Number(f64::from(upper)),
+            );
+            semantics::binary_value(BinaryOperator::StrictInequality, bits, Value::Number(0.0))
         }
         Stored::Plain | Stored::Record => value,
     }

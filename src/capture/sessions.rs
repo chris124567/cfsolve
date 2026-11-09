@@ -14,9 +14,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use num_bigint::BigUint;
+use oxc::ast::ast::Program;
+use oxc::ast_visit::Visit;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
-use swc_core::ecma::ast::Script;
 use tokio::task::JoinSet;
 use url::Url;
 
@@ -349,8 +350,8 @@ fn extract_codec(original: &str) -> Result<Codec> {
 /// Searches literals and inline decoded `strings` for a custom base64 alphabet using the solver's
 /// alphabet rule. Searches the entire raw script, including outside the immediately invoked
 /// function. Background extraction validates the result before saving session answers.
-pub(super) fn scan_alphabet(script: &Script, strings: &[Encoded]) -> Result<String> {
-    let mut candidates = ast::string_literals(script);
+pub(super) fn scan_alphabet(program: &Program<'_>, strings: &[Encoded]) -> Result<String> {
+    let mut candidates = ast::string_literals(|literals| literals.visit_program(program));
     candidates.extend(strings.iter().map(|string| string.decoded.clone()));
     program::base64_alphabet(candidates)
 }

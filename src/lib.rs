@@ -44,6 +44,7 @@ mod engine;
 mod error;
 mod listing;
 mod performance_clock;
+mod profiling;
 mod random_id;
 mod resource_timing;
 mod session;

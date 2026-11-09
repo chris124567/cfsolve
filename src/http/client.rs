@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env, fs};
 
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "internals")]
@@ -25,10 +24,6 @@ use wreq_util::{Emulation, Platform, Profile};
 use super::decode;
 use super::header_order::{HeaderOrder, RequestKind, Slot};
 use crate::engine::Engine;
-
-/// Environment variable naming a PEM certificate to trust instead of the built-in roots, such as
-/// `capture-proxy`'s CA, so a solve can be recorded in the same format as a browser session.
-const PROXY_CA: &str = "CFSOLVE_PROXY_CA";
 
 /// HTTP client configured from the browser fingerprint. Shared by all session requests to
 /// preserve cookies and transport settings.
@@ -70,7 +65,9 @@ impl Requests {
 impl BrowserClient {
     /// Creates a client from a wreq-util transport profile. `headers` replace the profile's
     /// user agent and client hints, `hello` adds ClientHello fields for newer browsers, and
-    /// `proxy` is an `http://`, `https://`, `socks5://`, or `socks5h://` URL.
+    /// `proxy` is an `http://`, `https://`, `socks5://`, or `socks5h://` URL. `trusted_root` is
+    /// PEM certificate text to trust instead of the built-in roots.
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         profile: Profile,
         platform: Platform,
@@ -79,6 +76,7 @@ impl BrowserClient {
         requests: Requests,
         engine: Engine,
         proxy: Option<&str>,
+        trusted_root: Option<&[u8]>,
     ) -> Result<Self> {
         use wreq::IntoEmulation;
 
@@ -119,10 +117,9 @@ impl BrowserClient {
         if let Some(proxy) = proxy {
             builder = builder.proxy(Proxy::all(proxy)?);
         }
-        if let Some(path) = env::var_os(PROXY_CA) {
-            let pem = fs::read(&path)
-                .with_context(|| format!("reading {PROXY_CA} {}", path.to_string_lossy()))?;
-            builder = builder.tls_cert_store(CertStore::from_pem_certs([&pem[..]])?);
+        if let Some(pem) = trusted_root {
+            let store = CertStore::from_pem_certs([pem]).context("reading the trusted root")?;
+            builder = builder.tls_cert_store(store);
         }
         Ok(Self {
             http: builder.build()?,

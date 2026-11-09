@@ -9,7 +9,7 @@ use std::convert::Infallible;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
 use super::output::{Constant, Effect, Listing, Path, Term};
 use super::{dataflow, disassemble};
@@ -111,8 +111,12 @@ fn value(term: &Term, known: &Registers, temporaries: &Temporaries) -> Option<Rc
         }
         Term::Reg(register) => known.get(register).cloned(),
         Term::Temp(temporary) => temporaries.get(temporary).cloned(),
-        Term::Binary(BinaryOp::Add, left, right) => number_constant(number(left)? + number(right)?),
-        Term::Binary(BinaryOp::Mul, left, right) => number_constant(number(left)? * number(right)?),
+        Term::Binary(BinaryOperator::Addition, left, right) => {
+            number_constant(number(left)? + number(right)?)
+        }
+        Term::Binary(BinaryOperator::Multiplication, left, right) => {
+            number_constant(number(left)? * number(right)?)
+        }
         Term::Call {
             callee,
             this: None,
@@ -175,7 +179,7 @@ mod tests {
         }
     }
 
-    fn binary(op: BinaryOp, left: u8, right: u8) -> Term {
+    fn binary(op: BinaryOperator, left: u8, right: u8) -> Term {
         Term::Binary(op, Box::new(Term::Reg(left)), Box::new(Term::Reg(right)))
     }
 
@@ -215,9 +219,9 @@ mod tests {
                 Effect::Let(0, method(1, "charCodeAt", vec![Term::Reg(3)])),
                 Effect::Set(2, Term::Temp(0)),
             ],
-            vec![Effect::Set(6, binary(BinaryOp::Mul, 6, 5))],
-            vec![Effect::Set(6, binary(BinaryOp::Add, 6, 2))],
-            vec![Effect::Set(6, binary(BinaryOp::Add, 6, 4))],
+            vec![Effect::Set(6, binary(BinaryOperator::Multiplication, 6, 5))],
+            vec![Effect::Set(6, binary(BinaryOperator::Addition, 6, 2))],
+            vec![Effect::Set(6, binary(BinaryOperator::Addition, 6, 4))],
             vec![
                 Effect::Let(0, method(1, "slice", vec![Term::Reg(4), Term::Reg(6)])),
                 Effect::Set(1, Term::Temp(0)),

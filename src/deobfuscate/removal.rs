@@ -1,82 +1,113 @@
 //! Removes definitions after a rewrite has replaced all reads of their bindings.
 
-use swc_core::ecma::ast::{Expr, Id, Program, SeqExpr, Stmt};
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use oxc::allocator::Vec;
+use oxc::ast::ast::{Expression, Program, SequenceExpression, Statement, VariableDeclarator};
+use oxc::ast_visit::{VisitMut, walk_mut};
 
-use super::analysis::Bindings;
-use super::{HashMap, HashSet};
+use super::analysis::{Analysis, Id};
+use super::{HashMap, HashSet, ast};
 
-/// Returns bindings whose reads have all been replaced, using replacement counts for each
-/// binding.
-#[must_use]
-pub(super) fn unread(replaced: &HashMap<Id, usize>, bindings: &Bindings) -> HashSet<Id> {
+/// Returns the bindings whose replacement counts account for every value read.
+pub(super) fn unread(replaced: &HashMap<Id, usize>, analysis: &Analysis<'_>) -> HashSet<Id> {
     replaced
         .iter()
-        .filter(|(id, replaced)| **replaced == bindings.references(id))
-        .map(|(id, _)| id.clone())
+        .filter(|&(id, &count)| count == analysis.bindings.references(id))
+        .map(|(&id, _)| id)
         .collect()
 }
 
-/// Removes assignments to `unread` bindings when their values are discarded. Preserves the
-/// final value of a sequence.
-pub(super) fn remove_definitions(program: &mut Program, unread: &HashSet<Id>) -> bool {
-    let mut remove = RemoveDefinitions {
+/// Removes assignments to `unread` bindings where their values are discarded. The final operand
+/// of a sequence supplies its value and is kept.
+pub(super) fn remove_definitions<'a>(
+    program: &mut Program<'a>,
+    analysis: &Analysis<'a>,
+    unread: &HashSet<Id>,
+) -> bool {
+    let mut remove = Remove {
+        analysis,
         unread,
         changed: false,
     };
-    if !unread.is_empty() {
-        program.visit_mut_with(&mut remove);
-    }
+    remove.visit_program(program);
     remove.changed
 }
 
-struct RemoveDefinitions<'unread> {
-    unread: &'unread HashSet<Id>,
+struct Remove<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    unread: &'b HashSet<Id>,
     changed: bool,
 }
 
-impl RemoveDefinitions<'_> {
-    fn is_definition(&self, expression: &Expr) -> bool {
-        expression
-            .as_assign()
-            .and_then(|assignment| assignment.left.as_ident())
-            .is_some_and(|identifier| self.unread.contains(&identifier.to_id()))
+impl Remove<'_, '_> {
+    fn is_dead(&self, expression: &Expression<'_>) -> bool {
+        let Expression::AssignmentExpression(assignment) = expression.get_inner_expression() else {
+            return false;
+        };
+        let target = self.analysis.target_id(&assignment.left);
+        target.is_some_and(|id| self.unread.contains(&id))
     }
 }
 
-impl VisitMut for RemoveDefinitions<'_> {
-    fn visit_mut_seq_expr(&mut self, sequence: &mut SeqExpr) {
-        sequence.visit_mut_children_with(self);
-        // The last operand supplies the sequence's value.
-        if let Some(last) = sequence.exprs.pop() {
-            self.changed |= retain(&mut sequence.exprs, |expression| {
-                !self.is_definition(expression)
-            });
-            sequence.exprs.push(last);
+impl<'a> VisitMut<'a> for Remove<'_, 'a> {
+    fn visit_sequence_expression(&mut self, sequence: &mut SequenceExpression<'a>) {
+        walk_mut::walk_sequence_expression(self, sequence);
+        if let Some(last) = sequence.expressions.pop() {
+            let before = sequence.expressions.len();
+            sequence
+                .expressions
+                .retain(|expression| !self.is_dead(expression));
+            self.changed |= sequence.expressions.len() != before;
+            sequence.expressions.push(last)
         }
     }
 
-    fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
-        statements.visit_mut_children_with(self);
-        self.changed |= remove_expr_stmts(statements, |expression| self.is_definition(expression));
+    fn visit_statements(&mut self, statements: &mut Vec<'a, Statement<'a>>) {
+        walk_mut::walk_statements(self, statements);
+        let before = statements.len();
+        statements.retain(|statement| match statement {
+            Statement::ExpressionStatement(statement) => !self.is_dead(&statement.expression),
+            _ => true,
+        });
+        self.changed |= statements.len() != before;
     }
 }
 
-/// Retains items accepted by `keep` and returns whether any were removed.
-pub(super) fn retain<T>(items: &mut Vec<T>, keep: impl FnMut(&T) -> bool) -> bool {
-    let count = items.len();
-    items.retain(keep);
-    items.len() != count
+/// Drops the initializers of `unread` bindings' declarations. Callers ensure the initializers
+/// have no side effects.
+pub(super) fn remove_initializers(program: &mut Program<'_>, unread: &HashSet<Id>) {
+    struct Uninitialize<'b> {
+        unread: &'b HashSet<Id>,
+    }
+
+    impl<'a> VisitMut<'a> for Uninitialize<'_> {
+        fn visit_variable_declarator(&mut self, declarator: &mut VariableDeclarator<'a>) {
+            if ast::pattern_id(&declarator.id).is_some_and(|id| self.unread.contains(&id)) {
+                declarator.init = None;
+            }
+            walk_mut::walk_variable_declarator(self, declarator)
+        }
+    }
+
+    Uninitialize { unread }.visit_program(program)
 }
 
-/// Removes expression statements accepted by `dead` and returns whether any were removed.
-pub(super) fn remove_expr_stmts(
-    statements: &mut Vec<Stmt>,
-    mut dead: impl FnMut(&Expr) -> bool,
-) -> bool {
-    retain(statements, |statement| {
-        statement
-            .as_expr()
-            .is_none_or(|statement| !dead(&statement.expr))
-    })
+/// Removes the function declarations of `unread` bindings.
+pub(super) fn remove_function_declarations(program: &mut Program<'_>, unread: &HashSet<Id>) {
+    struct RemoveDeclarations<'b> {
+        unread: &'b HashSet<Id>,
+    }
+
+    impl<'a> VisitMut<'a> for RemoveDeclarations<'_> {
+        fn visit_statements(&mut self, statements: &mut Vec<'a, Statement<'a>>) {
+            walk_mut::walk_statements(self, statements);
+            statements.retain(|statement| match statement {
+                Statement::FunctionDeclaration(function) => {
+                    !ast::function_id(function).is_some_and(|id| self.unread.contains(&id))
+                }
+                _ => true,
+            })
+        }
+    }
+
+    RemoveDeclarations { unread }.visit_program(program)
 }

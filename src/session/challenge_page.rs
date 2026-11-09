@@ -127,13 +127,13 @@ pub(crate) async fn begin(
     challenge: ChallengePage,
     referrer_policy: ReferrerPolicy,
 ) -> Result<(OrchestratorSession, EmbeddingPage)> {
-    sink.artifact("page.html", challenge.html.as_bytes())?;
+    sink.save("page.html", challenge.html.as_bytes())?;
     let pacing = &page.orchestrator_pacing;
     let timer = Timer::start();
     let script =
         http::fetch_orchestrator(client, &challenge.orchestrator, &challenge.loading).await?;
     let script_fetch = timer.overall(challenge.orchestrator.as_str(), script.len() as u64);
-    sink.artifact("orchestrator.js", script.as_bytes())?;
+    sink.save("orchestrator.js", script.as_bytes())?;
     // The orchestrator's header shows the site's icon as it starts. Deobfuscation runs on its
     // own thread meanwhile.
     let icon_url = challenge.url.join("/favicon.ico")?;
@@ -149,7 +149,7 @@ pub(crate) async fn begin(
     ));
     let ((text, cases), icon) =
         tokio::try_join!(initial::deobfuscate(sink, javascript.clone()), icon)?;
-    sink.artifact("orchestrator.deobfuscated.js", text.as_bytes())?;
+    sink.save("orchestrator.deobfuscated.js", text.as_bytes())?;
     let source = Source::try_new(&text).context("parsing the deobfuscated orchestrator")?;
 
     let intervals = &pacing.intervals;
@@ -187,7 +187,7 @@ pub(crate) async fn begin(
         .context("the orchestrator's message table names no one language")?;
     let ray = first.program.request.ray()?;
     let rendered = embedding_page::challenge_page::render(&challenge, &loader, language, ray)?;
-    sink.artifact("rendered-page.html", rendered.as_bytes())?;
+    sink.save("rendered-page.html", rendered.as_bytes())?;
     let rendered = RenderedPage::render_explicit(
         &rendered,
         challenge.url.clone(),
@@ -308,7 +308,7 @@ impl OrchestratorSession {
             .as_ref()
             .unwrap_or(&self.challenge.url);
         let cleared = http::submit_form(client, referer, &form.action, &form.fields).await?;
-        sink.artifact("cleared.html", cleared.html.as_bytes())?;
+        sink.save("cleared.html", cleared.html.as_bytes())?;
         let challenged = ChallengePage::parse(&cleared.html, &cleared.url)?.is_some();
         let cookies = client.cookies(&cleared.url);
         let clearance = cookies

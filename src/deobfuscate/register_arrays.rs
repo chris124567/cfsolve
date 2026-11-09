@@ -8,7 +8,7 @@
 //! a = f(); g(r_0++); h();
 //! ```
 //!
-//! The array must be local to a function and assigned once from a literal without spreads.
+//! The array must be local to a function and initialized or assigned once from a literal without spreads.
 //! That assignment must discard its value. All other uses must access constant indices within
 //! bounds, without calling or deleting slots. Writes to unread slots keep only the assigned
 //! expression so its side effects still run.
@@ -18,42 +18,48 @@
 //! `void` element there keeps only its operand, so a constant hidden as `void (k ^ x ^ (k ^ x))`
 //! leaves the slot's later write as its local's only one, which copy propagation can inline.
 
-use swc_core::common::util::take::Take;
-use swc_core::common::{DUMMY_SP, Mark, SyntaxContext};
-use swc_core::ecma::ast::{
-    ArrayLit, ArrowExpr, AssignExpr, AssignOp, AssignTarget, BindingIdent, CallExpr, Callee,
-    Constructor, Expr, ExprStmt, ForStmt, Function, GetterProp, Id, Ident, MemberExpr, Pat,
-    Program, SeqExpr, SetterProp, SimpleAssignTarget, Stmt, TaggedTpl, UnaryExpr, UnaryOp,
-    VarDeclOrExpr, VarDeclarator,
+use std::mem;
+
+use oxc::allocator::{Box, CloneIn, GetAllocator, TakeIn, Vec as ArenaVec};
+use oxc::ast::ast::{
+    ArrayExpression, ArrowFunctionExpression, AssignmentExpression, AssignmentTarget,
+    BindingIdentifier, BindingPattern, CallExpression, Expression, ExpressionStatement,
+    ForStatement, Function, IdentifierReference, MemberExpression, Program, SimpleAssignmentTarget,
+    Statement, TaggedTemplateExpression, UnaryExpression, UpdateExpression, VariableDeclaration,
+    VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::ast::builder::AstBuilder;
+use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
+use oxc::span::{GetSpan, Span};
+use oxc::syntax::operator::{AssignmentOperator, UnaryOperator};
+use oxc::syntax::reference::ReferenceFlags;
+use oxc::syntax::scope::{ScopeFlags, ScopeId};
 
-use super::analysis::{Analysis, Globals, effects};
-use super::{HashMap, HashSet, removal};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::{HashMap, HashSet, ast};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let globals = analysis.globals;
-    let bindings = analysis.bindings(program);
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let root = analysis.scoping.root_scope_id();
     let mut uses = Uses {
-        globals,
+        analysis,
         created: HashMap::default(),
         slots: HashMap::default(),
-        declared: HashMap::default(),
-        function: 0,
-        functions: 0,
+        function: root,
         loops: 0,
+        discarded: false,
     };
-    program.visit_with(&mut uses);
+    uses.visit_program(program);
+    let mut slots = uses.slots;
     let mut arrays = HashMap::default();
     for (id, created) in uses.created {
-        let slots = uses.slots.remove(&id).unwrap_or_default();
-        let [creation] = &created[..] else {
+        let [creation] = created.as_slice() else {
             continue;
         };
-        if creation.function == 0
-            || uses.declared.get(&id) != Some(&creation.function)
-            || bindings.write_count(&id) != 1
+        let slots = slots.remove(&id).unwrap_or_default();
+        let bindings = &analysis.bindings;
+        if creation.function == root
+            || analysis.scope(id) != creation.function
+            || !bindings.is_written_once(&id)
             || bindings.is_parameter(&id)
             || slots.opaque
             || slots.accesses != bindings.references(&id)
@@ -61,414 +67,435 @@ pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
                 .read
                 .iter()
                 .chain(&slots.written)
-                .any(|&slot| slot >= creation.length)
+                .any(|&index| index >= creation.length)
         {
             continue;
         }
-        // Give each array a separate context so same-named arrays stay distinct until hygiene
-        // renames them.
-        let context = SyntaxContext::empty().apply_mark(Mark::new());
-        let locals: Vec<Option<Ident>> = (0..creation.length)
-            .map(|slot| {
-                let needed = slots.read.contains(&slot) || creation.defined.contains(&slot);
-                needed.then(|| Ident::new(format!("{}_{slot}", id.0).into(), DUMMY_SP, context))
+        let base = analysis.name(id).to_owned();
+        let span = analysis.span(id);
+        let locals = (0..creation.length).map(|index| {
+            let used = slots.read.contains(&index) || creation.defined.contains(&index);
+            used.then(|| {
+                analysis.fresh_binding(&format!("{base}_{index}"), creation.function, span)
             })
-            .collect();
-        arrays.insert(
-            id,
-            Array {
-                locals,
-                read: slots.read,
-                // Replacement locals already start undefined on each call.
-                assign_undefined: !creation.once,
-            },
-        );
+        });
+        let array = Array {
+            locals: locals.collect(),
+            read: slots.read,
+            reset: !creation.once,
+        };
+        arrays.insert(id, array);
     }
     if arrays.is_empty() {
         return false;
     }
-    program.visit_mut_with(&mut Split {
+    Split {
+        analysis,
         arrays: &arrays,
-        globals,
-    });
+    }
+    .visit_program(program);
     true
 }
 
-/// Checks whether an element is undefined with no side effects: a hole, a side-effect-free `void`
-/// expression, or global `undefined`.
-fn is_undefined(element: Option<&Expr>, globals: Globals) -> bool {
-    match element {
-        None => true,
-        // Constant arithmetic has no side effects, even when nested.
-        Some(Expr::Unary(unary)) => {
-            unary.op == UnaryOp::Void
-                && (ast::fold_number(&unary.arg, &|_| None).is_some()
-                    || !effects::may_have_effects(&unary.arg, globals))
-        }
-        Some(Expr::Ident(identifier)) => globals.is(identifier, "undefined"),
-        Some(_) => false,
+/// Recognizes a hole or an [`Analysis::is_undefined`] value.
+fn undefined(value: Option<&Expression<'_>>, analysis: &Analysis<'_>) -> bool {
+    value.is_none_or(|value| analysis.is_undefined(value))
+}
+
+/// Extracts `array[index]` with a constant non-negative integer index, rejecting optional access.
+fn slot(member: Option<&MemberExpression<'_>>, analysis: &Analysis<'_>) -> Option<(Id, usize)> {
+    let Some(MemberExpression::ComputedMemberExpression(member)) = member else {
+        return None;
+    };
+    if member.optional {
+        return None;
     }
+    Some((
+        analysis.expression_id(&member.object)?,
+        ast::index(&member.expression)?,
+    ))
 }
 
-fn undefined() -> Expr {
-    Expr::Unary(UnaryExpr {
-        span: DUMMY_SP,
-        op: UnaryOp::Void,
-        arg: 0.0.into(),
-    })
+fn void_zero<'a>(span: Span, builder: &AstBuilder<'a>) -> Expression<'a> {
+    let zero = ast::number_literal(span, 0.0, builder);
+    Expression::new_unary_expression(span, UnaryOperator::Void, zero, builder)
 }
 
-/// Extracts the array and constant index from `array[slot]`. Folds indices because the simplifier
-/// leaves them unchanged in optional chains.
-fn slot(member: &MemberExpr) -> Option<(Id, usize)> {
-    let index = &member.prop.as_computed()?.expr;
-    let slot = ast::array_index(ast::fold_number(index, &|_| None)?)?;
-    Some((member.obj.as_ident()?.to_id(), slot))
-}
-
+/// An array-literal creation and the context that executes it.
 struct Creation {
     length: usize,
-    /// Slots initialized to values other than undefined.
+    /// Slots initialized to values other than effect-free undefined.
     defined: HashSet<usize>,
-    function: usize,
-    /// Whether creation occurs outside loops and at most once per call of `function`.
+    function: ScopeId,
+    /// Creation runs outside loops and at most once per invocation of its declaring function.
     once: bool,
 }
 
 #[derive(Default)]
 struct Slots {
-    /// Number of constant-index accesses, for comparison with the total reference count.
+    /// Compared with the binding's reference count to detect other uses.
     accesses: usize,
-    /// Slots read, updated, or assigned with an operator other than `=`.
+    /// Slots read, updated, or assigned with an operator other than plain `=`.
     read: HashSet<usize>,
     written: HashSet<usize>,
-    /// Whether a slot is called or deleted. These operations depend on the array itself.
+    /// A slot is called, tagged, or deleted; these uses depend on the array itself.
     opaque: bool,
 }
 
-/// Collects array assignments whose values are discarded, slot accesses, and the function declaring
-/// each array binding.
-struct Uses {
-    globals: Globals,
+/// Collects discarded array assignments, declared initializers, and slot accesses.
+struct Uses<'b, 'a> {
+    analysis: &'b Analysis<'a>,
     created: HashMap<Id, Vec<Creation>>,
     slots: HashMap<Id, Slots>,
-    declared: HashMap<Id, usize>,
-    /// Current function number in traversal order; 0 denotes the script.
-    function: usize,
-    functions: usize,
+    function: ScopeId,
     loops: usize,
+    /// The visited expression's value is discarded.
+    discarded: bool,
 }
 
-impl Uses {
-    fn create(&mut self, id: Id, array: &ArrayLit) {
+impl<'a> Uses<'_, 'a> {
+    fn create(&mut self, id: Id, array: &ArrayExpression<'a>) {
+        if array.elements.iter().any(|element| element.is_spread()) {
+            return;
+        }
         let mut defined = HashSet::default();
-        for (slot, element) in array.elems.iter().enumerate() {
-            if element
-                .as_ref()
-                .is_some_and(|element| element.spread.is_some())
-            {
-                return;
-            }
-            if !is_undefined(element.as_ref().map(|element| &*element.expr), self.globals) {
-                defined.insert(slot);
+        for (index, element) in array.elements.iter().enumerate() {
+            if !undefined(element.as_expression(), self.analysis) {
+                defined.insert(index);
             }
         }
-        let creation = Creation {
-            length: array.elems.len(),
+        self.created.entry(id).or_default().push(Creation {
+            length: array.elements.len(),
             defined,
             function: self.function,
             once: self.loops == 0,
-        };
-        self.created.entry(id).or_default().push(creation);
+        });
     }
 
-    /// Records an array assignment whose value is discarded by a statement. Sequence expressions
-    /// handle their other operands separately.
-    fn statement(&mut self, expression: &Expr) {
-        let last = expression
-            .as_seq()
-            .and_then(|sequence| sequence.exprs.last());
-        self.discarded(last.map_or(expression, |last| &**last));
-    }
-
-    /// Records `binding = [...]`.
-    fn discarded(&mut self, expression: &Expr) {
-        if let Some((id, Expr::Array(array))) = ast::assignment(expression) {
-            self.create(id, array);
-        }
-    }
-
-    fn access(&mut self, member: &MemberExpr, read: bool) {
-        if let Some((id, slot)) = slot(member) {
+    fn access(&mut self, member: Option<&MemberExpression<'a>>, read: bool) {
+        if let Some((id, index)) = slot(member, self.analysis) {
             let slots = self.slots.entry(id).or_default();
             slots.accesses += 1;
             if read {
-                slots.read.insert(slot);
+                slots.read.insert(index);
             } else {
-                slots.written.insert(slot);
+                slots.written.insert(index);
             }
         }
     }
 
-    fn opaque(&mut self, expression: &Expr) {
-        if let Some(member) = expression.unwrap_parens().as_member()
-            && let Some((id, _)) = slot(member)
-        {
-            self.slots.entry(id).or_default().opaque = true;
+    fn opaque(&mut self, expression: &Expression<'a>) {
+        if let Some((id, _)) = slot(expression.as_member_expression(), self.analysis) {
+            self.slots.entry(id).or_default().opaque = true
         }
     }
 
-    fn in_function(&mut self, visit: impl FnOnce(&mut Self)) {
-        self.functions += 1;
-        let function = std::mem::replace(&mut self.function, self.functions);
-        let loops = std::mem::take(&mut self.loops);
-        visit(self);
-        self.function = function;
-        self.loops = loops;
+    fn expression(&mut self, expression: &Expression<'a>, discarded: bool) {
+        let outer = mem::replace(&mut self.discarded, discarded);
+        self.visit_expression(expression);
+        self.discarded = outer;
     }
 
-    fn in_loop(&mut self, visit: impl FnOnce(&mut Self)) {
+    /// Visits a function body with its own scope and outside the enclosing loops.
+    fn function(&mut self, scope: Option<ScopeId>, walk: impl FnOnce(&mut Self)) {
+        let scope = scope.expect("semantic analysis assigns function scopes");
+        let outer = mem::replace(&mut self.function, scope);
+        let loops = mem::take(&mut self.loops);
+        walk(self);
+        self.function = outer;
+        self.loops = loops;
+    }
+}
+
+impl<'a> Visit<'a> for Uses<'_, 'a> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        let discarded = mem::replace(&mut self.discarded, false);
+        if discarded
+            && let Some((id, Expression::ArrayExpression(array))) =
+                self.analysis.assignment(expression)
+        {
+            self.create(id, array)
+        }
+        self.access(expression.as_member_expression(), true);
+        if let Expression::SequenceExpression(sequence) = expression {
+            let length = sequence.expressions.len();
+            for (index, expression) in sequence.expressions.iter().enumerate() {
+                self.expression(expression, index + 1 < length || discarded)
+            }
+        } else {
+            walk::walk_expression(self, expression)
+        }
+        self.discarded = discarded;
+    }
+
+    fn visit_expression_statement(&mut self, statement: &ExpressionStatement<'a>) {
+        self.expression(&statement.expression, true)
+    }
+
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(id) = ast::pattern_id(&declarator.id)
+            && let Some(Expression::ArrayExpression(array)) = &declarator.init
+        {
+            self.create(id, array)
+        }
+        walk::walk_variable_declarator(self, declarator)
+    }
+
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        let Some(member) = assignment.left.as_member_expression() else {
+            return walk::walk_assignment_expression(self, assignment);
+        };
+        self.access(
+            Some(member),
+            assignment.operator != AssignmentOperator::Assign,
+        );
+        self.visit_expression(member.object());
+        if let MemberExpression::ComputedMemberExpression(computed) = member {
+            self.visit_expression(&computed.expression)
+        }
+        self.visit_expression(&assignment.right)
+    }
+
+    fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
+        self.access(update.argument.as_member_expression(), true);
+        walk::walk_update_expression(self, update)
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        self.opaque(&call.callee);
+        walk::walk_call_expression(self, call)
+    }
+
+    fn visit_tagged_template_expression(&mut self, template: &TaggedTemplateExpression<'a>) {
+        self.opaque(&template.tag);
+        walk::walk_tagged_template_expression(self, template)
+    }
+
+    fn visit_unary_expression(&mut self, unary: &UnaryExpression<'a>) {
+        if unary.operator == UnaryOperator::Delete {
+            self.opaque(&unary.argument)
+        }
+        walk::walk_unary_expression(self, unary)
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.function(function.scope_id.get(), |uses| {
+            walk::walk_function(uses, function, flags)
+        })
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.function(arrow.scope_id.get(), |uses| {
+            walk::walk_arrow_function_expression(uses, arrow)
+        })
+    }
+
+    fn visit_statement(&mut self, statement: &Statement<'a>) {
+        let is_loop = usize::from(matches!(
+            statement,
+            Statement::WhileStatement(_)
+                | Statement::DoWhileStatement(_)
+                | Statement::ForInStatement(_)
+                | Statement::ForOfStatement(_)
+        ));
+        self.loops += is_loop;
+        walk::walk_statement(self, statement);
+        self.loops -= is_loop;
+    }
+
+    /// The initializer runs once, unlike the rest of the loop.
+    fn visit_for_statement(&mut self, for_loop: &ForStatement<'a>) {
+        if let Some(init) = &for_loop.init {
+            match init.as_expression() {
+                Some(expression) => self.expression(expression, true),
+                None => self.visit_for_statement_init(init),
+            }
+        }
         self.loops += 1;
-        visit(self);
+        if let Some(test) = &for_loop.test {
+            self.visit_expression(test)
+        }
+        if let Some(update) = &for_loop.update {
+            self.visit_expression(update)
+        }
+        self.visit_statement(&for_loop.body);
         self.loops -= 1;
     }
 }
 
-impl Visit for Uses {
-    fn visit_expr_stmt(&mut self, statement: &ExprStmt) {
-        self.statement(&statement.expr);
-        statement.visit_children_with(self);
-    }
-
-    fn visit_seq_expr(&mut self, sequence: &SeqExpr) {
-        if let [discarded @ .., _] = &sequence.exprs[..] {
-            for expression in discarded {
-                self.discarded(expression);
-            }
-        }
-        sequence.visit_children_with(self);
-    }
-
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Some(name) = declarator.name.as_ident() {
-            self.declared.insert(name.to_id(), self.function);
-            if let Some(Expr::Array(array)) = declarator.init.as_deref() {
-                self.create(name.to_id(), array);
-            }
-        }
-        declarator.visit_children_with(self);
-    }
-
-    fn visit_expr(&mut self, expression: &Expr) {
-        if let Expr::Member(member) = expression {
-            self.access(member, /* read= */ true);
-        }
-        expression.visit_children_with(self);
-    }
-
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left {
-            self.access(member, assignment.op != AssignOp::Assign);
-        }
-        assignment.visit_children_with(self);
-    }
-
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee {
-            self.opaque(callee);
-        }
-        call.visit_children_with(self);
-    }
-
-    fn visit_tagged_tpl(&mut self, template: &TaggedTpl) {
-        self.opaque(&template.tag);
-        template.visit_children_with(self);
-    }
-
-    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
-        if unary.op == UnaryOp::Delete {
-            self.opaque(&unary.arg);
-        }
-        unary.visit_children_with(self);
-    }
-
-    fn visit_function(&mut self, function: &Function) {
-        self.in_function(|uses| function.visit_children_with(uses));
-    }
-
-    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        self.in_function(|uses| arrow.visit_children_with(uses));
-    }
-
-    fn visit_constructor(&mut self, constructor: &Constructor) {
-        self.in_function(|uses| constructor.visit_children_with(uses));
-    }
-
-    fn visit_getter_prop(&mut self, getter: &GetterProp) {
-        self.in_function(|uses| getter.visit_children_with(uses));
-    }
-
-    fn visit_setter_prop(&mut self, setter: &SetterProp) {
-        self.in_function(|uses| setter.visit_children_with(uses));
-    }
-
-    /// A loop initializer runs once before the loop and discards its value.
-    fn visit_for_stmt(&mut self, statement: &ForStmt) {
-        if let Some(VarDeclOrExpr::Expr(init)) = &statement.init {
-            self.statement(init);
-        }
-        statement.init.visit_with(self);
-        self.in_loop(|uses| {
-            statement.test.visit_with(uses);
-            statement.update.visit_with(uses);
-            statement.body.visit_with(uses);
-        });
-    }
-
-    fn visit_stmt(&mut self, statement: &Stmt) {
-        if matches!(
-            statement,
-            Stmt::ForIn(_) | Stmt::ForOf(_) | Stmt::While(_) | Stmt::DoWhile(_)
-        ) {
-            self.in_loop(|uses| statement.visit_children_with(uses));
-        } else {
-            statement.visit_children_with(self);
-        }
-    }
-}
-
-struct Array {
-    /// Replacement local for each slot that is read or initialized with a value.
-    locals: Vec<Option<Ident>>,
+/// A split array.
+struct Array<'a> {
+    /// Replacement binding for each slot that is read or initialized with a value.
+    locals: Vec<Option<BindingIdentifier<'a>>>,
     read: HashSet<usize>,
-    assign_undefined: bool,
+    /// Creation can repeat, so even undefined slots need explicit assignments.
+    reset: bool,
 }
 
-struct Split<'arrays> {
-    arrays: &'arrays HashMap<Id, Array>,
-    globals: Globals,
+struct Split<'b, 'a> {
+    analysis: &'b mut Analysis<'a>,
+    arrays: &'b HashMap<Id, Array<'a>>,
 }
 
-impl Split<'_> {
-    /// Builds assignments to replacement locals for an array initialization.
-    fn initial(&self, array: &Array, literal: &mut ArrayLit) -> Vec<(Ident, Box<Expr>)> {
-        let mut assignments = vec![];
-        for (local, element) in array.locals.iter().zip(&mut literal.elems) {
-            let element = element.take().map(|element| element.expr);
-            if let Some(local) = local
-                && (array.assign_undefined || !is_undefined(element.as_deref(), self.globals))
-            {
-                let value = element.unwrap_or_else(|| Box::new(undefined()));
-                assignments.push((local.clone(), value));
-            }
-        }
-        assignments
+impl<'b, 'a> Split<'b, 'a> {
+    /// Returns the replacement local of a split array's slot.
+    fn local(&self, member: Option<&MemberExpression<'a>>) -> Option<&'b BindingIdentifier<'a>> {
+        let (id, index) = slot(member, self.analysis)?;
+        self.arrays.get(&id)?.locals[index].as_ref()
     }
 
-    /// Replaces slot assignment targets in place. Returns a replacement expression for slot reads,
-    /// writes to unread slots, and array creation.
-    fn replacement(&self, expression: &mut Expr) -> Option<Expr> {
-        match expression {
-            Expr::Member(member) => {
-                let (id, slot) = slot(member)?;
-                let local = self.arrays.get(&id)?.locals.get(slot)?.clone()?;
-                Some(Expr::Ident(local))
-            }
-            Expr::Assign(assignment) => {
-                if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left {
-                    let (id, slot) = slot(member)?;
-                    let array = self.arrays.get(&id)?;
-                    return match &array.locals[slot] {
-                        Some(local) if array.read.contains(&slot) => {
-                            assignment.left = AssignTarget::Simple(SimpleAssignTarget::Ident(
-                                local.clone().into(),
-                            ));
-                            None
-                        }
-                        _ => Some(*assignment.right.take()),
-                    };
+    fn reference(
+        &mut self,
+        local: &BindingIdentifier<'a>,
+        span: Span,
+        flags: ReferenceFlags,
+    ) -> Box<'a, IdentifierReference<'a>> {
+        let reference = self.analysis.reference(local.symbol_id(), span, flags);
+        Box::new_in(reference, &self.analysis.ast)
+    }
+
+    /// Builds scalar assignments in the array literal's element order. Locals already start
+    /// undefined on each function call, so a once-only `void` element keeps just its operand;
+    /// creations inside loops must reset undefined slots on every iteration.
+    fn initial(
+        &mut self,
+        array: &Array<'a>,
+        literal: &ArrayExpression<'a>,
+    ) -> ArenaVec<'a, Expression<'a>> {
+        let allocator = self.analysis.allocator();
+        let span = literal.span;
+        let mut initial = ArenaVec::new_in(&self.analysis.ast);
+        for (index, element) in literal.elements.iter().enumerate() {
+            let value = element.as_expression();
+            if !array.reset {
+                if undefined(value, self.analysis) {
+                    continue;
                 }
-                // The array binding is assigned only when the array is created.
-                let array = self.arrays.get(&assignment.left.as_ident()?.to_id())?;
-                let Expr::Array(literal) = &mut *assignment.right else {
-                    return None;
-                };
-                let mut assignments: Vec<Box<Expr>> = self
-                    .initial(array, literal)
-                    .into_iter()
-                    .map(|(local, value)| match *value {
-                        // The local already starts undefined, so only the operand runs.
-                        Expr::Unary(UnaryExpr {
-                            op: UnaryOp::Void,
-                            arg,
-                            ..
-                        }) if !array.assign_undefined => arg,
-                        value => Box::new(Expr::Assign(AssignExpr {
-                            span: DUMMY_SP,
-                            op: AssignOp::Assign,
-                            left: AssignTarget::Simple(SimpleAssignTarget::Ident(local.into())),
-                            right: Box::new(value),
-                        })),
-                    })
-                    .collect();
-                Some(match assignments.len() {
-                    0 => undefined(),
-                    1 => *assignments.remove(0),
-                    _ => Expr::Seq(SeqExpr {
-                        span: assignment.span,
-                        exprs: assignments,
-                    }),
-                })
+                if let Some(Expression::UnaryExpression(unary)) = value
+                    && unary.operator == UnaryOperator::Void
+                {
+                    initial.push(unary.argument.clone_in_with_semantic_ids(allocator));
+                    continue;
+                }
             }
-            _ => None,
-        }
-    }
-}
-
-impl VisitMut for Split<'_> {
-    fn visit_mut_expr(&mut self, expression: &mut Expr) {
-        expression.visit_mut_children_with(self);
-        if let Some(replacement) = self.replacement(expression) {
-            *expression = replacement;
-        }
-    }
-
-    /// Removes `void 0` left by array creations that need no assignments.
-    fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
-        statements.visit_mut_children_with(self);
-        removal::remove_expr_stmts(statements, |expression| {
-            is_undefined(Some(expression), self.globals)
-        });
-    }
-
-    fn visit_mut_var_declarators(&mut self, declarators: &mut Vec<VarDeclarator>) {
-        declarators.visit_mut_children_with(self);
-        let mut split = Vec::with_capacity(declarators.len());
-        for mut declarator in declarators.drain(..) {
-            let Some(array) = declarator
-                .name
-                .as_ident()
-                .and_then(|name| self.arrays.get(&name.to_id()))
-            else {
-                split.push(declarator);
+            let value = match value {
+                Some(value) => value.clone_in_with_semantic_ids(allocator),
+                None => void_zero(span, &self.analysis.ast),
+            };
+            let Some(local) = &array.locals[index] else {
+                initial.push(value);
                 continue;
             };
-            let mut initial: HashMap<Id, Box<Expr>> = match declarator.init.as_deref_mut() {
-                Some(Expr::Array(literal)) => self
-                    .initial(array, literal)
-                    .into_iter()
-                    .map(|(local, value)| (local.to_id(), value))
-                    .collect(),
-                _ => HashMap::default(),
-            };
-            split.extend(array.locals.iter().flatten().map(|local| VarDeclarator {
-                span: declarator.span,
-                name: Pat::Ident(BindingIdent::from(local.clone())),
-                init: initial.remove(&local.to_id()),
-                definite: false,
-            }));
+            let reference = self.reference(local, span, ReferenceFlags::Write);
+            let target = AssignmentTarget::AssignmentTargetIdentifier(reference);
+            initial.push(Expression::new_assignment_expression(
+                span,
+                AssignmentOperator::Assign,
+                target,
+                value,
+                &self.analysis.ast,
+            ));
         }
-        *declarators = split;
+        initial
+    }
+}
+
+impl<'a> VisitMut<'a> for Split<'_, 'a> {
+    fn visit_assignment_target(&mut self, target: &mut AssignmentTarget<'a>) {
+        let Some(local) = self.local(target.as_member_expression()) else {
+            return walk_mut::walk_assignment_target(self, target);
+        };
+        let reference = self.reference(local, target.span(), ReferenceFlags::Write);
+        *target = AssignmentTarget::AssignmentTargetIdentifier(reference);
+    }
+
+    fn visit_simple_assignment_target(&mut self, target: &mut SimpleAssignmentTarget<'a>) {
+        let Some(local) = self.local(target.as_member_expression()) else {
+            return walk_mut::walk_simple_assignment_target(self, target);
+        };
+        let flags = ReferenceFlags::Read | ReferenceFlags::Write;
+        let reference = self.reference(local, target.span(), flags);
+        *target = SimpleAssignmentTarget::AssignmentTargetIdentifier(reference);
+    }
+
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        if let Expression::AssignmentExpression(assignment) = expression {
+            // A write to a slot that is never read keeps only its value.
+            if let Some((id, index)) = slot(assignment.left.as_member_expression(), self.analysis)
+                && let Some(array) = self.arrays.get(&id)
+                && !array.read.contains(&index)
+            {
+                let mut value = assignment.right.take_in(&self.analysis.ast);
+                self.visit_expression(&mut value);
+                *expression = value;
+                return;
+            }
+            if let Some(id) = self.analysis.target_id(&assignment.left)
+                && let Some(array) = self.arrays.get(&id)
+                && let Expression::ArrayExpression(literal) = &assignment.right
+            {
+                let mut initial = self.initial(array, literal);
+                *expression = if initial.len() > 1 {
+                    Expression::new_sequence_expression(assignment.span, initial, self.analysis)
+                } else {
+                    initial
+                        .pop()
+                        .unwrap_or_else(|| void_zero(assignment.span, &self.analysis.ast))
+                };
+                return;
+            }
+        }
+        walk_mut::walk_expression(self, expression);
+        if let Some(local) = self.local(expression.as_member_expression()) {
+            let reference = self.reference(local, expression.span(), ReferenceFlags::Read);
+            *expression = Expression::Identifier(reference);
+        }
+    }
+
+    fn visit_variable_declaration(&mut self, declaration: &mut VariableDeclaration<'a>) {
+        let allocator = self.analysis.allocator();
+        let mut declarators = ArenaVec::new_in(&self.analysis.ast);
+        for declarator in declaration.declarations.take_in(&self.analysis.ast) {
+            let array = ast::pattern_id(&declarator.id).and_then(|id| self.arrays.get(&id));
+            let Some(array) = array else {
+                declarators.push(declarator);
+                continue;
+            };
+            for (index, local) in array.locals.iter().enumerate() {
+                let Some(local) = local else { continue };
+                let init = match &declarator.init {
+                    Some(Expression::ArrayExpression(literal)) => literal.elements[index]
+                        .as_expression()
+                        .filter(|value| array.reset || !undefined(Some(value), self.analysis))
+                        .map(|value| value.clone_in_with_semantic_ids(allocator)),
+                    _ => None,
+                };
+                let local = Box::new_in(
+                    local.clone_in_with_semantic_ids(allocator),
+                    &self.analysis.ast,
+                );
+                let pattern = BindingPattern::BindingIdentifier(local);
+                declarators.push(VariableDeclarator::new(
+                    declarator.span,
+                    pattern,
+                    None,
+                    init,
+                    false,
+                    &self.analysis.ast,
+                ));
+            }
+        }
+        declaration.declarations = declarators;
+        walk_mut::walk_variable_declaration(self, declaration);
+    }
+
+    /// Drops the statements left by removed undefined writes.
+    fn visit_statements(&mut self, statements: &mut ArenaVec<'a, Statement<'a>>) {
+        walk_mut::walk_statements(self, statements);
+        statements.retain(|statement| {
+            !matches!(statement, Statement::ExpressionStatement(statement)
+                if undefined(Some(&statement.expression), self.analysis))
+        });
     }
 }
 
@@ -478,7 +505,7 @@ mod tests {
 
     #[test]
     fn splits_arrays_reached_only_through_constant_slots() {
-        let transform = |source: &str| testing::rewrite(source, super::run, /* fix= */ true);
+        let transform = |source: &str| testing::rewrite(source, super::run);
         let output = transform(
             "function f(x) {
                 var r, a, s = [1, void 0];
@@ -489,7 +516,6 @@ mod tests {
         );
         testing::assert_contains(
             &output,
-            &[],
             &[
                 "var r_0, a, s_0 = 1, s_1;",
                 "a = g(); g(r_0++, s_0, s_1); h();",
@@ -501,17 +527,17 @@ mod tests {
         let output = transform(
             "function f() { var r, i; for (r = [void 0], i = 0; i < 2; i++) { h(r[0]); r[0] = i; } }",
         );
-        testing::assert_contains(&output, &[], &["h(r_0);", "r_0 = i;"]);
+        testing::assert_contains(&output, &["h(r_0);", "r_0 = i;"]);
         testing::assert_lacks(&output, &["r_0 = void 0", "["]);
         // A `void` element runs its operand without writing the local.
         let output =
             transform("function f() { var r; r = [void (7 ^ k ^ (7 ^ k))]; r[0] = 1; g(r[0]); }");
-        testing::assert_contains(&output, &[], &["7 ^ k ^ (7 ^ k);", "r_0 = 1;", "g(r_0);"]);
+        testing::assert_contains(&output, &["7 ^ k ^ (7 ^ k);", "r_0 = 1;", "g(r_0);"]);
         testing::assert_lacks(&output, &["r_0 = void"]);
         // A creation in a loop resets the slots on every iteration.
         let output =
             transform("function f() { var r; while (g()) { r = [void 0]; h(r[0]); r[0] = 1; } }");
-        testing::assert_contains(&output, &[], &["r_0 = void 0;", "h(r_0);", "r_0 = 1;"]);
+        testing::assert_contains(&output, &["r_0 = void 0;", "h(r_0);", "r_0 = 1;"]);
         for kept in [
             "function f() { var r; r = [1]; g(r); }",
             "function f() { var r; r = [1]; r[0](); }",

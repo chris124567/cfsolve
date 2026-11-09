@@ -73,7 +73,7 @@ trait Copier<'ast>: Sized {
                         // The function captures no mutable state.
                         None => return value.clone(),
                         scope => Callable::Script {
-                            name: name.clone(),
+                            name: *name,
                             function,
                             scope,
                         },
@@ -176,7 +176,7 @@ impl<'ast> Copier<'ast> for Isolation<'_, '_, 'ast> {
         let variables = original
             .variables
             .iter()
-            .map(|(name, value)| (name.clone(), self.copy(value)))
+            .map(|(name, value)| (*name, self.copy(value)))
             .collect();
         *copied.borrow_mut() = Env { variables, outer };
         Some(copied)

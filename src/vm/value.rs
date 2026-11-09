@@ -4,13 +4,13 @@ use std::cell::RefCell;
 use std::mem;
 use std::rc::Rc;
 
-use swc_core::atoms::Atom;
-use swc_core::ecma::ast::{ArrowExpr, Function as ScriptFunction};
+use oxc::ast::ast::{ArrowFunctionExpression, Function as ScriptFunction};
 
 use super::interpret::Builtin;
 use super::output::{Constant, Term};
 use super::registers::Slots;
 use super::{HashMap, convert};
+use crate::js::ast::Binding;
 
 /// A value produced by a handler. Uses a word-sized discriminant so the whole value occupies
 /// two words.
@@ -48,10 +48,12 @@ pub(crate) enum Value<'ast> {
     Cell(u32),
 }
 
-/// Variables of a call or of setup. Functions capture scopes by reference, so later assignments
-/// are visible to every function sharing the scope.
+/// Variables of a call or of setup, by binding: each declared variable by its symbol, and a
+/// function's `arguments` or an undeclared variable a sloppy assignment creates by name. Functions
+/// capture scopes by reference, so later assignments are visible to every function sharing the
+/// scope.
 pub(crate) struct Env<'ast> {
-    pub variables: HashMap<Atom, Value<'ast>>,
+    pub variables: HashMap<Binding<'ast>, Value<'ast>>,
     pub outer: Option<Scope<'ast>>,
 }
 
@@ -59,34 +61,34 @@ pub(crate) type Scope<'ast> = Rc<RefCell<Env<'ast>>>;
 
 impl<'ast> Env<'ast> {
     pub(super) fn scope(
-        variables: HashMap<Atom, Value<'ast>>,
+        variables: HashMap<Binding<'ast>, Value<'ast>>,
         outer: Option<Scope<'ast>>,
     ) -> Scope<'ast> {
         Rc::new(RefCell::new(Self { variables, outer }))
     }
 
-    pub(super) fn find(scope: &RefCell<Self>, name: &Atom) -> Option<Value<'ast>> {
+    pub(super) fn find(scope: &RefCell<Self>, binding: Binding<'ast>) -> Option<Value<'ast>> {
         let scope = scope.borrow();
-        match scope.variables.get(name) {
+        match scope.variables.get(&binding) {
             Some(value) => Some(value.clone()),
-            None => Self::find(scope.outer.as_ref()?, name),
+            None => Self::find(scope.outer.as_ref()?, binding),
         }
     }
 
-    /// Assigns `name` in the nearest scope containing it. Returns `value` if no scope contains
-    /// the name.
+    /// Assigns `binding` in the nearest scope containing it. Returns `value` if no scope
+    /// contains the binding.
     pub(super) fn assign(
         scope: &RefCell<Self>,
-        name: &Atom,
+        binding: Binding<'ast>,
         value: Value<'ast>,
     ) -> Option<Value<'ast>> {
         let mut scope = scope.borrow_mut();
-        if let Some(slot) = scope.variables.get_mut(name) {
+        if let Some(slot) = scope.variables.get_mut(&binding) {
             *slot = value;
             return None;
         }
         match &scope.outer {
-            Some(outer) => Self::assign(outer, name, value),
+            Some(outer) => Self::assign(outer, binding, value),
             None => Some(value),
         }
     }
@@ -94,8 +96,9 @@ impl<'ast> Env<'ast> {
 
 pub(crate) enum Callable<'ast> {
     Script {
-        name: Option<Atom>,
-        function: &'ast ScriptFunction,
+        /// The name calls to the function are recorded under.
+        name: Option<&'ast str>,
+        function: &'ast ScriptFunction<'ast>,
         /// Scope captured at function creation. Functions declared beside the class use `None`
         /// and resolve through setup or session bindings.
         scope: Option<Scope<'ast>>,
@@ -103,7 +106,7 @@ pub(crate) enum Callable<'ast> {
     /// Arrow function with captured `this` and scope. A copied function uses `None` when its
     /// entire scope chain is empty.
     Arrow {
-        arrow: &'ast ArrowExpr,
+        arrow: &'ast ArrowFunctionExpression<'ast>,
         this: Value<'ast>,
         scope: Option<Scope<'ast>>,
     },
@@ -289,8 +292,8 @@ fn closure(callable: &Callable<'_>) -> Option<Term> {
             // Use the factory's variables; its `arguments` also contains the machine and layout.
             let scope = scope.borrow();
             let variables = &scope.variables;
-            let mut layouts = variables.iter().filter_map(|(name, value)| match value {
-                Value::Array(layout) if &**name != "arguments" => Some(layout),
+            let mut layouts = variables.iter().filter_map(|(binding, value)| match value {
+                Value::Array(layout) if *binding != Binding::Global("arguments") => Some(layout),
                 _ => None,
             });
             let machine = variables

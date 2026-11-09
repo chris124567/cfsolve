@@ -14,61 +14,68 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
-use swc_core::common::{BytePos, Mark, Span, Spanned, SyntaxContext};
-use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, AssignTarget, BinaryOp, BlockStmt, CallExpr, Callee, Class, ClassDecl,
-    ClassMember, Decl, Expr, FnDecl, FnExpr, Function, Id, Ident, MemberExpr, MemberProp, NewExpr,
-    ObjectLit, Pat, Program, Prop, ReturnStmt, SimpleAssignTarget, Stmt, SwitchCase, SwitchStmt,
-    ThrowStmt, TryStmt, UnaryOp, VarDeclarator,
+use oxc::ast::AstKind;
+use oxc::ast::ast::{
+    Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
+    BindingPattern, CallExpression, Class, ClassElement, Expression, FormalParameter, Function,
+    MemberExpression, MethodDefinition, MethodDefinitionKind, NewExpression, ObjectExpression,
+    ObjectProperty, ObjectPropertyKind, PropertyKind, Statement, SwitchCase, SwitchStatement,
+    ThrowStatement, TryStatement, VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::SymbolId;
+use oxc::span::{GetSpan, Span};
+use oxc::syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
+use oxc::syntax::scope::ScopeFlags;
+use serde::{Deserialize, Serialize};
 
+use super::syntax::{
+    assigned_member, is_optional_call, member, plain_parameter, walk_method, walk_property,
+};
 use crate::deobfuscate::{self, Deobfuscated};
 use crate::engine::{self, Engine, Lines, StackFrame, V8_STACK_LIMIT};
-use crate::js::ast;
+use crate::js::ast::{self, Binding, ParsedScript};
 use crate::{candidates, js};
 
 /// Maps VM dispatch cases to opcodes at their original source positions. Deobfuscation resolves
 /// case labels while preserving spans. Recovery uses the resolved labels to find each opcode's
 /// case in the original script.
-#[derive(Clone, Debug, Default)]
-pub struct CaseOpcodes(HashMap<(u32, u32), u8>);
-
-/// Returns a span's offset from the parse start, stable across parses of the same script.
-fn offsets(span: Span, start: BytePos) -> (u32, u32) {
-    (span.lo.0 - start.0, span.hi.0 - start.0)
+#[derive(Clone, Default)]
+pub struct CaseOpcodes {
+    opcodes: HashMap<Span, u8>,
+    /// The decoded program captured during deobfuscation, with the source it was decoded from,
+    /// shared so the cases stay cheap to clone.
+    decoded: Option<Arc<ParsedScript>>,
 }
 
 /// Deobfuscates `source` and maps its dispatch cases' original positions to their opcodes.
 pub fn deobfuscate_with_cases(source: String) -> Result<(Deobfuscated, CaseOpcodes)> {
-    struct Cases {
-        start: BytePos,
-        opcodes: CaseOpcodes,
-    }
-    impl Visit for Cases {
-        fn visit_switch_case(&mut self, case: &SwitchCase) {
+    // Spans are stable across parses of the same script.
+    struct Cases(HashMap<Span, u8>);
+    impl<'a> Visit<'a> for Cases {
+        fn visit_switch_case(&mut self, case: &SwitchCase<'a>) {
             if let Some(test) = &case.test
                 && let Some(opcode) = ast::index_literal(test)
                 && let Ok(opcode) = u8::try_from(opcode)
             {
-                self.opcodes
-                    .0
-                    .insert(offsets(case.span, self.start), opcode);
+                self.0.insert(case.span, opcode);
             }
-            case.visit_children_with(self);
+            walk::walk_switch_case(self, case);
         }
     }
-    deobfuscate::deobfuscate_with(source, |program, start| {
-        let mut cases = Cases {
-            start,
-            opcodes: CaseOpcodes::default(),
-        };
-        program.visit_with(&mut cases);
-        cases.opcodes
-    })
+    let (deobfuscated, opcodes, decoded) = deobfuscate::deobfuscate_capturing(source, |program| {
+        let mut cases = Cases(HashMap::new());
+        cases.visit_program(program);
+        Ok(cases.0)
+    })?;
+    let cases = CaseOpcodes {
+        opcodes,
+        decoded: Some(Arc::new(decoded)),
+    };
+    Ok((deobfuscated, cases))
 }
 
 /// Engine-specific function name and call position, measured from the script start in
@@ -246,71 +253,79 @@ pub struct DispatchSummary {
 
 /// Summarizes dispatch loops called by `run`, including whether each case resolves to a function.
 pub fn dispatch_summary(source: &str, cases: &CaseOpcodes) -> Result<Vec<DispatchSummary>> {
-    deobfuscate::read_decoded(source.to_owned(), |program, start| {
-        let machine = Machine::new(program, start, cases)?;
-        let script = &machine.script;
-        let mut summaries = Vec::new();
-        for dispatch_loop in &machine.loops {
-            let function = script.function(&dispatch_loop.name)?;
-            let scope = Scope::new(&dispatch_loop.name.0, function, &script.appliers);
-            let mut opcodes = 0;
-            let mut unresolved = Vec::new();
-            for case in cases_of(function) {
-                let Some(&opcode) = cases.0.get(&offsets(case.span, start)) else {
-                    continue;
-                };
-                opcodes += 1;
-                let resolved = scope.target(&case.call).is_ok_and(|target| {
-                    target
-                        .callee
-                        .is_some_and(|callee| script.function(&callee).is_ok())
-                });
-                if !resolved {
-                    unresolved.push(opcode);
-                }
-            }
-            let frames = dispatch_loop.call.frames(Name::same("run".to_owned()));
-            summaries.push(DispatchSummary {
-                function: dispatch_loop.name.0.to_string(),
-                guarded: dispatch_loop.guarded,
-                frames: frames.into_iter().map(|call| call.name.v8).collect(),
-                opcodes,
-                unresolved,
+    let decoded = deobfuscate::decode(source.to_owned())?;
+    let machine = Machine::new(decoded.script(), cases)?;
+    let script = &machine.script;
+    let mut summaries = Vec::new();
+    for dispatch_loop in &machine.loops {
+        let name = script.appliers.name(dispatch_loop.name);
+        let function = script.function(dispatch_loop.name)?;
+        let scope = Scope::new(name, &function, &script.appliers);
+        let mut opcodes = 0;
+        let mut unresolved = Vec::new();
+        for case in cases_of(script.js(), &function) {
+            let Some(&opcode) = cases.opcodes.get(&case.span) else {
+                continue;
+            };
+            opcodes += 1;
+            let resolved = scope.target(case.call).is_ok_and(|target| {
+                target
+                    .callee
+                    .is_some_and(|callee| script.function(callee).is_ok())
             });
+            if !resolved {
+                unresolved.push(opcode);
+            }
         }
-        Ok(summaries)
-    })
+        let frames = dispatch_loop.call.frames(Name::same("run".to_owned()));
+        summaries.push(DispatchSummary {
+            function: name.to_owned(),
+            guarded: dispatch_loop.guarded,
+            frames: frames.into_iter().map(|call| call.name.v8).collect(),
+            opcodes,
+            unresolved,
+        });
+    }
+    Ok(summaries)
 }
 
 /// Parses `source` and places the frames `recover` finds in it as each engine reports them.
 fn geometry(
     source: &str,
     cases: &CaseOpcodes,
-    mut recover: impl FnMut(&Machine<'_>) -> Result<Chain>,
+    recover: impl FnOnce(&Machine<'_, '_>) -> Result<Chain>,
 ) -> Result<Geometry> {
-    deobfuscate::read_decoded(source.to_owned(), |program, start| {
-        let Chain { frames, reflected } = recover(&Machine::new(program, start, cases)?)?;
-        let frame = |function: String, at: BytePos| -> Result<Frame> {
-            let offset = (at.0 - start.0) as usize;
-            let prefix = source.get(..offset).context("invalid source byte offset")?;
-            let (line, column) = engine::line_and_column(prefix, Lines::Script);
-            Ok(Frame {
-                function,
-                line,
-                column,
-            })
-        };
-        let mut geometry = Geometry {
-            frames: Vec::new(),
-            jsc_frames: Vec::new(),
-            reflected,
-        };
-        for Call { name, site } in frames {
-            geometry.frames.push(frame(name.v8, site.v8)?);
-            geometry.jsc_frames.push(frame(name.jsc, site.jsc)?);
+    // Reuse the decoded program `cases` captured if it comes from the same source.
+    let Chain { frames, reflected } = match &cases.decoded {
+        Some(decoded) if decoded.script().source == source => {
+            recover(&Machine::new(decoded.script(), cases)?)?
         }
-        Ok(geometry)
-    })
+        _ => recover(&Machine::new(
+            deobfuscate::decode(source.to_owned())?.script(),
+            cases,
+        )?)?,
+    };
+    let frame = |function: String, at: u32| -> Result<Frame> {
+        let prefix = source
+            .get(..at as usize)
+            .context("invalid source byte offset")?;
+        let (line, column) = engine::line_and_column(prefix, Lines::Script);
+        Ok(Frame {
+            function,
+            line,
+            column,
+        })
+    };
+    let mut geometry = Geometry {
+        frames: Vec::new(),
+        jsc_frames: Vec::new(),
+        reflected,
+    };
+    for Call { name, site } in frames {
+        geometry.frames.push(frame(name.v8, site.v8)?);
+        geometry.jsc_frames.push(frame(name.jsc, site.jsc)?);
+    }
+    Ok(geometry)
 }
 
 /// Calls recovered from the innermost frame outward.
@@ -344,15 +359,16 @@ impl Name {
     }
 }
 
-/// A call site's position for each engine: see [`call_position`] and [`arguments_position`].
+/// A call site's byte offset for each engine: see [`call_position`] and
+/// [`arguments_position`].
 #[derive(Clone, Copy, Debug)]
 struct Site {
-    v8: BytePos,
-    jsc: BytePos,
+    v8: u32,
+    jsc: u32,
 }
 
 impl Site {
-    fn new(call: &CallExpr) -> Self {
+    fn new(call: &CallExpression<'_>) -> Self {
         Self {
             v8: call_position(call),
             jsc: arguments_position(call),
@@ -366,45 +382,65 @@ struct Call {
     site: Site,
 }
 
-/// The VM dispatch method, its runner, and listeners that wrap the runner for each closure
-/// parameter count.
-struct Machine<'script> {
-    script: Script,
-    dispatch: DispatchMethod,
-    /// The dispatch loops `run` calls.
-    loops: Vec<DispatchLoop>,
-    cases: &'script CaseOpcodes,
-    start: BytePos,
-    runner: Call,
-    listeners: Vec<Invocation>,
+/// A function that call resolution identifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Callee<'a> {
+    /// A function or value held by a binding, or by a global.
+    Binding(Binding<'a>),
+    /// An original function extracted from a merged function, indexed into
+    /// [`Appliers::originals`].
+    Original(usize),
 }
 
-impl<'script> Machine<'script> {
-    fn new(program: &Program, start: BytePos, cases: &'script CaseOpcodes) -> Result<Self> {
-        let mut script = Script::new(program);
+impl Callee<'_> {
+    /// The parameter or local `symbol`.
+    fn symbol(symbol: SymbolId) -> Self {
+        Self::Binding(Binding::Symbol(symbol))
+    }
+}
+
+/// The VM dispatch method, its runner, and listeners that wrap the runner for each closure
+/// parameter count.
+struct Machine<'a, 'cases> {
+    script: Script<'a>,
+    dispatch: DispatchMethod<'a>,
+    /// The dispatch loops `run` calls.
+    loops: Vec<DispatchLoop<'a>>,
+    cases: &'cases CaseOpcodes,
+    runner: Call,
+    listeners: Vec<Invocation<'a>>,
+}
+
+impl<'a, 'cases> Machine<'a, 'cases> {
+    fn new(js: ast::Script<'a>, cases: &'cases CaseOpcodes) -> Result<Self> {
+        let mut script = Script::new(js);
         let classes = mem::take(&mut script.classes);
         // The runner passes the closure's program counter, key, and arguments to `run`,
         // copying arguments when required by the VM function.
         let mut runners = Vec::new();
         for (name, function) in &script.functions {
-            for call in calls_of(function) {
-                let calls_run = call
-                    .callee
-                    .as_expr()
-                    .and_then(|callee| callee.as_member())
-                    .is_some_and(|member| ast::member_str(&member.prop) == Some("run"));
-                if calls_run && call.args.len() == 3 && call.args[2].expr.is_cond() {
-                    runners.push((name, call));
+            for call in calls_of(js, function) {
+                let calls_run = member(&call.callee)
+                    .is_some_and(|member| ast::member_str(member) == Some("run"));
+                if calls_run
+                    && call.arguments.len() == 3
+                    && matches!(
+                        ast::argument_expression(&call.arguments[2]),
+                        Expression::ConditionalExpression(_)
+                    )
+                {
+                    runners.push((*name, call));
                 }
             }
         }
         let (runner, run_call) = candidates::exactly_one(runners, "closure-to-VM runner call")?;
+        let runner = Callee::Binding(runner);
         let mut listeners = Listeners {
             runner,
             appliers: &script.appliers,
             found: Vec::new(),
         };
-        program.visit_with(&mut listeners);
+        listeners.visit_program(js.program);
         let listeners: Vec<Invocation> = listeners.found.into_iter().collect::<Result<_>>()?;
         let dispatches = classes.into_iter().filter_map(|dispatch| {
             let loops = dispatch_loops(&script, &dispatch.run);
@@ -413,44 +449,44 @@ impl<'script> Machine<'script> {
         let (dispatch, loops) = candidates::exactly_one(dispatches, "VM dispatch method")?;
         Ok(Self {
             runner: Call {
-                name: Name::same(runner.0.to_string()),
-                site: Site::new(&run_call),
+                name: Name::same(script.appliers.name(runner).to_owned()),
+                site: Site::new(run_call),
             },
             listeners,
             dispatch,
             loops,
             script,
             cases,
-            start,
         })
     }
 
     /// Finds the handler for `opcode` in the dispatch loop with or without exception handling.
-    fn handler(&self, opcode: u8, guarded: bool) -> Result<Handler<'_>> {
+    fn handler(&self, opcode: u8, guarded: bool) -> Result<Handler<'a, '_>> {
+        let appliers = &self.script.appliers;
         for dispatch_loop in &self.loops {
             if dispatch_loop.guarded != guarded {
                 continue;
             }
-            let function = self.script.function(&dispatch_loop.name)?;
-            let Some(case) = cases_of(function)
+            let function = self.script.function(dispatch_loop.name)?;
+            let Some(case) = cases_of(self.script.js(), &function)
                 .into_iter()
-                .find(|case| self.cases.0.get(&offsets(case.span, self.start)) == Some(&opcode))
+                .find(|case| self.cases.opcodes.get(&case.span) == Some(&opcode))
             else {
                 continue;
             };
-            let scope = Scope::new(&dispatch_loop.name.0, function, &self.script.appliers);
-            let dispatch = scope.target(&case.call)?;
+            let scope = Scope::new(appliers.name(dispatch_loop.name), &function, appliers);
+            let dispatch = scope.target(case.call)?;
             let handler = dispatch
                 .callee
-                .clone()
                 .with_context(|| format!("opcode {opcode}'s dispatch calls no named handler"))?;
+            let name = appliers.name(handler);
             let frame = Name {
                 v8: if dispatch.method {
-                    format!("{}.{}", self.dispatch.class, handler.0)
+                    format!("{}.{name}", self.dispatch.class)
                 } else {
-                    handler.0.to_string()
+                    name.to_owned()
                 },
-                jsc: handler.0.to_string(),
+                jsc: name.to_owned(),
             };
             return Ok(Handler {
                 dispatch,
@@ -463,17 +499,14 @@ impl<'script> Machine<'script> {
     }
 
     /// Appends frames from the call to `handler` through the dispatch loop, `run`, and the runner.
-    fn entered(&self, handler: &Handler<'_>, mut frames: Vec<Call>) -> Vec<Call> {
+    fn entered(&self, handler: &Handler<'a, '_>, mut frames: Vec<Call>) -> Vec<Call> {
         let DispatchMethod { class, key, .. } = &self.dispatch;
         let dispatch_loop = handler.dispatch_loop;
-        frames.extend(
-            handler
-                .dispatch
-                .frames(Name::same(dispatch_loop.name.0.to_string())),
-        );
+        let name = self.script.appliers.name(dispatch_loop.name);
+        frames.extend(handler.dispatch.frames(Name::same(name.to_owned())));
         frames.extend(dispatch_loop.call.frames(Name {
             v8: format!("{class}.run"),
-            jsc: key.clone().unwrap_or_default(),
+            jsc: key.unwrap_or_default().to_owned(),
         }));
         frames.push(self.runner.clone());
         frames
@@ -484,21 +517,20 @@ impl<'script> Machine<'script> {
     /// arguments.
     fn construction(&self, opcode: u8, guarded: bool) -> Result<Chain> {
         let handler = self.handler(opcode, guarded)?;
-        let function = self.script.function(&handler.name)?;
-        let scope = Scope::new(&handler.name.0, function, &self.script.appliers);
+        let appliers = &self.script.appliers;
+        let function = self.script.function(handler.name)?;
+        let scope = Scope::new(appliers.name(handler.name), &function, appliers);
         let mut found = Vec::new();
-        for call in calls_of(function) {
-            let target = scope.target(&call)?;
+        for call in calls_of(self.script.js(), &function) {
+            let target = scope.target(call)?;
             // Find `Reflect.construct` in a binding or array slot, called directly or through a
             // helper.
             let named = target
                 .callee
-                .as_ref()
-                .is_some_and(|callee| self.script.constructs.contains(callee));
+                .is_some_and(|callee| self.script.constructs.contains(&callee));
             let slotted = target
                 .slot
-                .as_ref()
-                .is_some_and(|slot| self.script.construct_slots.contains(slot));
+                .is_some_and(|slot| self.script.construct_slots.contains(&slot));
             if named || slotted {
                 found.push(target.frames(handler.frame.clone()));
             }
@@ -507,23 +539,26 @@ impl<'script> Machine<'script> {
         if !reflected {
             #[derive(Default)]
             struct News(Vec<Site>);
-            impl Visit for News {
-                fn visit_function(&mut self, _: &Function) {}
-                fn visit_class(&mut self, _: &Class) {}
+            impl<'a> Visit<'a> for News {
+                fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+                fn visit_class(&mut self, _: &Class<'a>) {}
+                fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+                    walk_property(self, property);
+                }
                 // Ignore guard exceptions; they do not produce the handler's constructed value.
-                fn visit_throw_stmt(&mut self, _: &ThrowStmt) {}
-                fn visit_new_expr(&mut self, construction: &NewExpr) {
-                    if construction.args.as_ref().is_none_or(Vec::is_empty) {
+                fn visit_throw_statement(&mut self, _: &ThrowStatement<'a>) {}
+                fn visit_new_expression(&mut self, construction: &NewExpression<'a>) {
+                    if construction.arguments.is_empty() {
                         self.0.push(Site {
-                            v8: construction.span.lo,
-                            jsc: construction.callee.span().hi,
+                            v8: construction.span.start,
+                            jsc: construction.callee.span().end,
                         });
                     }
-                    construction.visit_children_with(self);
+                    walk::walk_new_expression(self, construction);
                 }
             }
             let mut news = News::default();
-            function.body.visit_with(&mut news);
+            function.visit(&mut news);
             for site in news.0 {
                 found.push(vec![Call {
                     name: handler.frame.clone(),
@@ -537,7 +572,7 @@ impl<'script> Machine<'script> {
         let Some(frames) = found.pop() else {
             bail!(
                 "missing original function {} with the needed shape",
-                handler.name.0
+                appliers.name(handler.name)
             );
         };
         Ok(Chain {
@@ -550,13 +585,14 @@ impl<'script> Machine<'script> {
     /// passes the method, receiver, and `passed` arguments to a native apply forwarder.
     fn method_call(&self, opcode: u8, passed: usize, guarded: bool) -> Result<Vec<Call>> {
         let handler = self.handler(opcode, guarded)?;
-        let function = self.script.function(&handler.name)?;
-        let scope = Scope::new(&handler.name.0, function, &self.script.appliers);
+        let appliers = &self.script.appliers;
+        let function = self.script.function(handler.name)?;
+        let scope = Scope::new(appliers.name(handler.name), &function, appliers);
         let mut calls = Vec::new();
-        for call in calls_of(function) {
-            let target = scope.target(&call)?;
+        for call in calls_of(self.script.js(), &function) {
+            let target = scope.target(call)?;
             if target.passed == Some(passed + 2)
-                && let Some(callee) = &target.callee
+                && let Some(callee) = target.callee
                 && let Some(inner) = self.script.method_forwarder(callee)
             {
                 calls.push((inner, target));
@@ -575,10 +611,7 @@ impl<'script> Machine<'script> {
             .iter()
             .filter(|target| target.passed == Some(arity))
             .collect();
-        let sites: Vec<u32> = listeners
-            .iter()
-            .map(|target| target.site.v8.0 - self.start.0)
-            .collect();
+        let sites: Vec<u32> = listeners.iter().map(|target| target.site.v8).collect();
         let listener = candidates::exactly_one(listeners, "listener of the closure's arity")
             .with_context(|| {
                 format!("no one listener for a closure of {arity} arguments, at {sites:?}")
@@ -588,19 +621,19 @@ impl<'script> Machine<'script> {
 }
 
 /// The function `run` calls for an opcode.
-struct Handler<'machine> {
+struct Handler<'a, 'machine> {
     /// Call from the dispatch loop to this handler.
-    dispatch: Invocation,
-    name: Id,
+    dispatch: Invocation<'a>,
+    name: Callee<'a>,
     frame: Name,
-    dispatch_loop: &'machine DispatchLoop,
+    dispatch_loop: &'machine DispatchLoop<'a>,
 }
 
 /// Function called by `run` with the machine to dispatch opcodes.
-struct DispatchLoop {
-    name: Id,
+struct DispatchLoop<'a> {
+    name: Callee<'a>,
     /// Call from `run`, either direct or through a helper.
-    call: Invocation,
+    call: Invocation<'a>,
     /// Whether the call occurs in a `try` block that handles exceptions.
     guarded: bool,
 }
@@ -610,42 +643,61 @@ struct DispatchLoop {
 const DISPATCH_CASES: usize = 40;
 
 /// Finds functions with dispatch switches that `run` calls with the machine.
-fn dispatch_loops(script: &Script, run: &Function) -> Vec<DispatchLoop> {
-    #[derive(Default)]
-    struct Calls {
-        found: Vec<(CallExpr, bool)>,
+fn dispatch_loops<'a>(script: &Script<'a>, run: &Body<'a>) -> Vec<DispatchLoop<'a>> {
+    struct Calls<'a> {
+        js: ast::Script<'a>,
+        found: Vec<(&'a CallExpression<'a>, bool)>,
         guarded: bool,
     }
-    impl Visit for Calls {
-        fn visit_function(&mut self, _: &Function) {}
-        fn visit_class(&mut self, _: &Class) {}
+    impl<'a> Visit<'a> for Calls<'a> {
+        fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+        fn visit_class(&mut self, _: &Class<'a>) {}
+        fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+            walk_property(self, property);
+        }
         // Only a `try` with a `catch` handles exceptions.
-        fn visit_try_stmt(&mut self, statement: &TryStmt) {
+        fn visit_try_statement(&mut self, statement: &TryStatement<'a>) {
             let outer = self.guarded;
             self.guarded |= statement.handler.is_some();
-            statement.block.visit_with(self);
+            self.visit_block_statement(&statement.block);
             self.guarded = outer;
-            statement.handler.visit_with(self);
-            statement.finalizer.visit_with(self);
-        }
-        fn visit_call_expr(&mut self, call: &CallExpr) {
-            if call.args.iter().any(|argument| argument.expr.is_this()) {
-                self.found.push((call.clone(), self.guarded));
+            if let Some(handler) = &statement.handler {
+                self.visit_catch_clause(handler);
             }
-            call.visit_children_with(self);
+            if let Some(finalizer) = &statement.finalizer {
+                self.visit_block_statement(finalizer);
+            }
+        }
+        fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+            if !is_optional_call(call)
+                && call.arguments.iter().any(|argument| {
+                    matches!(
+                        ast::argument_expression(argument),
+                        Expression::ThisExpression(_)
+                    )
+                })
+            {
+                let call = self.js.lend(call, AstKind::as_call_expression);
+                self.found.push((call, self.guarded));
+            }
+            walk::walk_call_expression(self, call);
         }
     }
-    let mut calls = Calls::default();
-    run.body.visit_with(&mut calls);
+    let mut calls = Calls {
+        js: script.js(),
+        found: Vec::new(),
+        guarded: false,
+    };
+    run.visit(&mut calls);
     let scope = Scope::new("", run, &script.appliers);
     calls
         .found
         .into_iter()
         .filter_map(|(call, guarded)| {
-            let call = scope.target(&call).ok()?;
-            let name = call.callee.clone()?;
-            let function = script.function(&name).ok()?;
-            (cases_of(function).len() > DISPATCH_CASES).then_some(DispatchLoop {
+            let call = scope.target(call).ok()?;
+            let name = call.callee?;
+            let function = script.function(name).ok()?;
+            (cases_of(script.js(), &function).len() > DISPATCH_CASES).then_some(DispatchLoop {
                 name,
                 call,
                 guarded,
@@ -654,148 +706,270 @@ fn dispatch_loops(script: &Script, run: &Function) -> Vec<DispatchLoop> {
         .collect()
 }
 
-/// The script's declared and assigned functions, VM dispatch methods, and aliases for
-/// `Reflect.construct` and `Reflect.apply`.
-struct Script {
-    functions: Vec<(Id, Function)>,
-    /// Original functions extracted from merged functions, each using the merged function name. See
-    /// [`Merged`].
-    originals: Vec<(Id, Function)>,
-    classes: Vec<DispatchMethod>,
-    constructs: Vec<Id>,
-    /// Array slots containing `Reflect.construct`, indexed by array and slot.
-    construct_slots: Vec<(Id, usize)>,
-    applies: Vec<Id>,
-    /// Array slots containing `Reflect.apply`, indexed by array and slot.
-    apply_slots: Vec<(Id, usize)>,
-    appliers: Appliers,
+/// A function's parameters and statements. An original function extracted from a merged
+/// function has the merged function's parameters after the selector and its case's statements.
+#[derive(Clone, Copy)]
+struct Body<'a> {
+    parameters: &'a [FormalParameter<'a>],
+    /// Whether a rest parameter follows `parameters`.
+    rest: bool,
+    /// Whether the body starts with a directive prologue, which no statement pattern accepts.
+    prologue: bool,
+    /// The statements, in two parts so that an original function can join its case block to the
+    /// statements after it.
+    head: &'a [Statement<'a>],
+    tail: &'a [Statement<'a>],
 }
 
-/// Call helpers indexed by name, including selector-based helpers, merged functions, and
+impl<'a> Body<'a> {
+    fn of(function: &'a Function<'a>) -> Self {
+        let (prologue, head) = match &function.body {
+            Some(body) => (!body.directives.is_empty(), &body.statements[..]),
+            None => (false, &[][..]),
+        };
+        Self {
+            parameters: &function.params.items,
+            rest: function.params.rest.is_some(),
+            prologue,
+            head,
+            tail: &[],
+        }
+    }
+
+    fn statements(&self) -> impl DoubleEndedIterator<Item = &'a Statement<'a>> + Clone + use<'a> {
+        self.head.iter().chain(self.tail)
+    }
+
+    /// The statements of a body without a directive prologue.
+    fn plain_statements(
+        &self,
+    ) -> Option<impl DoubleEndedIterator<Item = &'a Statement<'a>> + Clone + use<'a>> {
+        (!self.prologue).then(|| self.statements())
+    }
+
+    /// The only statement after leading local declarations without initializers.
+    fn only_statement(&self) -> Option<&'a Statement<'a>> {
+        let mut rest = self.plain_statements()?.skip_while(|statement| {
+            matches!(statement, Statement::VariableDeclaration(declaration)
+                if !declaration.kind.is_using()
+                    && declaration.declarations.iter().all(|declarator| declarator.init.is_none()))
+        });
+        let only = rest.next()?;
+        rest.next().is_none().then_some(only)
+    }
+
+    /// The bindings of the parameters, if they are all plain names.
+    fn parameters(&self) -> Option<Vec<SymbolId>> {
+        if self.rest {
+            return None;
+        }
+        self.parameters.iter().map(plain_parameter).collect()
+    }
+
+    fn visit(&self, visitor: &mut impl Visit<'a>) {
+        for statement in self.statements() {
+            visitor.visit_statement(statement);
+        }
+    }
+}
+
+/// The script's declared and assigned functions, VM dispatch methods, and aliases for
+/// `Reflect.construct` and `Reflect.apply`.
+struct Script<'a> {
+    functions: Vec<(Binding<'a>, Body<'a>)>,
+    classes: Vec<DispatchMethod<'a>>,
+    constructs: Vec<Callee<'a>>,
+    /// Array slots containing `Reflect.construct`, indexed by array and slot.
+    construct_slots: Vec<(Binding<'a>, usize)>,
+    applies: Vec<Callee<'a>>,
+    /// Array slots containing `Reflect.apply`, indexed by array and slot.
+    apply_slots: Vec<(Binding<'a>, usize)>,
+    appliers: Appliers<'a>,
+}
+
+/// An original function extracted from a merged function. See [`merged`].
+struct Original<'a> {
+    /// The merged function's name, which frames of the original use.
+    name: &'a str,
+    body: Body<'a>,
+}
+
+/// Call helpers indexed by callee, including selector-based helpers, merged functions, and
 /// forwarders. Also records numeric constants used by selectors.
-struct Appliers {
-    helpers: HashMap<Id, Applier>,
-    merged: HashMap<Id, Merged>,
-    forwarders: Forwarders,
-    /// Bindings assigned a numeric value once, such as a shared case-label mask.
-    constants: HashMap<Id, f64>,
+struct Appliers<'a> {
+    helpers: HashMap<Callee<'a>, Selection<Site>>,
+    /// Merged functions, selecting originals indexed into `originals`.
+    merged: HashMap<Binding<'a>, Selection<usize>>,
+    /// Original functions extracted from merged functions.
+    originals: Vec<Original<'a>>,
+    forwarders: Forwarders<'a>,
+    constants: Constants<'a>,
+}
+
+/// Bindings assigned a numeric value once, such as a shared case-label mask, and the script
+/// that binds them.
+struct Constants<'a> {
+    js: ast::Script<'a>,
+    values: HashMap<SymbolId, f64>,
+}
+
+impl<'a> Constants<'a> {
+    fn new(js: ast::Script<'a>) -> Self {
+        let mut values = HashMap::new();
+        let mut assigned = HashSet::new();
+        for node in js.nodes.iter() {
+            match node.kind() {
+                AstKind::VariableDeclarator(declarator) => {
+                    if let BindingPattern::BindingIdentifier(name) = &declarator.id
+                        && let Some(value) = declarator
+                            .init
+                            .as_ref()
+                            .and_then(|init| ast::fold_number(init, &|_| None))
+                    {
+                        values.insert(name.symbol_id(), value);
+                    }
+                }
+                AstKind::AssignmentExpression(assignment) => {
+                    if let AssignmentTarget::AssignmentTargetIdentifier(name) = &assignment.left
+                        && let Some(symbol) = js.symbol(name)
+                    {
+                        assigned.insert(symbol);
+                    }
+                }
+                _ => {}
+            }
+        }
+        values.retain(|symbol, _| !assigned.contains(symbol));
+        Self { js, values }
+    }
+
+    /// The function or value `expression` names.
+    fn binding(&self, expression: &Expression<'a>) -> Option<Binding<'a>> {
+        match expression.without_parentheses() {
+            Expression::Identifier(reference) => Some(self.js.binding(reference)),
+            _ => None,
+        }
+    }
 }
 
 /// Functions that call their first parameter with the remaining parameters, as recorded by
 /// [`Scope`].
 #[derive(Default)]
-struct Forwarders {
+struct Forwarders<'a> {
     /// Forwarders indexed by the binding holding their object and their property key.
-    on_objects: HashMap<(Holder, String), Forwarder>,
+    on_objects: HashMap<(Holder<'a>, &'a str), Forwarder>,
     /// Forwarders copied to bindings, as in `f = object.key`, with the frames produced when called
     /// through those bindings.
-    held: HashMap<Holder, Vec<Call>>,
+    held: HashMap<Holder<'a>, Vec<Call>>,
 }
 
-impl Forwarders {
+impl<'a> Forwarders<'a> {
     /// Keeps only forwarders whose object bindings are assigned once, so their values are known.
-    fn retain_assigned_once(&mut self, assigned: &HashMap<Holder, usize>) {
+    fn retain_assigned_once(&mut self, assigned: &HashMap<Holder<'a>, usize>) {
         let once = |holder: &Holder| assigned.get(holder).is_none_or(|&count| count == 1);
         self.on_objects.retain(|(holder, _), _| once(holder));
         self.held.retain(|holder, _| once(holder));
     }
 }
 
-impl Appliers {
-    /// Also returns original functions extracted from merged functions, using names described by
-    /// [`Merged`].
-    fn new(program: &Program, functions: &[(Id, Function)]) -> (Self, Vec<(Id, Function)>) {
-        #[derive(Default)]
-        struct Constants {
-            values: HashMap<Id, f64>,
-            assigned: HashSet<Id>,
-        }
-        impl Visit for Constants {
-            fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-                if let Pat::Ident(name) = &declarator.name
-                    && let Some(value) = declarator
-                        .init
-                        .as_deref()
-                        .and_then(|init| ast::fold_number(init, &|_| None))
-                {
-                    self.values.insert(name.to_id(), value);
-                }
-                declarator.visit_children_with(self);
-            }
-            fn visit_assign_expr(&mut self, assign: &AssignExpr) {
-                if let Some(name) = assign.left.as_ident() {
-                    self.assigned.insert(name.to_id());
-                }
-                assign.visit_children_with(self);
-            }
-        }
-        let mut constants = Constants::default();
-        program.visit_with(&mut constants);
-        constants
-            .values
-            .retain(|name, _| !constants.assigned.contains(name));
-        let values = constants.values;
-        let applier = |(name, function): &(Id, Function)| {
-            Some((name.clone(), Applier::new(function, &values)?))
-        };
-        let mut helpers: HashMap<Id, Applier> = functions.iter().filter_map(applier).collect();
-        let mut merged = HashMap::new();
+impl<'a> Appliers<'a> {
+    fn new(js: ast::Script<'a>, functions: &[(Binding<'a>, Body<'a>)]) -> Self {
+        let constants = Constants::new(js);
+        let mut helpers: HashMap<Callee<'a>, Selection<Site>> = functions
+            .iter()
+            .filter_map(|(name, function)| {
+                Some((Callee::Binding(*name), applier(function, &constants)?))
+            })
+            .collect();
+        let mut merged_functions = HashMap::new();
         let mut originals = Vec::new();
         for (name, function) in functions {
-            if !helpers.contains_key(name)
-                && let Some((selection, held)) = Merged::new(name, function, &values)
+            if !helpers.contains_key(&Callee::Binding(*name))
+                && let Some(Selection { mask, cases }) = merged(function, &constants)
             {
-                merged.insert(name.clone(), selection);
-                originals.extend(held);
+                let mut indexed = Vec::new();
+                for (label, body) in cases {
+                    indexed.push((label, originals.len()));
+                    originals.push(Original {
+                        name: js.name(*name),
+                        body,
+                    });
+                }
+                merged_functions.insert(
+                    *name,
+                    Selection {
+                        mask,
+                        cases: indexed,
+                    },
+                );
             }
         }
         // A merged function may hold call helpers.
-        helpers.extend(originals.iter().filter_map(applier));
+        for (index, original) in originals.iter().enumerate() {
+            if let Some(helper) = applier(&original.body, &constants) {
+                helpers.insert(Callee::Original(index), helper);
+            }
+        }
         let mut appliers = Self {
             helpers,
-            merged,
+            merged: merged_functions,
+            originals,
             forwarders: Forwarders::default(),
-            constants: values,
+            constants,
         };
-        appliers.forwarders = forwarders(program, &appliers);
-        (appliers, originals)
+        appliers.forwarders = forwarders(&appliers);
+        appliers
     }
 
-    /// Evaluates `expression` using numeric literals and known constants.
-    fn number(&self, expression: &Expr) -> Option<f64> {
-        number(expression, &self.constants)
+    fn js(&self) -> ast::Script<'a> {
+        self.constants.js
+    }
+
+    /// The name of `callee` in the source. An original function has its merged function's name.
+    fn name(&self, callee: Callee<'a>) -> &'a str {
+        match callee {
+            Callee::Binding(binding) => self.js().name(binding),
+            Callee::Original(index) => self.originals[index].name,
+        }
+    }
+
+    /// Evaluates `operand` using numeric literals and known constants.
+    fn number(&self, operand: Operand<'a>) -> Option<f64> {
+        match operand {
+            Operand::Expression(expression) => number(expression, &self.constants),
+            Operand::Resolved(Callee::Binding(Binding::Symbol(symbol))) => {
+                self.constants.values.get(&symbol).copied()
+            }
+            Operand::Resolved(_) => None,
+        }
     }
 }
 
 /// Collects forwarders from each function via [`Scope`]. Keeps only those whose object bindings are
 /// assigned once.
-fn forwarders(program: &Program, appliers: &Appliers) -> Forwarders {
-    struct Collect<'script> {
-        appliers: &'script Appliers,
-        found: Forwarders,
-        assigned: HashMap<Holder, usize>,
+fn forwarders<'a>(appliers: &Appliers<'a>) -> Forwarders<'a> {
+    struct Collect<'a, 's> {
+        appliers: &'s Appliers<'a>,
+        found: Forwarders<'a>,
+        assigned: HashMap<Holder<'a>, usize>,
     }
-    impl Collect<'_> {
-        fn scope(&mut self, name: &str, function: &Function) {
-            let scope = Scope::new(name, function, self.appliers);
+    impl<'a> Visit<'a> for Collect<'a, '_> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            let function = self.appliers.js().lend(function, AstKind::as_function);
+            let name = function.id.as_ref().map_or("", |name| name.name.as_str());
+            let scope = Scope::new(name, &Body::of(function), self.appliers);
             self.found.on_objects.extend(scope.forwarders.on_objects);
             self.found.held.extend(scope.forwarders.held);
             for (holder, count) in scope.assigned {
                 *self.assigned.entry(holder).or_default() += count;
             }
-            function.visit_children_with(self);
+            walk::walk_function(self, function, flags);
         }
-    }
-    impl Visit for Collect<'_> {
-        fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-            self.scope(&declaration.ident.sym, &declaration.function);
+        fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+            walk_property(self, property);
         }
-        fn visit_fn_expr(&mut self, expression: &FnExpr) {
-            let name = expression.ident.as_ref().map_or("", |name| &*name.sym);
-            self.scope(name, &expression.function);
-        }
-        fn visit_function(&mut self, function: &Function) {
-            self.scope("", function);
+        fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+            walk_method(self, method);
         }
     }
     let mut collect = Collect {
@@ -803,35 +977,42 @@ fn forwarders(program: &Program, appliers: &Appliers) -> Forwarders {
         found: Forwarders::default(),
         assigned: HashMap::new(),
     };
-    program.visit_with(&mut collect);
+    collect.visit_program(appliers.js().program);
     collect.found.retain_assigned_once(&collect.assigned);
     collect.found
 }
 
 /// Evaluates `expression` using literals and `constants`.
-fn number(expression: &Expr, constants: &HashMap<Id, f64>) -> Option<f64> {
-    ast::fold_number(expression, &|leaf| {
-        constants.get(&leaf.as_ident()?.to_id()).copied()
+fn number<'a>(expression: &Expression<'a>, constants: &Constants<'a>) -> Option<f64> {
+    ast::fold_number(expression, &|leaf| match leaf {
+        Expression::Identifier(reference) => constants
+            .values
+            .get(&constants.js.symbol(reference)?)
+            .copied(),
+        _ => None,
     })
 }
 
 /// Finds the VM class method `run` that calls the dispatch loops.
-struct DispatchMethod {
-    class: String,
-    run: Function,
+struct DispatchMethod<'a> {
+    class: &'a str,
+    run: Body<'a>,
     /// The method's literal property key, if present.
-    key: Option<String>,
+    key: Option<&'a str>,
 }
 
-impl Script {
-    fn new(program: &Program) -> Self {
-        // The decoded AST retains resolver contexts, so equal names in different
-        // lexical scopes have distinct IDs while frame names keep their original spelling.
-        let functions = ast::named_functions(program);
-        let (appliers, originals) = Appliers::new(program, &functions);
+impl<'a> Script<'a> {
+    fn new(js: ast::Script<'a>) -> Self {
+        // Semantic analysis gives equal names in different lexical scopes distinct bindings,
+        // while frame names keep their original spelling.
+        let functions: Vec<(Binding<'a>, Body<'a>)> = js
+            .named_functions()
+            .into_iter()
+            .map(|(name, function)| (name, Body::of(function)))
+            .collect();
+        let appliers = Appliers::new(js, &functions);
         let mut script = Self {
             functions,
-            originals,
             classes: Vec::new(),
             constructs: Vec::new(),
             construct_slots: Vec::new(),
@@ -839,148 +1020,256 @@ impl Script {
             apply_slots: Vec::new(),
             appliers,
         };
-        program.visit_with(&mut script);
+        for node in js.nodes.iter() {
+            match node.kind() {
+                AstKind::AssignmentExpression(assignment) => script.assignment(assignment),
+                AstKind::Class(class) if class.is_declaration() => script.class(class),
+                _ => {}
+            }
+        }
         script
     }
 
-    fn function(&self, name: &Id) -> Result<&Function> {
-        self.functions
-            .iter()
-            .chain(&self.originals)
-            .find(|(function_name, _)| function_name == name)
-            .map(|(_, function)| function)
-            .with_context(|| format!("missing original function {}", name.0))
+    fn js(&self) -> ast::Script<'a> {
+        self.appliers.js()
     }
 
-    /// Returns frames for the function bound to `name` if it forwards a method call. Allows
-    /// local variable declarations before the return.
-    fn method_forwarder(&self, name: &Id) -> Option<Vec<Call>> {
-        let function = self.function(name).ok()?;
-        let parameters = parameters(function)?;
+    /// Tracks `Reflect.construct` and `Reflect.apply` in bindings or array slots, including
+    /// indirect references to `Reflect`. Each assignment in a chain records its own target.
+    fn assignment(&mut self, assignment: &'a AssignmentExpression<'a>) {
+        let js = self.js();
+        let mut value = &assignment.right;
+        while let Expression::AssignmentExpression(inner) = value.without_parentheses() {
+            value = &inner.right;
+        }
+        let Some(member) = member(value.without_parentheses()) else {
+            return;
+        };
+        let method = ast::member_str(member);
+        if let AssignmentTarget::AssignmentTargetIdentifier(name) = &assignment.left {
+            let name = Callee::Binding(js.binding(name));
+            match method {
+                Some("construct") => self.constructs.push(name),
+                Some("apply") => self.applies.push(name),
+                _ => {}
+            }
+        }
+        if let Some(MemberExpression::ComputedMemberExpression(slot)) =
+            assigned_member(&assignment.left)
+            && let Expression::Identifier(array) = &slot.object
+            && let Some(index) =
+                number(&slot.expression, &self.appliers.constants).and_then(ast::array_index)
+        {
+            let slot = (js.binding(array), index);
+            match method {
+                Some("construct") => self.construct_slots.push(slot),
+                Some("apply") => self.apply_slots.push(slot),
+                _ => {}
+            }
+        }
+    }
+
+    /// Records a class declaration's `run` method.
+    fn class(&mut self, class: &'a Class<'a>) {
+        let run = class.body.body.iter().find_map(|element| match element {
+            ClassElement::MethodDefinition(method)
+                if method.kind != MethodDefinitionKind::Constructor
+                    && ast::static_key_str(&method.key, method.computed) == Some("run") =>
+            {
+                Some(method)
+            }
+            _ => None,
+        });
+        if let Some(method) = run
+            && let Some(name) = &class.id
+        {
+            self.classes.push(DispatchMethod {
+                class: name.name.as_str(),
+                run: Body::of(&method.value),
+                key: ast::key_str(&method.key, method.computed),
+            });
+        }
+    }
+
+    fn function(&self, callee: Callee<'a>) -> Result<Body<'a>> {
+        match callee {
+            Callee::Binding(binding) => self
+                .functions
+                .iter()
+                .find(|(name, _)| *name == binding)
+                .map(|(_, function)| *function),
+            Callee::Original(index) => self
+                .appliers
+                .originals
+                .get(index)
+                .map(|original| original.body),
+        }
+        .with_context(|| format!("missing original function {}", self.appliers.name(callee)))
+    }
+
+    /// Returns frames for the function `callee` if it forwards a method call. Allows local
+    /// variable declarations before the return.
+    fn method_forwarder(&self, callee: Callee<'a>) -> Option<Vec<Call>> {
+        let function = self.function(callee).ok()?;
+        let parameters = function.parameters()?;
         let [method, receiver, ..] = parameters.as_slice() else {
             return None;
         };
-        let (Stmt::Return(returned), declarations) = function.body.as_ref()?.stmts.split_last()?
-        else {
+        let mut statements = function.plain_statements()?;
+        let Statement::ReturnStatement(returned) = statements.next_back()? else {
             return None;
         };
-        if !declarations
-            .iter()
-            .all(|statement| matches!(statement, Stmt::Decl(Decl::Var(_))))
-        {
+        if !statements.all(|statement| {
+            matches!(statement, Statement::VariableDeclaration(declaration)
+                if !declaration.kind.is_using())
+        }) {
             return None;
         }
-        let mut value = returned.arg.as_deref()?.unwrap_parens();
-        if let Expr::Seq(sequence) = value {
-            value = sequence.exprs.last()?.unwrap_parens();
+        let mut value = returned.argument.as_ref()?.without_parentheses();
+        if let Expression::SequenceExpression(sequence) = value {
+            value = sequence.expressions.last()?.without_parentheses();
         }
-        let call = value.as_call()?;
-        let target = Scope::new(&name.0, function, &self.appliers)
+        let Expression::CallExpression(call) = value else {
+            return None;
+        };
+        let name = self.appliers.name(callee);
+        let target = Scope::new(name, &function, &self.appliers)
             .target(call)
             .ok()?;
         // Compare bindings so a nested function with the same name as a native apply
         // alias cannot be mistaken for that alias. Some builds keep the alias in an array slot.
-        let native = match (&target.callee, &target.slot) {
-            (Some(callee), _) => self.function(callee).is_err() || self.applies.contains(callee),
-            (None, Some(slot)) => self.apply_slots.contains(slot),
+        let native = match (target.callee, target.slot) {
+            (Some(callee), _) => self.function(callee).is_err() || self.applies.contains(&callee),
+            (None, Some(slot)) => self.apply_slots.contains(&slot),
             (None, None) => false,
         };
         if !native {
             return None;
         }
-        let [first, second, ..] = handed(call, &target)?[..] else {
+        let [first, second, ..] = handed(Arguments::of(call), &target)?[..] else {
             return None;
         };
-        (self::name(first).as_ref() == Some(method)
-            && self::name(second).as_ref() == Some(receiver))
-        .then(|| target.frames(Name::same(name.0.to_string())))
+        let constants = &self.appliers.constants;
+        (first.callee(constants) == Some(Callee::symbol(*method))
+            && second.callee(constants) == Some(Callee::symbol(*receiver)))
+        .then(|| target.frames(Name::same(name.to_owned())))
     }
 }
 
-impl Visit for Script {
-    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
-        // Track `Reflect.construct` and `Reflect.apply` in bindings or array slots, including
-        // indirect references to `Reflect`. Visit child expressions to record every target in a
-        // chained assignment.
-        let mut value = &*assign.right;
-        while let Expr::Assign(inner) = value.unwrap_parens() {
-            value = &inner.right;
-        }
-        if let Expr::Member(member) = value.unwrap_parens() {
-            let method = ast::member_str(&member.prop);
-            match (assign.left.as_ident(), method) {
-                (Some(name), Some("construct")) => self.constructs.push(name.to_id()),
-                (Some(name), Some("apply")) => self.applies.push(name.to_id()),
-                _ => {}
-            }
-            if let AssignTarget::Simple(SimpleAssignTarget::Member(slot)) = &assign.left
-                && let Some(array) = slot.obj.as_ident()
-                && let Some(index) = slot.prop.as_computed()
-                && let Some(index) = self.appliers.number(&index.expr).and_then(ast::array_index)
-            {
-                match method {
-                    Some("construct") => self.construct_slots.push((array.to_id(), index)),
-                    Some("apply") => self.apply_slots.push((array.to_id(), index)),
-                    _ => {}
-                }
-            }
-        }
-        assign.visit_children_with(self);
-    }
+/// A call argument as call resolution reads it.
+#[derive(Clone, Copy)]
+enum Operand<'a> {
+    Expression(&'a Expression<'a>),
+    /// A function resolved without an expression that names it: a binding a forwarder reads back
+    /// from an array copy, or an original function selected from a merged function.
+    Resolved(Callee<'a>),
+}
 
-    fn visit_class_decl(&mut self, declaration: &ClassDecl) {
-        let run = declaration
-            .class
-            .body
-            .iter()
-            .filter_map(ClassMember::as_method)
-            .find(|method| ast::static_key_str(&method.key) == Some("run"));
-        if let Some(method) = run {
-            self.classes.push(DispatchMethod {
-                class: declaration.ident.sym.to_string(),
-                run: (*method.function).clone(),
-                key: ast::key_str(&method.key).map(str::to_owned),
-            });
+impl<'a> Operand<'a> {
+    /// The function or value the operand names.
+    fn callee(self, constants: &Constants<'a>) -> Option<Callee<'a>> {
+        match self {
+            Self::Expression(expression) => constants.binding(expression).map(Callee::Binding),
+            Self::Resolved(callee) => Some(callee),
         }
-        declaration.visit_children_with(self);
     }
 }
 
-fn name(expression: &Expr) -> Option<Id> {
-    Some(expression.unwrap_parens().as_ident()?.to_id())
+/// A call's arguments. In a forwarder, `copies` resolves arguments read back from array copies,
+/// at the top level and in array literals.
+#[derive(Clone, Copy)]
+struct Arguments<'a, 'c> {
+    list: &'a [Argument<'a>],
+    copies: Option<&'c Copies<'a, 'c>>,
 }
 
-/// The names of a function's parameters, if they are all plain names.
-fn parameters(function: &Function) -> Option<Vec<Id>> {
-    function
-        .params
-        .iter()
-        .map(|parameter| Some(parameter.pat.as_ident()?.to_id()))
-        .collect()
+impl<'a, 'c> Arguments<'a, 'c> {
+    fn of(call: &'a CallExpression<'a>) -> Self {
+        Self {
+            list: &call.arguments,
+            copies: None,
+        }
+    }
+
+    /// Reads an argument, resolving it through the copies unless it is an array literal.
+    fn argument(&self, argument: &'a Argument<'a>) -> Operand<'a> {
+        let expression = ast::argument_expression(argument);
+        if let Some(copies) = self.copies
+            && !matches!(
+                expression.without_parentheses(),
+                Expression::ArrayExpression(_)
+            )
+            && let Some(binding) = copies.resolve(expression)
+        {
+            return Operand::Resolved(Callee::Binding(binding));
+        }
+        Operand::Expression(expression)
+    }
+
+    /// Reads an array element, or `None` for a hole.
+    fn element(&self, element: &'a ArrayExpressionElement<'a>) -> Option<Operand<'a>> {
+        let expression = element_expression(element)?;
+        Some(
+            match self.copies.and_then(|copies| copies.resolve(expression)) {
+                Some(binding) => Operand::Resolved(Callee::Binding(binding)),
+                None => Operand::Expression(expression),
+            },
+        )
+    }
 }
 
-/// Returns the arguments `call` forwards to the callee identified by `target`. Skips leading
+/// The expression an array element holds, ignoring a spread, or `None` for a hole.
+fn element_expression<'b, 'a>(
+    element: &'b ArrayExpressionElement<'a>,
+) -> Option<&'b Expression<'a>> {
+    match element {
+        ArrayExpressionElement::SpreadElement(spread) => Some(&spread.argument),
+        ArrayExpressionElement::Elision(_) => None,
+        element => Some(element.to_expression()),
+    }
+}
+
+/// An array literal, possibly parenthesized.
+fn array<'b, 'a>(expression: &'b Expression<'a>) -> Option<&'b ArrayExpression<'a>> {
+    match expression.without_parentheses() {
+        Expression::ArrayExpression(array) => Some(array),
+        _ => None,
+    }
+}
+
+/// Returns the arguments a call forwards to the callee identified by `target`. Skips leading
 /// selectors, callee, and receiver. The forwarded arguments are either the trailing call arguments
 /// or the trailing elements of an apply-helper argument list.
-fn handed<'call>(call: &'call CallExpr, target: &Invocation) -> Option<Vec<&'call Expr>> {
-    let arguments: Vec<&Expr> = if target.listed {
-        let list = call.args.last()?.expr.unwrap_parens().as_array()?;
-        list.elems
+fn handed<'a>(arguments: Arguments<'a, '_>, target: &Invocation<'a>) -> Option<Vec<Operand<'a>>> {
+    let operands: Vec<Operand<'a>> = if target.listed {
+        let list = array(ast::argument_expression(arguments.list.last()?))?;
+        list.elements
             .iter()
-            .map(|element| element.as_ref().map(|element| &*element.expr))
+            .map(|element| arguments.element(element))
             .collect::<Option<_>>()?
     } else {
-        call.args.iter().map(|argument| &*argument.expr).collect()
+        arguments
+            .list
+            .iter()
+            .map(|argument| arguments.argument(argument))
+            .collect()
     };
-    let start = arguments.len().checked_sub(target.passed?)?;
-    Some(arguments[start..].to_vec())
+    let start = operands.len().checked_sub(target.passed?)?;
+    Some(operands[start..].to_vec())
 }
 
 /// Checks whether `call` forwards two captured values followed by `function`'s leading
 /// parameters, as a closure-factory listener does. The function may also declare trailing
 /// parameters used as local variables.
-fn forwards_parameters(function: &Function, call: &CallExpr, target: &Invocation) -> bool {
-    let (Some(handed), Some(parameters)) = (handed(call, target), parameters(function)) else {
+fn forwards_parameters<'a>(
+    constants: &Constants<'a>,
+    function: &Body<'a>,
+    call: &'a CallExpression<'a>,
+    target: &Invocation<'a>,
+) -> bool {
+    let (Some(handed), Some(parameters)) =
+        (handed(Arguments::of(call), target), function.parameters())
+    else {
         return false;
     };
     let Some(forwarded) = handed.get(2..) else {
@@ -990,19 +1279,21 @@ fn forwards_parameters(function: &Function, call: &CallExpr, target: &Invocation
         && forwarded
             .iter()
             .zip(parameters)
-            .all(|(argument, parameter)| name(argument) == Some(parameter))
+            .all(|(argument, parameter)| {
+                argument.callee(constants) == Some(Callee::symbol(parameter))
+            })
 }
 
 /// Arrays a function fills with names before reading them back, such as `g = [f, a]` read as
 /// `g[0]` and `g[1]`.
-struct Copies<'constants> {
-    arrays: HashMap<Id, Vec<Id>>,
+struct Copies<'a, 'c> {
+    arrays: HashMap<Binding<'a>, Vec<Binding<'a>>>,
     /// Known constants used to evaluate array indices.
-    constants: &'constants HashMap<Id, f64>,
+    constants: &'c Constants<'a>,
 }
 
-impl<'constants> Copies<'constants> {
-    fn new(constants: &'constants HashMap<Id, f64>) -> Self {
+impl<'a, 'c> Copies<'a, 'c> {
+    fn new(constants: &'c Constants<'a>) -> Self {
         Self {
             arrays: HashMap::new(),
             constants,
@@ -1010,34 +1301,49 @@ impl<'constants> Copies<'constants> {
     }
 
     /// Records `expression` if it is `array = [name, ...]`.
-    fn record(&mut self, expression: &Expr) -> Option<()> {
-        let assign = expression.as_assign()?;
-        let array = assign.left.as_ident()?;
-        let names: Option<Vec<Id>> = assign
-            .right
-            .as_array()?
-            .elems
+    fn record(&mut self, expression: &Expression<'a>) -> Option<()> {
+        let Expression::AssignmentExpression(assignment) = expression else {
+            return None;
+        };
+        let AssignmentTarget::AssignmentTargetIdentifier(array) = &assignment.left else {
+            return None;
+        };
+        let Expression::ArrayExpression(list) = &assignment.right else {
+            return None;
+        };
+        let names: Option<Vec<Binding<'a>>> = list
+            .elements
             .iter()
-            .map(|element| name(&element.as_ref()?.expr))
+            .map(|element| self.constants.binding(element_expression(element)?))
             .collect();
-        self.arrays.insert(array.to_id(), names?);
+        self.arrays.insert(self.constants.js.binding(array), names?);
         Some(())
     }
 
-    /// The name `expression` reads, directly or through an element of a copied array.
-    fn resolve(&self, expression: &Expr) -> Option<Id> {
-        match expression.unwrap_parens() {
-            Expr::Ident(name) => Some(name.to_id()),
-            Expr::Member(member) => {
-                let (Expr::Ident(array), MemberProp::Computed(index)) =
-                    (&*member.obj, &member.prop)
-                else {
+    /// The binding `expression` reads, directly or through an element of a copied array.
+    fn resolve(&self, expression: &Expression<'a>) -> Option<Binding<'a>> {
+        match expression.without_parentheses() {
+            Expression::Identifier(name) => Some(self.constants.js.binding(name)),
+            Expression::ComputedMemberExpression(member) => {
+                let Expression::Identifier(array) = &member.object else {
                     return None;
                 };
-                let index = ast::array_index(number(&index.expr, self.constants)?)?;
-                self.arrays.get(&array.to_id())?.get(index).cloned()
+                let index = ast::array_index(number(&member.expression, self.constants)?)?;
+                self.arrays
+                    .get(&self.constants.js.binding(array))?
+                    .get(index)
+                    .copied()
             }
             _ => None,
+        }
+    }
+
+    /// The binding `operand` reads. See [`Copies::resolve`].
+    fn resolve_operand(&self, operand: Operand<'a>) -> Option<Binding<'a>> {
+        match operand {
+            Operand::Expression(expression) => self.resolve(expression),
+            Operand::Resolved(Callee::Binding(binding)) => Some(binding),
+            Operand::Resolved(Callee::Original(_)) => None,
         }
     }
 }
@@ -1045,83 +1351,108 @@ impl<'constants> Copies<'constants> {
 /// JavaScriptCore's call position: the opening argument parenthesis, which in minified source
 /// immediately precedes the first argument. Decoding may change the callee's parentheses but
 /// preserves argument positions.
-fn arguments_position(call: &CallExpr) -> BytePos {
-    match call.args.first() {
-        Some(first) => first.span().lo - BytePos(1),
-        None => call.span.hi - BytePos(2),
+fn arguments_position(call: &CallExpression<'_>) -> u32 {
+    match call.arguments.first() {
+        Some(first) => first.span().start - 1,
+        None => call.span.end - 2,
     }
 }
 
 /// V8's call position: the method or function name, else JavaScriptCore's position.
-fn call_position(call: &CallExpr) -> BytePos {
+fn call_position(call: &CallExpression<'_>) -> u32 {
     match &call.callee {
-        Callee::Expr(callee) => match &**callee {
-            Expr::Member(member) => match &member.prop {
-                MemberProp::Ident(property) => property.span.lo,
-                _ => callee.span().hi,
-            },
-            Expr::Ident(_) => call.span.lo,
-            _ => arguments_position(call),
+        callee if let Some(member) = member(callee) => match member {
+            MemberExpression::StaticMemberExpression(member) => member.property.span.start,
+            _ => callee.span().end,
         },
-        _ => call.span.lo,
+        Expression::Identifier(_) | Expression::Super(_) => call.span.start,
+        _ => arguments_position(call),
     }
 }
 
 /// Finds the first call in a dispatch case.
-struct Case {
+struct Case<'a> {
     span: Span,
-    call: CallExpr,
+    call: &'a CallExpression<'a>,
 }
 
-fn cases_of(function: &Function) -> Vec<Case> {
-    #[derive(Default)]
-    struct Cases(Vec<Case>);
+fn cases_of<'a>(js: ast::Script<'a>, function: &Body<'a>) -> Vec<Case<'a>> {
+    struct Cases<'a> {
+        js: ast::Script<'a>,
+        found: Vec<Case<'a>>,
+    }
     // Visitors inspect only the supplied body. Skip nested functions and classes, but include
     // arrows.
-    impl Visit for Cases {
-        fn visit_function(&mut self, _: &Function) {}
-        fn visit_class(&mut self, _: &Class) {}
-        fn visit_switch_case(&mut self, case: &SwitchCase) {
+    impl<'a> Visit<'a> for Cases<'a> {
+        fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+        fn visit_class(&mut self, _: &Class<'a>) {}
+        fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+            walk_property(self, property);
+        }
+        fn visit_switch_case(&mut self, case: &SwitchCase<'a>) {
             if case.test.is_some() {
-                let mut calls = Calls::default();
-                case.cons.visit_with(&mut calls);
-                if let Some(call) = calls.0.into_iter().next() {
-                    self.0.push(Case {
+                let case = self.js.lend(case, AstKind::as_switch_case);
+                if let Some(&call) = calls_in(self.js, &case.consequent).first() {
+                    self.found.push(Case {
                         span: case.span,
                         call,
                     });
                 }
             }
-            case.visit_children_with(self);
+            walk::walk_switch_case(self, case);
         }
     }
-    let mut cases = Cases::default();
-    function.body.visit_with(&mut cases);
-    cases.0
+    let mut cases = Cases {
+        js,
+        found: Vec::new(),
+    };
+    function.visit(&mut cases);
+    cases.found
 }
 
 /// Calls made by a function's own body, excluding nested functions.
-#[derive(Default)]
-struct Calls(Vec<CallExpr>);
+struct Calls<'a> {
+    js: ast::Script<'a>,
+    found: Vec<&'a CallExpression<'a>>,
+}
 
-impl Visit for Calls {
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_class(&mut self, _: &Class) {}
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        self.0.push(call.clone());
-        call.visit_children_with(self);
+impl<'a> Visit<'a> for Calls<'a> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        walk_property(self, property);
+    }
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !is_optional_call(call) {
+            self.found
+                .push(self.js.lend(call, AstKind::as_call_expression));
+        }
+        walk::walk_call_expression(self, call);
     }
 }
 
-fn calls_of(function: &Function) -> Vec<CallExpr> {
-    let mut calls = Calls::default();
-    function.body.visit_with(&mut calls);
-    calls.0
+/// Calls made by `statements`, excluding nested functions.
+fn calls_in<'a>(
+    js: ast::Script<'a>,
+    statements: impl IntoIterator<Item = &'a Statement<'a>>,
+) -> Vec<&'a CallExpression<'a>> {
+    let mut calls = Calls {
+        js,
+        found: Vec::new(),
+    };
+    for statement in statements {
+        calls.visit_statement(statement);
+    }
+    calls.found
+}
+
+fn calls_of<'a>(js: ast::Script<'a>, function: &Body<'a>) -> Vec<&'a CallExpression<'a>> {
+    calls_in(js, function.statements())
 }
 
 /// A call's target, resolved through helper functions.
-struct Invocation {
-    callee: Option<Id>,
+struct Invocation<'a> {
+    callee: Option<Callee<'a>>,
     /// Whether it invokes `callee.call(receiver, ...)`.
     method: bool,
     /// Intermediate helper frames, innermost first.
@@ -1132,10 +1463,23 @@ struct Invocation {
     /// Whether the final argument is an array literal containing the arguments passed to `callee`.
     listed: bool,
     /// The array slot the called function is read from, if any.
-    slot: Option<(Id, usize)>,
+    slot: Option<(Binding<'a>, usize)>,
 }
 
-impl Invocation {
+impl Invocation<'_> {
+    /// An unresolved call at `site`.
+    fn at(site: Site) -> Self {
+        Self {
+            callee: None,
+            method: false,
+            helpers: Vec::new(),
+            site,
+            passed: None,
+            listed: false,
+            slot: None,
+        }
+    }
+
     /// The frames of the call made from `caller`, innermost first.
     fn frames(&self, caller: Name) -> Vec<Call> {
         let mut frames = self.helpers.clone();
@@ -1147,224 +1491,186 @@ impl Invocation {
     }
 }
 
-/// Recovers the XOR mask and call cases of a selector-based helper. Calls can use `Reflect.apply(f,
-/// _, list)` or `f(a, b)` with later parameters forwarded in order.
+/// A `switch (selector ^ mask)` whose case labels each select a `T`.
+struct Selection<T> {
+    mask: f64,
+    cases: Vec<(f64, T)>,
+}
+
+impl<T: Copy> Selection<T> {
+    /// The case `selector` selects.
+    fn select(&self, selector: f64) -> Option<T> {
+        let chosen = f64::from(js::int32(self.mask) ^ js::int32(selector));
+        self.cases
+            .iter()
+            .find(|(label, _)| *label == chosen)
+            .map(|&(_, case)| case)
+    }
+}
+
+/// Recovers the `Reflect.apply` call site of each case of a selector-based helper. Calls can use
+/// `Reflect.apply(f, _, list)` or `f(a, b)` with later parameters forwarded in order.
 ///
 /// Handles copied selectors such as `(s = [selector], mask ^ s[0])`, indirect references to
 /// `apply`, copied arguments such as `(g = [f, a], (0, g[0])(g[1]))`, and masks or labels computed
 /// from constants.
-struct Applier {
-    mask: f64,
-    cases: Vec<ApplierCase>,
-}
-
-struct ApplierCase {
-    label: f64,
-    site: Site,
-}
-
-impl Applier {
-    fn new(function: &Function, constants: &HashMap<Id, f64>) -> Option<Self> {
-        let parameters = parameters(function)?;
-        let [selector, applied, rest @ ..] = parameters.as_slice() else {
-            return None;
-        };
-        let (mask, switch, copies) = selection(function, selector, constants)?;
-        // Match `f(a, b)` when arguments follow parameter order.
-        let passes_on = |call: &CallExpr| {
-            let Some(callee) = call.callee.as_expr() else {
-                return false;
-            };
-            let (callee, _) = undetached(callee, constants);
-            copies.resolve(callee).as_ref() == Some(applied)
-                && call.args.len() <= rest.len()
-                && call.args.iter().zip(rest).all(|(argument, parameter)| {
-                    argument.spread.is_none()
-                        && copies.resolve(&argument.expr).as_ref() == Some(parameter)
+fn applier<'a>(function: &Body<'a>, constants: &Constants<'a>) -> Option<Selection<Site>> {
+    let parameters = function.parameters()?;
+    let [selector, applied, rest @ ..] = parameters.as_slice() else {
+        return None;
+    };
+    let (mask, switch, copies) = selection(function, *selector, constants)?;
+    let is = |binding: Option<Binding<'a>>, parameter: &SymbolId| {
+        binding == Some(Binding::Symbol(*parameter))
+    };
+    // Match `f(a, b)` when arguments follow parameter order.
+    let passes_on = |call: &CallExpression<'a>| {
+        let (callee, _) = undetached(&call.callee, constants);
+        is(copies.resolve(callee), applied)
+            && call.arguments.len() <= rest.len()
+            && call
+                .arguments
+                .iter()
+                .zip(rest)
+                .all(|(argument, parameter)| match argument {
+                    Argument::SpreadElement(_) => false,
+                    argument => is(copies.resolve(argument.to_expression()), parameter),
                 })
+    };
+    let applies = |call: &CallExpression<'a>| {
+        let [first, _, third] = &call.arguments[..] else {
+            return false;
         };
-        let applies = |call: &CallExpr| {
-            let [first, _, third] = &call.args[..] else {
-                return false;
+        member(call.callee.without_parentheses()).is_some()
+            && is(constants.binding(ast::argument_expression(first)), applied)
+            && rest
+                .first()
+                .is_some_and(|list| is(constants.binding(ast::argument_expression(third)), list))
+    };
+    let cases: Vec<(f64, Site)> = switch
+        .cases
+        .iter()
+        .filter_map(|case| {
+            let label = number(case.test.as_ref()?, constants)?;
+            let [Statement::ReturnStatement(returned)] = &case.consequent[..] else {
+                return None;
             };
-            call.callee
-                .as_expr()
-                .is_some_and(|callee| callee.unwrap_parens().is_member())
-                && name(&first.expr).as_ref() == Some(applied)
-                && rest
-                    .first()
-                    .is_some_and(|list| name(&third.expr).as_ref() == Some(list))
-        };
-        let cases: Vec<ApplierCase> = switch
-            .cases
-            .iter()
-            .filter_map(|case| {
-                let label = number(case.test.as_deref()?, constants)?;
-                let [Stmt::Return(returned)] = &case.cons[..] else {
-                    return None;
-                };
-                let Some(Expr::Call(call)) = returned.arg.as_deref().map(Expr::unwrap_parens)
-                else {
-                    return None;
-                };
-                (applies(call) || passes_on(call)).then(|| ApplierCase {
-                    label,
-                    site: Site::new(call),
-                })
-            })
-            .collect();
-        // Other cases may call more helpers. Selectors routed there have no case in this helper.
-        (!cases.is_empty()).then_some(Self { mask, cases })
-    }
-
-    /// The `Reflect.apply` call in the case `selector` selects.
-    fn call(&self, selector: f64) -> Option<Site> {
-        let chosen = f64::from(js::int32(self.mask) ^ js::int32(selector));
-        self.cases
-            .iter()
-            .find(|case| case.label == chosen)
-            .map(|case| case.site)
-    }
+            let Expression::CallExpression(call) =
+                returned.argument.as_ref()?.without_parentheses()
+            else {
+                return None;
+            };
+            (applies(call) || passes_on(call)).then(|| (label, Site::new(call)))
+        })
+        .collect();
+    // Other cases may call more helpers. Selectors routed there have no case in this helper.
+    (!cases.is_empty()).then_some(Selection { mask, cases })
 }
 
 /// Extracts the mask and switch from a function containing `switch (selector ^ mask)`, with
 /// optional leading local declarations. Also tracks arrays used to copy selector names, as in `(s =
 /// [selector], mask ^ s[0])`.
-fn selection<'function, 'constants>(
-    function: &'function Function,
-    selector: &Id,
-    constants: &'constants HashMap<Id, f64>,
-) -> Option<(f64, &'function SwitchStmt, Copies<'constants>)> {
-    let [Stmt::Switch(switch)] = after_declarations(&function.body.as_ref()?.stmts) else {
+fn selection<'a, 'c>(
+    function: &Body<'a>,
+    selector: SymbolId,
+    constants: &'c Constants<'a>,
+) -> Option<(f64, &'a SwitchStatement<'a>, Copies<'a, 'c>)> {
+    let Statement::SwitchStatement(switch) = function.only_statement()? else {
         return None;
     };
-    let mut discriminant = switch.discriminant.unwrap_parens();
+    let mut discriminant = switch.discriminant.without_parentheses();
     let mut copies = Copies::new(constants);
-    if let Expr::Seq(sequence) = discriminant {
-        let (last, before) = sequence.exprs.split_last()?;
+    if let Expression::SequenceExpression(sequence) = discriminant {
+        let (last, before) = sequence.expressions.split_last()?;
         for expression in before {
             copies.record(expression);
         }
-        discriminant = last.unwrap_parens();
+        discriminant = last.without_parentheses();
     }
-    let xor = discriminant
-        .as_bin()
-        .filter(|xor| xor.op == BinaryOp::BitXor)?;
-    let is_selector = |expression: &Expr| copies.resolve(expression).as_ref() == Some(selector);
-    let mask = match (xor.left.unwrap_parens(), xor.right.unwrap_parens()) {
+    let Expression::BinaryExpression(xor) = discriminant else {
+        return None;
+    };
+    if xor.operator != BinaryOperator::BitwiseXOR {
+        return None;
+    }
+    let is_selector =
+        |expression: &Expression<'a>| copies.resolve(expression) == Some(Binding::Symbol(selector));
+    let mask = match (
+        xor.left.without_parentheses(),
+        xor.right.without_parentheses(),
+    ) {
         (other, mask) | (mask, other) if is_selector(other) => number(mask, constants)?,
         _ => return None,
     };
     Some((mask, switch, copies))
 }
 
-/// Returns `statements` after skipping leading local declarations without initializers.
-fn after_declarations(statements: &[Stmt]) -> &[Stmt] {
-    let start = statements
-        .iter()
-        .position(|statement| {
-            !matches!(statement, Stmt::Decl(Decl::Var(declaration))
-                if declaration.decls.iter().all(|declarator| declarator.init.is_none()))
-        })
-        .unwrap_or(statements.len());
-    &statements[start..]
-}
-
-/// A function combining several original functions, selected by its first parameter:
+/// Recovers the original functions of a function that combines several, selected by its first
+/// parameter:
 ///
 /// ```js
 /// function merged(selector, a) { switch (selector ^ mask) { case 1: { <original> } return; } }
 /// ```
 ///
 /// Both V8 and JavaScriptCore name every original function's frame after the merged function.
-/// Recovery gives each original a fresh binding with that name and keeps the other parameters.
-struct Merged {
-    mask: f64,
-    /// Original function for each case label, indexed into [`Script::originals`].
-    cases: Vec<(f64, Id)>,
-}
-
-impl Merged {
-    fn new(
-        name: &Id,
-        function: &Function,
-        constants: &HashMap<Id, f64>,
-    ) -> Option<(Self, Vec<(Id, Function)>)> {
-        let selector = function.params.first()?.pat.as_ident()?.to_id();
-        let (mask, switch, _) = selection(function, &selector, constants)?;
-        let block = function.body.as_ref()?;
-        let mut cases = Vec::new();
-        let mut originals = Vec::new();
-        for (at, case) in switch.cases.iter().enumerate() {
-            let label = case
-                .test
-                .as_deref()
-                .and_then(|test| number(test, constants));
-            // Labels sharing a body fall through to it.
-            let body = switch.cases[at..]
-                .iter()
-                .map(|case| &case.cons)
-                .find(|body| !body.is_empty());
-            let (Some(label), Some(body)) = (label, body) else {
-                continue;
-            };
-            let mut statements: Vec<Stmt> = match &body[..] {
-                [Stmt::Block(original), rest @ ..] => {
-                    original.stmts.iter().chain(rest).cloned().collect()
-                }
-                _ => body.clone(),
-            };
-            if let Some(Stmt::Return(ReturnStmt { arg: None, .. })) = statements.last() {
-                statements.pop();
-            }
-            let original = Function {
-                params: function.params[1..].to_vec(),
-                span: function.span,
-                ctxt: function.ctxt,
-                body: Some(BlockStmt {
-                    span: block.span,
-                    ctxt: block.ctxt,
-                    stmts: statements,
-                }),
-                ..Function::default()
-            };
-            let binding = (
-                name.0.clone(),
-                SyntaxContext::empty().apply_mark(Mark::new()),
-            );
-            cases.push((label, binding.clone()));
-            originals.push((binding, original));
-        }
-        (!cases.is_empty()).then_some((Self { mask, cases }, originals))
-    }
-
-    /// Returns the original function selected by `selector`.
-    fn original(&self, selector: f64) -> Option<&Id> {
-        let chosen = f64::from(js::int32(self.mask) ^ js::int32(selector));
-        self.cases
+/// Each original keeps the merged function's other parameters.
+fn merged<'a>(function: &Body<'a>, constants: &Constants<'a>) -> Option<Selection<Body<'a>>> {
+    let selector = plain_parameter(function.parameters.first()?)?;
+    let (mask, switch, _) = selection(function, selector, constants)?;
+    let mut cases = Vec::new();
+    for (at, case) in switch.cases.iter().enumerate() {
+        let label = case.test.as_ref().and_then(|test| number(test, constants));
+        // Labels sharing a body fall through to it.
+        let body = switch.cases[at..]
             .iter()
-            .find(|(label, _)| *label == chosen)
-            .map(|(_, original)| original)
+            .map(|case| &case.consequent)
+            .find(|body| !body.is_empty());
+        let (Some(label), Some(body)) = (label, body) else {
+            continue;
+        };
+        let (mut head, mut tail): (&[Statement], &[Statement]) = match &body[..] {
+            [Statement::BlockStatement(original), rest @ ..] => (&original.body[..], rest),
+            body => (body, &[]),
+        };
+        let last = if tail.is_empty() {
+            &mut head
+        } else {
+            &mut tail
+        };
+        if let [statements @ .., Statement::ReturnStatement(returned)] = *last
+            && returned.argument.is_none()
+        {
+            *last = statements;
+        }
+        let body = Body {
+            parameters: &function.parameters[1..],
+            rest: function.rest,
+            prologue: false,
+            head,
+            tail,
+        };
+        cases.push((label, body));
     }
+    (!cases.is_empty()).then_some(Selection { mask, cases })
 }
 
 /// Storage location in a scope: a binding or a constant array slot.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Holder {
-    Name(Id),
-    Slot(Id, usize),
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Holder<'a> {
+    Name(Binding<'a>),
+    Slot(Binding<'a>, usize),
 }
 
 /// A function's local aliases, string constants, and forwarders.
-struct Scope<'script> {
-    appliers: &'script Appliers,
+struct Scope<'a, 's> {
+    appliers: &'s Appliers<'a>,
     /// V8's name prefix for functions assigned here, such as `Owner.`.
     prefix: String,
-    forwarders: Forwarders,
+    forwarders: Forwarders<'a>,
     /// Assignment count for each storage location. Only values assigned once are known.
-    assigned: HashMap<Holder, usize>,
-    aliases: HashMap<Id, Id>,
-    strings: HashMap<Id, String>,
+    assigned: HashMap<Holder<'a>, usize>,
+    aliases: HashMap<Binding<'a>, Binding<'a>>,
+    strings: HashMap<Binding<'a>, &'a str>,
 }
 
 /// Frames for an object function that forwards its first parameter with the remaining arguments.
@@ -1376,14 +1682,13 @@ struct Forwarder {
     plain: Vec<Call>,
 }
 
-impl<'script> Scope<'script> {
+impl<'a, 's> Scope<'a, 's> {
     /// `name` is empty for anonymous functions. V8 prefixes the names of functions assigned
     /// inside a capitalized function with its name, as it does for constructors.
-    fn new(name: &str, function: &Function, appliers: &'script Appliers) -> Self {
-        let constructor = name.starts_with(char::is_uppercase);
+    fn new(name: &str, function: &Body<'a>, appliers: &'s Appliers<'a>) -> Self {
         let mut scope = Self {
             appliers,
-            prefix: if constructor {
+            prefix: if name.starts_with(char::is_uppercase) {
                 format!("{name}.")
             } else {
                 String::new()
@@ -1393,157 +1698,199 @@ impl<'script> Scope<'script> {
             aliases: HashMap::new(),
             strings: HashMap::new(),
         };
-        function.body.visit_with(&mut scope);
+        function.visit(&mut scope);
         scope.forwarders.retain_assigned_once(&scope.assigned);
         scope
     }
 
-    fn target(&self, call: &CallExpr) -> Result<Invocation> {
-        let mut target = Invocation {
-            callee: None,
-            method: false,
-            helpers: Vec::new(),
-            site: Site::new(call),
-            passed: None,
-            listed: false,
-            slot: None,
+    fn js(&self) -> ast::Script<'a> {
+        self.appliers.js()
+    }
+
+    fn target(&self, call: &'a CallExpression<'a>) -> Result<Invocation<'a>> {
+        self.resolve(call, None)
+    }
+
+    /// Resolves `call`, reading arguments through `copies` when given.
+    fn resolve(
+        &self,
+        call: &'a CallExpression<'a>,
+        copies: Option<&Copies<'a, '_>>,
+    ) -> Result<Invocation<'a>> {
+        let site = Site::new(call);
+        let arguments = Arguments {
+            list: &call.arguments,
+            copies,
         };
-        let Some(callee) = call.callee.as_expr() else {
-            return Ok(target);
-        };
-        let arguments = call.args.len();
-        let (callee, detached) = undetached(callee, &self.appliers.constants);
+        let (callee, detached) = undetached(&call.callee, &self.appliers.constants);
         // Resolve the function called by `target`.
-        let mut function = match callee {
-            Expr::Ident(name) => {
-                if let Some(original) = self.merged_call(name, call) {
-                    // The original function uses the merged function's frame at this call site.
-                    let mut target = self.target(&original)?;
-                    target.site = Site::new(call);
-                    return Ok(target);
-                }
-                if let Some((applied, function)) = self.applier_call(name, call)? {
-                    target = applied;
-                    Some(function)
-                } else {
-                    target.passed = Some(arguments);
-                    Some(callee)
-                }
+        if let Expression::Identifier(name) = callee {
+            let binding = self.js().binding(name);
+            if let Some((original, arguments)) = self.merged_call(binding, arguments) {
+                // The original function uses the merged function's frame at this call site.
+                let original = Callee::Original(original);
+                return self.named(original, Operand::Resolved(original), arguments, site);
             }
+            return self.named(
+                Callee::Binding(binding),
+                Operand::Expression(callee),
+                arguments,
+                site,
+            );
+        }
+        let mut target = Invocation::at(site);
+        let count = arguments.list.len();
+        let function = match member(callee) {
             // Some builds keep the key in a local: `handler[c](this)` with `c = "call"`.
-            Expr::Member(member)
-                if !detached && member.obj.is_ident() && self.key(&member.prop) == Some("call") =>
+            Some(member)
+                if !detached
+                    && matches!(member.object(), Expression::Identifier(_))
+                    && self.key(member) == Some("call") =>
             {
                 target.method = true;
-                target.passed = Some(arguments.saturating_sub(1));
-                Some(&*member.obj)
+                target.passed = Some(count.saturating_sub(1));
+                Some(Operand::Expression(member.object()))
             }
             // The first argument to a forwarder is the function it calls.
-            Expr::Member(member) if let Some(forwarder) = self.member_forwarder(member) => {
+            Some(member) if let Some(forwarder) = self.member_forwarder(member) => {
                 target.helpers = if detached {
                     forwarder.plain.clone()
                 } else {
                     forwarder.method.clone()
                 };
-                target.passed = Some(arguments.saturating_sub(1));
-                call.args.first().map(|first| &*first.expr)
+                target.passed = Some(count.saturating_sub(1));
+                arguments
+                    .list
+                    .first()
+                    .map(|first| arguments.argument(first))
             }
             // Resolve an array-stored function, as in `(0, slots[i])(f, a)`.
-            Expr::Member(member) if self.slot(member).is_some() => {
-                target.passed = Some(arguments);
-                Some(callee)
+            Some(member) if self.slot(member).is_some() => {
+                target.passed = Some(count);
+                Some(Operand::Expression(callee))
             }
             _ => None,
         };
+        Ok(self.finish(target, function, arguments))
+    }
+
+    /// Resolves a call to the function `callee`, read as `operand`, directly or through a call
+    /// helper.
+    fn named(
+        &self,
+        callee: Callee<'a>,
+        operand: Operand<'a>,
+        arguments: Arguments<'a, '_>,
+        site: Site,
+    ) -> Result<Invocation<'a>> {
+        let (target, function) = match self.applier_call(callee, arguments, site)? {
+            Some(applied) => applied,
+            None => {
+                let mut target = Invocation::at(site);
+                target.passed = Some(arguments.list.len());
+                (target, operand)
+            }
+        };
+        Ok(self.finish(target, Some(function), arguments))
+    }
+
+    /// Follows stored forwarders from `function`, then records the resolved callee and slot.
+    fn finish(
+        &self,
+        mut target: Invocation<'a>,
+        mut function: Option<Operand<'a>>,
+        arguments: Arguments<'a, '_>,
+    ) -> Invocation<'a> {
         // A stored forwarder calls its first argument with the remaining arguments.
-        while let Some(expression) = function
-            && let Some(frames) = self.held_by(expression)
-            && let Some(first) = handed(call, &target).and_then(|handed| handed.first().copied())
+        while let Some(operand) = function
+            && let Some(frames) = self.held_by(operand)
+            && let Some(first) =
+                handed(arguments, &target).and_then(|handed| handed.first().copied())
         {
             function = Some(first);
             target.helpers = frames.iter().cloned().chain(target.helpers).collect();
             target.passed = target.passed.map(|passed| passed - 1);
         }
-        target.callee = function.and_then(name);
+        target.callee = function.and_then(|function| function.callee(&self.appliers.constants));
         target.slot = function.and_then(|function| match self.holder(function)? {
             Holder::Slot(array, index) => Some((array, index)),
             Holder::Name(_) => None,
         });
-        Ok(target)
+        target
     }
 
-    /// Converts `merged(selector, a, b)` to `original(a, b)` for the selected original function.
-    fn merged_call(&self, callee: &Ident, call: &CallExpr) -> Option<CallExpr> {
-        let merged = self.appliers.merged.get(&callee.to_id())?;
-        let (selector, arguments) = call.args.split_first()?;
-        let (name, context) = merged
-            .original(self.appliers.number(&selector.expr)?)?
-            .clone();
-        Some(CallExpr {
-            callee: Callee::Expr(Box::new(Expr::Ident(Ident::new(
-                name,
-                callee.span,
-                context,
-            )))),
-            args: arguments.to_vec(),
-            ..call.clone()
-        })
+    /// Resolves `merged(selector, a, b)` to the selected original function and the arguments
+    /// `a, b`.
+    fn merged_call<'c>(
+        &self,
+        callee: Binding<'a>,
+        arguments: Arguments<'a, 'c>,
+    ) -> Option<(usize, Arguments<'a, 'c>)> {
+        let merged = self.appliers.merged.get(&callee)?;
+        let (selector, rest) = arguments.list.split_first()?;
+        let original = merged.select(self.appliers.number(arguments.argument(selector))?)?;
+        Some((
+            original,
+            Arguments {
+                list: rest,
+                copies: arguments.copies,
+            },
+        ))
     }
 
     /// Resolves `applier(selector, f, [args])` or `applier(selector, f, a, b)` through a call
     /// helper. Also returns the called function `f`.
-    fn applier_call<'call>(
+    fn applier_call(
         &self,
-        callee: &Ident,
-        call: &'call CallExpr,
-    ) -> Result<Option<(Invocation, &'call Expr)>> {
+        callee: Callee<'a>,
+        arguments: Arguments<'a, '_>,
+        site: Site,
+    ) -> Result<Option<(Invocation<'a>, Operand<'a>)>> {
         let (Some(applier), [selector, function, passed @ ..]) =
-            (self.appliers.helpers.get(&callee.to_id()), &call.args[..])
+            (self.appliers.helpers.get(&callee), arguments.list)
         else {
             return Ok(None);
         };
-        let Some(selector) = self.appliers.number(&selector.expr) else {
+        let Some(selector) = self.appliers.number(arguments.argument(selector)) else {
             return Ok(None);
         };
+        let name = self.appliers.name(callee);
         let inner = applier
-            .call(selector)
-            .with_context(|| format!("{} has no case for selector {selector}", callee.sym))?;
+            .select(selector)
+            .with_context(|| format!("{name} has no case for selector {selector}"))?;
         let (passed, listed) = match passed {
-            [list] if let Some(list) = list.expr.unwrap_parens().as_array() => {
-                (list.elems.len(), true)
+            [list] if let Some(list) = array(ast::argument_expression(list)) => {
+                (list.elements.len(), true)
             }
             passed => (passed.len(), false),
         };
-        let invocation = Invocation {
-            callee: None,
-            method: false,
-            helpers: vec![Call {
-                name: Name::same(callee.sym.to_string()),
-                site: inner,
-            }],
-            site: Site::new(call),
-            passed: Some(passed),
-            listed,
-            slot: None,
-        };
-        Ok(Some((invocation, &function.expr)))
+        let mut invocation = Invocation::at(site);
+        invocation.helpers = vec![Call {
+            name: Name::same(name.to_owned()),
+            site: inner,
+        }];
+        invocation.passed = Some(passed);
+        invocation.listed = listed;
+        Ok(Some((invocation, arguments.argument(function))))
     }
 
     /// Resolves a member key from a literal or a local string binding.
-    fn key<'member>(&'member self, property: &'member MemberProp) -> Option<&'member str> {
-        match property {
-            MemberProp::Computed(computed) if let Expr::Ident(name) = &*computed.expr => {
-                self.strings.get(&name.to_id()).map(String::as_str)
+    fn key(&self, member: &MemberExpression<'a>) -> Option<&'a str> {
+        match member {
+            MemberExpression::ComputedMemberExpression(computed)
+                if let Expression::Identifier(name) = &computed.expression =>
+            {
+                self.strings.get(&self.js().binding(name)).copied()
             }
-            property => ast::member_str(property),
+            member => ast::member_str(member),
         }
     }
 
     /// Finds the forwarder read by `object.key`.
-    fn member_forwarder(&self, member: &MemberExpr) -> Option<&Forwarder> {
+    fn member_forwarder(&self, member: &'a MemberExpression<'a>) -> Option<&Forwarder> {
         let key = (
-            self.holder(&member.obj)?,
-            self.key(&member.prop)?.to_owned(),
+            self.holder(Operand::Expression(member.object()))?,
+            self.key(member)?,
         );
         self.forwarders
             .on_objects
@@ -1551,74 +1898,85 @@ impl<'script> Scope<'script> {
             .or_else(|| self.appliers.forwarders.on_objects.get(&key))
     }
 
-    /// Returns frames for the stored forwarder read by `expression`.
-    fn held_by(&self, expression: &Expr) -> Option<&Vec<Call>> {
-        let holder = self.holder(expression)?;
+    /// Returns frames for the stored forwarder read by `operand`.
+    fn held_by(&self, operand: Operand<'a>) -> Option<&Vec<Call>> {
+        let holder = self.holder(operand)?;
         self.forwarders
             .held
             .get(&holder)
             .or_else(|| self.appliers.forwarders.held.get(&holder))
     }
 
-    /// Resolves the value read by `expression`, following local aliases.
-    fn holder(&self, expression: &Expr) -> Option<Holder> {
-        match expression.unwrap_parens() {
-            Expr::Ident(name) => Some(Holder::Name(self.object(&name.to_id()))),
-            Expr::Member(member) => self.slot(member),
-            _ => None,
+    /// Resolves the value read by `operand`, following local aliases. An original function is
+    /// never stored.
+    fn holder(&self, operand: Operand<'a>) -> Option<Holder<'a>> {
+        match operand {
+            Operand::Expression(expression) => match expression.without_parentheses() {
+                Expression::Identifier(name) => {
+                    Some(Holder::Name(self.object(self.js().binding(name))))
+                }
+                expression => self.slot(member(expression)?),
+            },
+            Operand::Resolved(Callee::Binding(binding)) => Some(Holder::Name(self.object(binding))),
+            Operand::Resolved(Callee::Original(_)) => None,
         }
     }
 
     /// Resolves `array[index]` when the index is constant.
-    fn slot(&self, member: &MemberExpr) -> Option<Holder> {
-        let array = member.obj.as_ident()?;
-        let index = self.appliers.number(&member.prop.as_computed()?.expr)?;
+    fn slot(&self, member: &MemberExpression<'a>) -> Option<Holder<'a>> {
+        let MemberExpression::ComputedMemberExpression(member) = member else {
+            return None;
+        };
+        let Expression::Identifier(array) = &member.object else {
+            return None;
+        };
+        let index = number(&member.expression, &self.appliers.constants)?;
         Some(Holder::Slot(
-            self.object(&array.to_id()),
+            self.object(self.js().binding(array)),
             ast::array_index(index)?,
         ))
     }
 
     /// Resolves the object held by `name` through local copies.
-    fn object(&self, name: &Id) -> Id {
+    fn object(&self, name: Binding<'a>) -> Binding<'a> {
         let mut name = name;
         for _ in 0..self.aliases.len() {
-            match self.aliases.get(name) {
-                Some(original) => name = original,
+            match self.aliases.get(&name) {
+                Some(&original) => name = original,
                 None => break,
             }
         }
-        name.to_owned()
+        name
     }
 
     /// Records the value stored by assigning `value` to `holder`.
-    fn bind(&mut self, holder: Holder, value: &Expr) {
-        *self.assigned.entry(holder.clone()).or_default() += 1;
+    fn bind(&mut self, holder: Holder<'a>, value: &'a Expression<'a>) {
+        *self.assigned.entry(holder).or_default() += 1;
         // Chained assignments store the innermost value in each target.
-        let mut value = value.unwrap_parens();
-        while let Expr::Assign(inner) = value
-            && inner.op == AssignOp::Assign
+        let mut value = value.without_parentheses();
+        while let Expression::AssignmentExpression(inner) = value
+            && inner.operator == AssignmentOperator::Assign
         {
-            value = inner.right.unwrap_parens();
+            value = inner.right.without_parentheses();
         }
-        let forwarder = match value {
-            Expr::Member(member) if let Some(forwarder) = self.member_forwarder(member) => {
+        let forwarder = match member(value) {
+            Some(member) if let Some(forwarder) = self.member_forwarder(member) => {
                 Some(forwarder.plain.clone())
             }
-            value => self.held_by(value).cloned(),
+            _ => self.held_by(Operand::Expression(value)).cloned(),
         };
         if let Some(frames) = forwarder {
             self.forwarders.held.insert(holder, frames);
             return;
         }
         match (holder, value) {
-            (Holder::Name(name), Expr::Ident(original)) => {
-                self.aliases.insert(name, original.to_id());
+            (Holder::Name(name), Expression::Identifier(original)) => {
+                self.aliases.insert(name, self.js().binding(original));
             }
-            (holder, Expr::Object(object)) => self.literal(&holder, object),
+            (holder, Expression::ObjectExpression(object)) => self.literal(holder, object),
             (Holder::Name(name), value) => {
                 if let Some(text) = ast::static_str(value) {
-                    self.strings.insert(name, text.to_owned());
+                    self.strings.insert(name, text);
                 }
             }
             _ => {}
@@ -1627,26 +1985,20 @@ impl<'script> Scope<'script> {
 
     /// Records forwarders defined by an object literal assigned to `holder`. Uses property keys as
     /// function names, including computed keys.
-    fn literal(&mut self, holder: &Holder, object: &ObjectLit) {
-        for property in &object.props {
-            let (key, function) = match property.as_prop().map(|property| &**property) {
-                Some(Prop::KeyValue(property)) if let Expr::Fn(function) = &*property.value => {
-                    (&property.key, &*function.function)
-                }
-                Some(Prop::Method(method)) => (&method.key, &*method.function),
-                _ => continue,
-            };
-            let Some(key) = ast::static_key_str(key) else {
-                continue;
-            };
-            if let Some(frames) = self.forwarder(function, Name::same(key.to_owned())) {
+    fn literal(&mut self, holder: Holder<'a>, object: &'a ObjectExpression<'a>) {
+        // Matches `key: function` properties and methods, but not accessors.
+        for property in &object.properties {
+            if let ObjectPropertyKind::ObjectProperty(property) = property
+                && let Expression::FunctionExpression(function) = &property.value
+                && property.kind == PropertyKind::Init
+                && let Some(key) = ast::static_key_str(&property.key, property.computed)
+                && let Some(frames) = self.forwarder(function, Name::same(key.to_owned()))
+            {
                 let forwarder = Forwarder {
                     method: frames.clone(),
                     plain: frames,
                 };
-                self.forwarders
-                    .on_objects
-                    .insert((holder.clone(), key.to_owned()), forwarder);
+                self.forwarders.on_objects.insert((holder, key), forwarder);
             }
         }
     }
@@ -1655,168 +2007,168 @@ impl<'script> Scope<'script> {
     /// later parameters. Accepts direct calls, array copies such as `(g = [f, b], (0, g[0])(a,
     /// g[1]))`, and call helpers. Extra parameters can act as locals. Allows local declarations
     /// before the call.
-    fn forwarder(&self, function: &Function, frame: Name) -> Option<Vec<Call>> {
-        let parameters = parameters(function)?;
+    fn forwarder(&self, function: &'a Function<'a>, frame: Name) -> Option<Vec<Call>> {
+        let constants = &self.appliers.constants;
+        let function = Body::of(function);
+        let parameters = function.parameters()?;
         let (first, rest) = parameters.split_first()?;
-        let mut arrays = Copies::new(&self.appliers.constants);
-        let [Stmt::Return(returned)] = after_declarations(&function.body.as_ref()?.stmts) else {
+        let first = Binding::Symbol(*first);
+        let mut arrays = Copies::new(constants);
+        let Statement::ReturnStatement(returned) = function.only_statement()? else {
             return None;
         };
-        let mut value = returned.arg.as_deref()?.unwrap_parens();
-        if let Expr::Seq(sequence) = value {
-            let (last, before) = sequence.exprs.split_last()?;
+        let mut value = returned.argument.as_ref()?.without_parentheses();
+        if let Expression::SequenceExpression(sequence) = value {
+            let (last, before) = sequence.expressions.split_last()?;
             for expression in before {
                 // Obfuscation leaves expressions that do nothing.
-                if arrays.record(expression).is_none()
-                    && !is_inert(expression, &self.appliers.constants)
-                {
+                if arrays.record(expression).is_none() && !is_inert(expression, constants) {
                     return None;
                 }
             }
-            value = last.unwrap_parens();
+            value = last.without_parentheses();
         }
         // Forwarded arguments must match the parameters after the target function.
-        let passes_on = |arguments: &[&Expr]| {
+        let passes_on = |arguments: &[Operand<'a>]| {
             arguments.len() <= rest.len()
                 && arguments.iter().zip(rest).all(|(argument, parameter)| {
-                    arrays.resolve(argument).as_ref() == Some(parameter)
+                    arrays.resolve_operand(*argument) == Some(Binding::Symbol(*parameter))
                 })
         };
-        let call = value.as_call()?;
-        let (callee, _) = undetached(call.callee.as_expr()?, &self.appliers.constants);
-        if call.args.iter().any(|argument| argument.spread.is_some()) {
+        let Expression::CallExpression(call) = value else {
             return None;
-        }
-        let arguments: Vec<&Expr> = call.args.iter().map(|argument| &*argument.expr).collect();
-        if arrays.resolve(callee).as_ref() == Some(first) && passes_on(&arguments) {
+        };
+        let (callee, _) = undetached(&call.callee, constants);
+        // A spread has no expression, so it rejects the call.
+        let arguments: Vec<Operand<'a>> = call
+            .arguments
+            .iter()
+            .map(|argument| argument.as_expression().map(Operand::Expression))
+            .collect::<Option<_>>()?;
+        if arrays.resolve(callee) == Some(first) && passes_on(&arguments) {
             return Some(vec![Call {
                 name: frame,
                 site: Site::new(call),
             }]);
         }
         // Resolve copied names passed through a call helper.
-        let mut call = call.clone();
-        for argument in &mut call.args {
-            let copied = match argument.expr.unwrap_parens() {
-                Expr::Array(list) => {
-                    let mut list = list.clone();
-                    for element in list.elems.iter_mut().flatten() {
-                        if let Some(name) = arrays.resolve(&element.expr) {
-                            *element.expr =
-                                Expr::Ident(Ident::new(name.0, element.expr.span(), name.1));
-                        }
-                    }
-                    Expr::Array(list)
-                }
-                expression => match arrays.resolve(expression) {
-                    Some(name) => Expr::Ident(Ident::new(name.0, expression.span(), name.1)),
-                    None => continue,
-                },
-            };
-            *argument.expr = copied;
-        }
-        let target = self.target(&call).ok()?;
+        let target = self.resolve(call, Some(&arrays)).ok()?;
+        let copied = Arguments {
+            list: &call.arguments,
+            copies: Some(&arrays),
+        };
         (!target.helpers.is_empty()
-            && target.callee.as_ref() == Some(first)
-            && passes_on(&handed(&call, &target)?))
+            && target.callee == Some(Callee::Binding(first))
+            && passes_on(&handed(copied, &target)?))
         .then(|| target.frames(frame))
     }
 }
 
 /// Whether `expression` has no effect, such as obfuscation's `true`, constant comparisons and
-/// Matches `void` expressions, including those using numeric `constants`.
-fn is_inert(expression: &Expr, constants: &HashMap<Id, f64>) -> bool {
-    let inert = |expression: &Expr| is_inert(expression, constants);
-    match expression.unwrap_parens() {
-        Expr::Lit(_) => true,
-        Expr::Ident(name) => constants.contains_key(&name.to_id()),
-        Expr::Bin(binary) => inert(&binary.left) && inert(&binary.right),
-        Expr::Unary(unary) => unary.op != UnaryOp::Delete && inert(&unary.arg),
-        Expr::Array(array) => array
-            .elems
+/// `void` expressions, including those using numeric `constants`.
+fn is_inert<'a>(expression: &Expression<'a>, constants: &Constants<'a>) -> bool {
+    let inert = |expression: &Expression<'a>| is_inert(expression, constants);
+    match expression.without_parentheses() {
+        expression if expression.is_literal() => true,
+        Expression::Identifier(name) => constants
+            .js
+            .symbol(name)
+            .is_some_and(|symbol| constants.values.contains_key(&symbol)),
+        Expression::BinaryExpression(binary) => inert(&binary.left) && inert(&binary.right),
+        Expression::LogicalExpression(logical) => inert(&logical.left) && inert(&logical.right),
+        Expression::UnaryExpression(unary) => {
+            unary.operator != UnaryOperator::Delete && inert(&unary.argument)
+        }
+        Expression::ArrayExpression(array) => array
+            .elements
             .iter()
-            .all(|element| element.as_ref().is_none_or(|element| inert(&element.expr))),
+            .all(|element| element_expression(element).is_none_or(inert)),
         _ => false,
     }
 }
 
 /// Resolves the function produced by `callee` and checks whether a side-effect-free first operand
 /// detaches its receiver. For example, `(0, f)(a)` calls `f` without a receiver.
-fn undetached<'expression>(
-    callee: &'expression Expr,
-    constants: &HashMap<Id, f64>,
-) -> (&'expression Expr, bool) {
-    let callee = callee.unwrap_parens();
-    if let Expr::Seq(sequence) = callee
-        && let [discarded, last] = &sequence.exprs[..]
+fn undetached<'b, 'a>(
+    callee: &'b Expression<'a>,
+    constants: &Constants<'a>,
+) -> (&'b Expression<'a>, bool) {
+    let callee = callee.without_parentheses();
+    if let Expression::SequenceExpression(sequence) = callee
+        && let [discarded, last] = &sequence.expressions[..]
         && is_inert(discarded, constants)
     {
-        return (last.unwrap_parens(), true);
+        return (last.without_parentheses(), true);
     }
     (callee, false)
 }
 
-impl Visit for Scope<'_> {
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_class(&mut self, _: &Class) {}
+impl<'a> Visit<'a> for Scope<'a, '_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        walk_property(self, property);
+    }
 
-    fn visit_assign_expr(&mut self, assign: &AssignExpr) {
-        if assign.op == AssignOp::Assign {
-            match &assign.left {
-                AssignTarget::Simple(SimpleAssignTarget::Ident(name)) => {
-                    self.bind(Holder::Name(name.to_id()), &assign.right);
-                }
-                AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
-                    if let Some(slot) = self.slot(member) {
-                        self.bind(slot, &assign.right);
-                    } else if let Expr::Fn(function) = &*assign.right
-                        && let Some(object) = self.holder(&member.obj)
-                        && let Some(path) = inferred_path(&member.obj)
-                        && let Some(name) = ast::member_str(&member.prop)
-                    {
-                        // V8 infers the name of an anonymous function from the member it is
-                        // assigned to.
-                        let path = format!("{}{path}", self.prefix);
-                        let (inferred, method) = if member.prop.is_computed() {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        let assignment = self
+            .js()
+            .lend(assignment, AstKind::as_assignment_expression);
+        if assignment.operator == AssignmentOperator::Assign {
+            if let AssignmentTarget::AssignmentTargetIdentifier(name) = &assignment.left {
+                self.bind(Holder::Name(self.js().binding(name)), &assignment.right);
+            } else if let Some(member) = assigned_member(&assignment.left) {
+                if let Some(slot) = self.slot(member) {
+                    self.bind(slot, &assignment.right);
+                } else if let Expression::FunctionExpression(function) = &assignment.right
+                    && let Some(object) = self.holder(Operand::Expression(member.object()))
+                    && let Some(path) = inferred_path(member.object())
+                    && let Some(name) = ast::member_str(member)
+                {
+                    // V8 infers the name of an anonymous function from the member it is
+                    // assigned to.
+                    let path = format!("{}{path}", self.prefix);
+                    let (inferred, method) =
+                        if matches!(member, MemberExpression::ComputedMemberExpression(_)) {
                             let inferred = format!("{path}.<computed>");
                             (inferred.clone(), format!("{inferred} [as {name}]"))
                         } else {
                             let inferred = format!("{path}.{name}");
                             (inferred.clone(), inferred)
                         };
-                        let frames = |name: String| {
-                            self.forwarder(&function.function, Name::anonymous(name))
-                        };
-                        if let (Some(method), Some(plain)) = (frames(method), frames(inferred)) {
-                            self.forwarders
-                                .on_objects
-                                .insert((object, name.to_owned()), Forwarder { method, plain });
-                        }
+                    let frames = |name: String| self.forwarder(function, Name::anonymous(name));
+                    if let (Some(method), Some(plain)) = (frames(method), frames(inferred)) {
+                        self.forwarders
+                            .on_objects
+                            .insert((object, name), Forwarder { method, plain });
                     }
                 }
-                _ => {}
             }
         }
-        assign.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Pat::Ident(name) = &declarator.name
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        let declarator = self.js().lend(declarator, AstKind::as_variable_declarator);
+        if let BindingPattern::BindingIdentifier(name) = &declarator.id
             && let Some(init) = &declarator.init
         {
-            self.bind(Holder::Name(name.to_id()), init);
+            self.bind(Holder::Name(Binding::Symbol(name.symbol_id())), init);
         }
-        declarator.visit_children_with(self);
+        walk::walk_variable_declarator(self, declarator);
     }
 }
 
 /// Returns the V8 name inferred from an assignment target: `object` for an object or
 /// `array.<computed>` for an array slot.
-fn inferred_path(object: &Expr) -> Option<String> {
-    match object.unwrap_parens() {
-        Expr::Ident(name) => Some(name.sym.to_string()),
-        Expr::Member(member) if member.prop.is_computed() => {
-            Some(format!("{}.<computed>", member.obj.as_ident()?.sym))
+fn inferred_path(object: &Expression<'_>) -> Option<String> {
+    match object.without_parentheses() {
+        Expression::Identifier(name) => Some(name.name.to_string()),
+        Expression::ComputedMemberExpression(member) => {
+            let Expression::Identifier(array) = &member.object else {
+                return None;
+            };
+            Some(format!("{}.<computed>", array.name))
         }
         _ => None,
     }
@@ -1825,23 +2177,26 @@ fn inferred_path(object: &Expr) -> Option<String> {
 /// Finds runner calls from closure-factory listeners, including calls made through helpers, and
 /// records calls it cannot resolve. Each listener forwards its captured machine and layout
 /// followed by its own arguments.
-struct Listeners<'script> {
-    runner: &'script Id,
-    appliers: &'script Appliers,
-    found: Vec<Result<Invocation>>,
+struct Listeners<'a, 's> {
+    runner: Callee<'a>,
+    appliers: &'s Appliers<'a>,
+    found: Vec<Result<Invocation<'a>>>,
 }
 
-impl Visit for Listeners<'_> {
-    fn visit_function(&mut self, function: &Function) {
-        let scope = Scope::new("", function, self.appliers);
-        for call in calls_of(function) {
-            match scope.target(&call) {
+impl<'a> Visit<'a> for Listeners<'a, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let js = self.appliers.js();
+        let function = js.lend(function, AstKind::as_function);
+        let body = Body::of(function);
+        let scope = Scope::new("", &body, self.appliers);
+        for call in calls_of(js, &body) {
+            match scope.target(call) {
                 // A listener passes the captured machine and layout, then its own
                 // parameters. Other scopes may reuse the runner's name for another function,
                 // and the message handler starts the runner with computed arguments.
                 Ok(mut target)
-                    if target.callee.as_ref() == Some(self.runner)
-                        && forwards_parameters(function, &call, &target) =>
+                    if target.callee == Some(self.runner)
+                        && forwards_parameters(&self.appliers.constants, &body, call, &target) =>
                 {
                     target.passed = target.passed.map(|passed| passed - 2);
                     self.found.push(Ok(target));
@@ -1850,13 +2205,40 @@ impl Visit for Listeners<'_> {
                 Err(error) => self.found.push(Err(error)),
             }
         }
-        function.visit_children_with(self);
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        walk_property(self, property);
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        walk_method(self, method);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decoded program captured during deobfuscation equals the one decoding alone
+    /// produces, for a saved script named by `CFSOLVE_CAPTURE_SCRIPT`.
+    #[test]
+    fn captures_the_decoded_program() {
+        let Some(path) = std::env::var_os("CFSOLVE_CAPTURE_SCRIPT") else {
+            return;
+        };
+        let source = std::fs::read_to_string(path).expect("the capture script is readable");
+        // The debug form includes spans and semantic IDs.
+        let debug = |decoded: &ParsedScript| format!("{:?}", decoded.script().program);
+        let (_, cases) = deobfuscate_with_cases(source.clone()).unwrap();
+        let captured = debug(&cases.decoded.unwrap());
+        let alone = debug(&deobfuscate::decode(source).unwrap());
+        assert!(
+            captured == alone,
+            "the captured program differs from the decoded one"
+        );
+    }
 
     #[test]
     fn appliers_may_copy_their_selector_and_name_apply_indirectly() {
@@ -1865,9 +2247,10 @@ mod tests {
             "function j(s,f,a,e,c,n){switch(e={},c=`apply`,n=[s],5^n[0]){case 6:return Reflect[c](f,void 0,a)}}",
             "var j;j=function(s,f,a){switch(5^s){case 6:return Reflect.apply(f,void 0,a)}}",
         ] {
-            let (script, _) = script(source);
-            let applier = &script.appliers.helpers[&binding(&script, "j")];
-            assert!(applier.call(3.0).is_some(), "{source}");
+            with_script(source, |script| {
+                let applier = &script.appliers.helpers[&binding(script, "j")];
+                assert!(applier.select(3.0).is_some(), "{source}");
+            });
         }
     }
 
@@ -1882,11 +2265,11 @@ mod tests {
             o['k']=function(a,b,c,d,g){return g=[b,d],true,a(g[0],c,g[1])},\
             o['s']=function(a,b,c,g){return g=[c,a,b],(0,g[1])(g[2],g[0])},\
             q=o,q['k'](B,f,r,q['s'](S,arguments,2))}";
-        let (script, _) = script(source);
-        let frames = script.method_forwarder(&binding(&script, "PA")).unwrap();
-        let names: Vec<&str> = frames.iter().map(|call| call.name.v8.as_str()).collect();
-        assert_eq!(names, ["PA.o.<computed> [as k]", "PA"]);
-        assert!(script.method_forwarder(&binding(&script, "S")).is_none());
+        with_script(source, |script| {
+            let frames = script.method_forwarder(binding(script, "PA")).unwrap();
+            assert_eq!(v8_names(&frames), ["PA.o.<computed> [as k]", "PA"]);
+            assert!(script.method_forwarder(binding(script, "S")).is_none());
+        });
     }
 
     /// Checks method forwarders that call a `Reflect.apply` alias kept in an array slot, directly
@@ -1898,107 +2281,108 @@ mod tests {
             function D(f,r,a){return(0,G[2])(f,r,[a])}\
             function H(f,r,a,b){return W(1,G[2],f,r,[a,b])}\
             function O(f,r,a){return(0,G[3])(f,r,[a])}";
-        let (script, _) = script(source);
-        let cases: [(&str, &[&str]); 2] = [("D", &["D"]), ("H", &["W", "H"])];
-        for (forwarder, expected) in cases {
-            let frames = script
-                .method_forwarder(&binding(&script, forwarder))
-                .expect("`G[2]` holds `Reflect.apply`, so the call is a method forwarder");
-            let names: Vec<&str> = frames.iter().map(|call| call.name.v8.as_str()).collect();
-            assert_eq!(names, expected, "frames of forwarder {forwarder}");
-        }
-        assert!(
-            script.method_forwarder(&binding(&script, "O")).is_none(),
-            "`G[3]` holds a plain function, not `Reflect.apply`"
-        );
+        with_script(source, |script| {
+            let cases: [(&str, &[&str]); 2] = [("D", &["D"]), ("H", &["W", "H"])];
+            for (forwarder, expected) in cases {
+                let frames = script
+                    .method_forwarder(binding(script, forwarder))
+                    .expect("`G[2]` holds `Reflect.apply`, so the call is a method forwarder");
+                assert_eq!(
+                    v8_names(&frames),
+                    expected,
+                    "frames of forwarder {forwarder}"
+                );
+            }
+            assert!(
+                script.method_forwarder(binding(script, "O")).is_none(),
+                "`G[3]` holds a plain function, not `Reflect.apply`"
+            );
+        });
     }
 
     #[test]
     fn same_named_functions_resolve_to_the_called_binding() {
-        let (script, _) = script(
-            "function outer(){function h(){wrong()} h()} function h(){right()} function caller(){h()}",
-        );
-        let target = first_target(&script, "caller");
-        let handler = script.function(target.callee.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            name(calls_of(handler)[0].callee.as_expr().unwrap())
-                .unwrap()
-                .0,
-            "right"
-        );
+        let source = "function outer(){function h(){wrong()} h()} function h(){right()} function caller(){h()}";
+        with_script(source, |script| {
+            let target = first_target(script, "caller");
+            let handler = script.function(target.callee.unwrap()).unwrap();
+            let call = calls_of(script.js(), &handler)[0];
+            let callee = Operand::Expression(&call.callee)
+                .callee(&script.appliers.constants)
+                .unwrap();
+            assert_eq!(script.appliers.name(callee), "right");
+        });
     }
 
     #[test]
     fn shadowed_appliers_and_runners_are_distinct_bindings() {
-        let (script, _) = script(
-            "function runner(){} function j(s,f,a){switch(5^s){case 6:return Reflect.apply(f,void 0,a)}} function outer(){function j(){} function runner(){} j(3,f,[]);return function(a){runner(vm,layout,a);j(3,f,[])}} function real(a){runner(vm,layout,a)}",
-        );
-        let runner = first_target(&script, "real").callee.unwrap();
-        let mut listeners = Listeners {
-            runner: &runner,
-            appliers: &script.appliers,
-            found: Vec::new(),
-        };
-        // Visit every collected body, including the anonymous listener inside outer.
-        for (_, function) in &script.functions {
-            function.visit_with(&mut listeners);
-        }
-        assert_eq!(listeners.found.len(), 1);
-        let target = first_target(&script, "outer");
-        assert!(target.helpers.is_empty());
-        assert_eq!(target.passed, Some(3));
-        let callee = target.callee.expect("the call has a named callee");
-        assert!(!script.appliers.helpers.contains_key(&callee));
+        let source = "function runner(){} function j(s,f,a){switch(5^s){case 6:return Reflect.apply(f,void 0,a)}} function outer(){function j(){} function runner(){} j(3,f,[]);return function(a){runner(vm,layout,a);j(3,f,[])}} function real(a){runner(vm,layout,a)}";
+        with_script(source, |script| {
+            let runner = first_target(script, "real").callee.unwrap();
+            let mut listeners = Listeners {
+                runner,
+                appliers: &script.appliers,
+                found: Vec::new(),
+            };
+            // Visit every collected function, including the anonymous listener inside outer.
+            for (_, function) in script.js().named_functions() {
+                listeners.visit_function(function, ScopeFlags::Function);
+            }
+            assert_eq!(listeners.found.len(), 1);
+            let target = first_target(script, "outer");
+            assert!(target.helpers.is_empty());
+            assert_eq!(target.passed, Some(3));
+            let callee = target.callee.expect("the call has a named callee");
+            assert!(!script.appliers.helpers.contains_key(&callee));
+        });
     }
 
     #[test]
     fn native_apply_alias_does_not_match_a_shadowed_function() {
-        let (script, _) = script(
-            "var B=Reflect.apply; function outer(){function B(){} function wrong(f,r){return B(f,r,[])}} function good(f,r){return B(f,r,[])}",
-        );
-        assert!(
-            script
-                .method_forwarder(&binding(&script, "wrong"))
-                .is_none()
-        );
-        assert!(script.method_forwarder(&binding(&script, "good")).is_some());
+        let source = "var B=Reflect.apply; function outer(){function B(){} function wrong(f,r){return B(f,r,[])}} function good(f,r){return B(f,r,[])}";
+        with_script(source, |script| {
+            assert!(script.method_forwarder(binding(script, "wrong")).is_none());
+            assert!(script.method_forwarder(binding(script, "good")).is_some());
+        });
     }
 
     #[test]
     fn block_locals_do_not_replace_an_outer_objects_forwarder() {
-        let (script, _) = script(
-            "function F(){let o={},q=o,c='k';o.k=function(f,a){return f(a)};{let o={},q=o,c='other';o.k=function(f,a){return 0};}return q[c](target,1)}",
-        );
-        let target = first_target(&script, "F");
-        assert_eq!(target.callee.as_ref().unwrap().0, "target");
-        assert_eq!(target.helpers.len(), 1);
-        assert_eq!(target.helpers[0].name.v8, "F.o.k");
+        let source = "function F(){let o={},q=o,c='k';o.k=function(f,a){return f(a)};{let o={},q=o,c='other';o.k=function(f,a){return 0};}return q[c](target,1)}";
+        with_script(source, |script| {
+            let target = first_target(script, "F");
+            assert_eq!(script.appliers.name(target.callee.unwrap()), "target");
+            assert_eq!(target.helpers.len(), 1);
+            assert_eq!(target.helpers[0].name.v8, "F.o.k");
+        });
     }
 
-    /// Analyzes `source` and returns the script's starting position.
-    fn script(source: &str) -> (Script, BytePos) {
-        deobfuscate::read_decoded(source.to_owned(), |program, start| {
-            Ok((Script::new(program), start))
-        })
-        .unwrap()
+    /// Decodes `source` and analyzes it.
+    fn with_script<T>(source: &str, read: impl for<'a> FnOnce(&Script<'a>) -> T) -> T {
+        let decoded = deobfuscate::decode(source.to_owned()).unwrap();
+        read(&Script::new(decoded.script()))
     }
 
-    fn binding(script: &Script, name: &str) -> Id {
-        script
+    /// The binding of the script function named `name`.
+    fn binding<'a>(script: &Script<'a>, name: &str) -> Callee<'a> {
+        let (binding, _) = script
             .functions
             .iter()
-            .find(|(id, _)| id.0 == name)
-            .unwrap()
-            .0
-            .clone()
+            .find(|(binding, _)| script.js().name(*binding) == name)
+            .unwrap();
+        Callee::Binding(*binding)
+    }
+
+    fn v8_names(calls: &[Call]) -> Vec<&str> {
+        calls.iter().map(|call| call.name.v8.as_str()).collect()
     }
 
     /// Returns the target of the first call in the script function named `name`.
-    fn first_target(script: &Script, name: &str) -> Invocation {
-        let function = script.function(&binding(script, name)).unwrap();
-        let call = calls_of(function).remove(0);
-        Scope::new(name, function, &script.appliers)
-            .target(&call)
+    fn first_target<'a>(script: &Script<'a>, name: &str) -> Invocation<'a> {
+        let function = script.function(binding(script, name)).unwrap();
+        let call = calls_of(script.js(), &function)[0];
+        Scope::new(name, &function, &script.appliers)
+            .target(call)
             .unwrap()
     }
 
@@ -2010,20 +2394,21 @@ mod tests {
             function e(s,t,f,a){switch(s^C){case 1:{var y;switch(y=[a],5^t){case 6:return f(y[0])}}return;case 2:{h(a)}return}}\
             function caller(x){return e(6,3,g,x)}\
             function other(x){e(5,x)}";
-        let (script, _) = script(source);
-        let target = first_target(&script, "caller");
-        assert_eq!(target.callee.as_ref().unwrap().0, "g");
-        let helpers: Vec<&str> = target
-            .helpers
-            .iter()
-            .map(|call| call.name.v8.as_str())
-            .collect();
-        assert_eq!(helpers, ["e"]);
-        assert_eq!(target.passed, Some(1));
-        let original = first_target(&script, "other").callee.unwrap();
-        assert_eq!(original.0, "e");
-        let calls = calls_of(script.function(&original).unwrap());
-        assert_eq!(name(calls[0].callee.as_expr().unwrap()).unwrap().0, "h");
+        with_script(source, |script| {
+            let target = first_target(script, "caller");
+            assert_eq!(script.appliers.name(target.callee.unwrap()), "g");
+            assert_eq!(v8_names(&target.helpers), ["e"]);
+            assert_eq!(target.passed, Some(1));
+            let original = first_target(script, "other").callee.unwrap();
+            assert!(matches!(original, Callee::Original(_)));
+            assert_eq!(script.appliers.name(original), "e");
+            let function = script.function(original).unwrap();
+            let call = calls_of(script.js(), &function)[0];
+            let callee = Operand::Expression(&call.callee)
+                .callee(&script.appliers.constants)
+                .unwrap();
+            assert_eq!(script.appliers.name(callee), "h");
+        });
     }
 
     /// V8 names a forwarder copied to a binding after its assignment target, without the property
@@ -2035,31 +2420,35 @@ mod tests {
             function a(s,f,x,y,z){switch(s^5){case 6:return f(x,y,z)}}\
             function direct(m){return q(loop,m,1)}\
             function applied(m){return a(3,q,loop,m,1)}";
-        let (script, _) = script(source);
-        for (caller, expected) in [
-            ("direct", &["o.<computed>"][..]),
-            ("applied", &["o.<computed>", "a"]),
-        ] {
-            let target = first_target(&script, caller);
-            assert_eq!(target.callee.as_ref().unwrap().0, "loop", "{caller}");
-            let helpers: Vec<&str> = target
-                .helpers
-                .iter()
-                .map(|call| call.name.v8.as_str())
-                .collect();
-            assert_eq!(helpers, expected, "{caller}");
-            assert_eq!(target.passed, Some(2), "{caller}");
-        }
+        with_script(source, |script| {
+            for (caller, expected) in [
+                ("direct", &["o.<computed>"][..]),
+                ("applied", &["o.<computed>", "a"]),
+            ] {
+                let target = first_target(script, caller);
+                assert_eq!(
+                    script.appliers.name(target.callee.unwrap()),
+                    "loop",
+                    "{caller}"
+                );
+                assert_eq!(v8_names(&target.helpers), expected, "{caller}");
+                assert_eq!(target.passed, Some(2), "{caller}");
+            }
+        });
     }
 
     #[test]
     fn a_call_key_kept_in_a_local_still_calls_the_handler() {
         let source = "function run(){var c='call';switch(o){case 1:h[c](this);break}}";
-        let (script, _) = script(source);
-        let target = first_target(&script, "run");
-        assert_eq!(target.callee.as_ref().map(|id| id.0.as_ref()), Some("h"));
-        assert!(target.method);
-        assert_eq!(target.passed, Some(0));
+        with_script(source, |script| {
+            let target = first_target(script, "run");
+            assert_eq!(
+                target.callee.map(|callee| script.appliers.name(callee)),
+                Some("h")
+            );
+            assert!(target.method);
+            assert_eq!(target.passed, Some(0));
+        });
     }
 
     #[test]
@@ -2098,18 +2487,19 @@ mod tests {
     #[test]
     fn jsc_frames_are_placed_at_their_arguments() {
         let source = "function a(s,f,l){switch(1^s){case 0:return Reflect.construct(f,void 0,l);case 3:return Reflect.apply(f,void 0,l)}}function h(){return a(1,Error,[])}";
-        let (script, start) = script(source);
-        let target = first_target(&script, "h");
-        let frames = target.frames(Name::same("h".to_owned()));
-        let names: Vec<_> = frames
-            .iter()
-            .map(|call| (call.name.v8.as_str(), call.name.jsc.as_str()))
-            .collect();
-        assert_eq!(names, [("a", "a"), ("h", "h")]);
-        let at = |position: BytePos| &source[(position.0 - start.0) as usize..][..2];
-        let (applier, handler) = (&frames[0], &frames[1]);
-        assert_eq!(at(handler.site.v8), "a(");
-        assert_eq!(at(handler.site.jsc), "(1");
-        assert_eq!(at(applier.site.jsc), "(f");
+        with_script(source, |script| {
+            let target = first_target(script, "h");
+            let frames = target.frames(Name::same("h".to_owned()));
+            let names: Vec<_> = frames
+                .iter()
+                .map(|call| (call.name.v8.as_str(), call.name.jsc.as_str()))
+                .collect();
+            assert_eq!(names, [("a", "a"), ("h", "h")]);
+            let at = |position: u32| &source[position as usize..][..2];
+            let (applier, handler) = (&frames[0], &frames[1]);
+            assert_eq!(at(handler.site.v8), "a(");
+            assert_eq!(at(handler.site.jsc), "(1");
+            assert_eq!(at(applier.site.jsc), "(f");
+        });
     }
 }

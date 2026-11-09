@@ -6,6 +6,10 @@ license = "MIT"
 default-run = "cfsolve"
 autotests = false
 
+[[example]]
+name = "solver_profile"
+required-features = ["internals"]
+
 # Without default features, the library is the solver alone: `Browser`, `Options`, `Outcome`
 # and `Error`. The tools in this repository use the rest.
 [features]
@@ -34,6 +38,10 @@ html5ever = "0.39.0"
 indexmap = { version = "2", features = ["serde"] }
 iana-time-zone = "0.1.64"
 num-bigint = "0.4.6"
+# Deobfuscation, extraction, and the VM use Oxc's arena AST, semantic symbols, visitors, and
+# constant evaluator.
+oxc = { version = "0.157.0", features = ["ast_visit", "codegen", "semantic"] }
+oxc_ecmascript = { version = "0.157.0", features = ["constant_evaluation"] }
 # A returned program's payload can hold a capture of `RegExp(...).exec(...)`.
 regex = "1.12.2"
 ryu-js = "1.0.2"
@@ -45,12 +53,9 @@ scraper = { version = "0.27.0", features = ["deterministic"] }
 serde = { version = "1.0.228", features = ["derive"] }
 # Browser measurements must retain the exact doubles produced by JSON.parse.
 serde_json = { version = "1.0.151", features = ["float_roundtrip", "preserve_order"] }
+# Parsed scripts own the arena their Oxc tree borrows.
+self_cell = "1.2.0"
 sha2 = "0.10.9"
-# No default features: the linter and TypeScript declaration emit are unused.
-swc = { version = "52.0.0", default-features = false }
-swc_core = { version = "54.0.0", features = ["common", "ecma_ast", "ecma_visit", "ecma_codegen", "ecma_parser"] }
-swc_ecma_transforms = "44.0.0"
-swc_ecma_utils = "25.0.0"
 tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync", "time", "io-util", "signal"] }
 url = "2.5.8"
 # `Url` leaves an upstream proxy's credentials percent-encoded.
@@ -89,10 +94,16 @@ btls-sys = { path = "vendor/btls-sys" }
 wreq = { path = "vendor/wreq" }
 http2 = { path = "vendor/http2" }
 
-# Full debug info for swc dominates link time and target/ size. Line tables
+# Full dependency debug info dominates link time and target/ size. Line tables
 # keep file:line in this crate's backtraces; dependencies get none.
 [profile.dev]
 debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+
+# The interpreter and deobfuscator are split across many modules; one codegen unit lets LLVM
+# inline across them. Dependencies keep their default settings and cached artifacts.
+[profile.release.package.cfsolve]
+codegen-units = 1

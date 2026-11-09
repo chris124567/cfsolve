@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use cfsolve::fingerprint::Transport;
-use cfsolve::http::navigate;
+use cfsolve::http;
 use url::Url;
 
 #[tokio::main]
@@ -18,9 +18,9 @@ async fn main() -> Result<()> {
     let url = args
         .next()
         .unwrap_or_else(|| "https://tls.peet.ws/api/all".to_owned());
-    let browser = Transport::read(Path::new(&path))?.client(None)?;
+    let browser = Transport::read(Path::new(&path))?.client(None, None)?;
     // Opened the way the solver opens an embedding page.
-    let document = navigate(&browser, &Url::parse(&url)?).await?;
+    let document = http::navigate(&browser, &Url::parse(&url)?).await?;
     print!("{}", document.html);
     Ok(())
 }

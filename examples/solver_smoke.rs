@@ -5,10 +5,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use cfsolve::fingerprint::Transport;
 use cfsolve::{
-    Browser, Error, FetchedPage, Options, Outcome, PageSource, Sink, Turnstile, Url, Widget,
+    Browser, Clearance, Error, FetchedPage, Options, Outcome, PageSource, Sink, Turnstile, Url,
+    Widget,
 };
 
 const PROFILE: &str = "profiles/safari-26-ios.json";
@@ -38,7 +39,7 @@ async fn main() -> Result<()> {
     let under_attack: Url = UNDER_ATTACK.parse()?;
 
     // The managed page's HTML and sitekey, loaded as the profile's browser.
-    let client = Transport::read(Path::new(PROFILE))?.client(None)?;
+    let client = Transport::read(Path::new(PROFILE))?.client(None, None)?;
     let html = cfsolve::http::navigate(&client, &managed).await?.html;
     let sitekey = html
         .split("data-sitekey=\"")
@@ -127,7 +128,7 @@ async fn main() -> Result<()> {
         "solve(managed)",
         match browser.solve(&managed, &options).await {
             Ok(Outcome::Token(token)) => Ok(format!("token of {} bytes", token.len())),
-            Ok(Outcome::Cleared(_)) => Err(anyhow::anyhow!("cleared instead of a token")),
+            Ok(Outcome::Cleared(_)) => Err(anyhow!("cleared instead of a token")),
             Err(error) => Err(error.into()),
         },
     );
@@ -135,15 +136,15 @@ async fn main() -> Result<()> {
         "solve(under-attack)",
         match browser.solve(&under_attack, &options).await {
             Ok(Outcome::Cleared(cleared)) => Ok(format!("cf_clearance={}", cleared.clearance)),
-            Ok(Outcome::Token(_)) => Err(anyhow::anyhow!("a token instead of a clearance")),
+            Ok(Outcome::Token(_)) => Err(anyhow!("a token instead of a clearance")),
             Err(error) => Err(error.into()),
         },
     );
 
     let sink = Arc::new(IframeUrl::default());
     let recording = Options {
-        proxy: None,
         sink: Some(sink.clone()),
+        ..Options::default()
     };
     check(
         "send_first_payload(managed, widget)",
@@ -171,7 +172,7 @@ async fn main() -> Result<()> {
 
 /// Loads `url` the way a caller of `clear_fetched` would: as the profile's browser.
 async fn fetch(url: &Url) -> Result<FetchedPage> {
-    let client = Transport::read(Path::new(PROFILE))?.client(None)?;
+    let client = Transport::read(Path::new(PROFILE))?.client(None, None)?;
     let document = cfsolve::http::navigate(&client, url).await?;
     let set_cookies = client
         .cookies(&document.url)
@@ -193,7 +194,7 @@ fn token(result: Result<String, Error>) -> Result<String> {
     Ok(format!("token of {} bytes", token.len()))
 }
 
-fn clearance(result: Result<cfsolve::Clearance, Error>) -> Result<String> {
+fn clearance(result: Result<Clearance, Error>) -> Result<String> {
     let cleared = result?;
     ensure!(
         cleared

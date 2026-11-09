@@ -3,19 +3,32 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, ensure};
-use scraper::{Html, Selector};
-use swc_core::ecma::ast::{
-    AssignExpr, AssignOp, AssignTarget, BinExpr, BinaryOp, CallExpr, Callee, Expr, Function,
-    IfStmt, Lit, ObjectLit, SimpleAssignTarget, UnaryExpr, UnaryOp,
+use oxc::ast::ast::{
+    Argument, AssignmentExpression, BinaryExpression, CallExpression, Expression, Function,
+    IfStatement, ObjectExpression, UnaryExpression,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::ScopeFlags;
+use oxc::syntax::operator::{AssignmentOperator, LogicalOperator, UnaryOperator};
+use scraper::{Html, Selector};
 use url::Url;
 
 use crate::candidates;
 use crate::challenge::expression;
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{self, Script};
 use crate::js::{JsValue, Options};
 use crate::script::Source;
+
+/// Whether `text` is a randomized name in the form newer builds use: `_` and 24 lowercase hex
+/// digits, such as `_2b78d2cde0fa83bfaec4edae`.
+pub(crate) fn is_hex_name(text: &str) -> bool {
+    text.strip_prefix('_').is_some_and(|hex| {
+        hex.len() == 24
+            && hex
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
 
 /// Minimum property count distinguishing a payload template from an ordinary options object.
 const PAYLOAD_FIELDS: usize = 20;
@@ -45,18 +58,19 @@ impl InitialRequest {
 
     #[cfg(test)]
     pub(crate) fn from_javascript(source: &str, iframe_url: &Url) -> Result<Self> {
-        Self::from_parsed(&ast::parse_iframe_javascript(source)?, iframe_url)
+        Self::from_script(ast::ParsedScript::parse("t", source)?.script(), iframe_url)
     }
 
-    pub(crate) fn from_parsed(parsed: &ParsedScript, iframe_url: &Url) -> Result<Self> {
-        let options = bootstrap_options(parsed);
+    pub(crate) fn from_script(script: Script<'_>, iframe_url: &Url) -> Result<Self> {
+        let options = bootstrap_options(script);
         ensure!(!options.is_empty(), "missing _cf_chl_opt object");
         let mut request = Request {
+            script,
             options: &options,
             paths: BTreeSet::new(),
             tokens: BTreeSet::new(),
         };
-        parsed.script.visit_with(&mut request);
+        request.visit_program(script.program);
         let token = candidates::exactly_one(request.tokens, "cf-chl token")?;
         let path = candidates::exactly_one(
             request
@@ -96,12 +110,15 @@ pub fn ray(url: &Url) -> Result<&str> {
 /// Reads bootstrap `_cf_chl_opt` values and later static assignments. Returns an empty map if
 /// the script installs no options.
 #[must_use]
-pub(crate) fn bootstrap_options(parsed: &ParsedScript) -> Options {
-    let mut options = StaticOptions::default();
-    parsed.script.visit_with(&mut options);
+pub(crate) fn bootstrap_options(script: Script<'_>) -> Options {
+    let mut assigned = StaticOptions {
+        script,
+        options: Options::new(),
+    };
+    assigned.visit_program(script.program);
     let mut renames = Renames::default();
-    parsed.script.visit_with(&mut renames);
-    let StaticOptions(mut options) = options;
+    renames.visit_program(script.program);
+    let mut options = assigned.options;
     for (to, from) in renames.copies {
         if renames.deleted.contains(&from)
             && !options.contains_key(&to)
@@ -130,51 +147,53 @@ pub(crate) fn mode(options: &Options) -> Option<&str> {
 pub(crate) fn expected_build(source: &Source) -> Option<String> {
     #[derive(Default)]
     struct Builds(Vec<String>);
-    impl Visit for Builds {
-        fn visit_bin_expr(&mut self, binary: &BinExpr) {
+    impl<'a> Visit<'a> for Builds {
+        fn visit_binary_expression(&mut self, binary: &BinaryExpression<'a>) {
             if let Some(build) = expression::padded_build(binary).filter(|build| build.len() == 12)
             {
                 self.0.push(build);
             }
-            binary.visit_children_with(self);
+            walk::walk_binary_expression(self, binary);
         }
     }
     let mut builds = Builds::default();
-    source.parsed().script.visit_with(&mut builds);
+    builds.visit_program(source.script().program);
     candidates::at_most_one_distinct(builds.0, "loader build").ok()?
 }
 
 /// Identifies a payload template by its size and a field that reads the initial challenge type
 /// option.
 #[must_use]
-pub(crate) fn is_payload_template(object: &ObjectLit, options: &Options) -> bool {
+pub(crate) fn is_payload_template(object: &ObjectExpression<'_>, options: &Options) -> bool {
     let challenge = |value: &str| value.starts_with(INITIAL_CHALLENGE);
     let in_iframe = options
         .values()
         .any(|value| value.as_str().is_some_and(challenge));
     // The string values of the options the fields read.
     let mut read = ast::key_values(object).filter_map(|property| {
-        let member = property.value.as_member()?;
-        options.get(ast::member_str(&member.prop)?)?.as_str()
+        let member = property.value.as_member_expression()?;
+        options.get(ast::member_str(member)?)?.as_str()
     });
-    object.props.len() > PAYLOAD_FIELDS
+    object.properties.len() > PAYLOAD_FIELDS
         && read.any(|value| challenge(value) || !in_iframe && PAGE_CHALLENGES.contains(&value))
 }
 
 /// Visits branches using known option values. For a condition guarded by an unset option,
 /// visits only `else`; otherwise visits both branches. This skips an unused second payload
 /// template in page orchestrators.
-pub(crate) fn visit_taken_branches<V: Visit>(
+pub(crate) fn visit_taken_branches<'a, V: Visit<'a>>(
     visitor: &mut V,
-    conditional: &IfStmt,
+    conditional: &IfStatement<'a>,
     options: &Options,
 ) {
-    if expression::option_key(conditional.test.unwrap_parens())
+    if expression::option_key(conditional.test.without_parentheses())
         .is_some_and(|option| !options.contains_key(option))
     {
-        conditional.alt.visit_with(visitor);
+        if let Some(alternate) = &conditional.alternate {
+            visitor.visit_statement(alternate);
+        }
     } else {
-        conditional.visit_children_with(visitor);
+        walk::walk_if_statement(visitor, conditional);
     }
 }
 
@@ -188,107 +207,112 @@ struct Renames {
     deleted: Vec<String>,
 }
 
-impl Visit for Renames {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        let source = match assignment.right.unwrap_parens() {
-            Expr::Bin(BinExpr {
-                op: BinaryOp::LogicalOr,
-                right,
-                ..
-            }) => right.unwrap_parens(),
+impl<'a> Visit<'a> for Renames {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        let source = match assignment.right.without_parentheses() {
+            Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+                logical.right.without_parentheses()
+            }
             other => other,
         };
-        if assignment.op == AssignOp::Assign
+        if assignment.operator == AssignmentOperator::Assign
             && let Some(to) = expression::option_assignment(&assignment.left)
             && let Some(from) = expression::option_key(source)
         {
             self.copies.push((to.to_owned(), from.to_owned()));
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
-    fn visit_unary_expr(&mut self, unary: &UnaryExpr) {
-        if unary.op == UnaryOp::Delete
-            && let Some(option) = expression::option_key(unary.arg.unwrap_parens())
+    fn visit_unary_expression(&mut self, unary: &UnaryExpression<'a>) {
+        if unary.operator == UnaryOperator::Delete
+            && let Some(option) = expression::option_key(unary.argument.without_parentheses())
         {
             self.deleted.push(option.to_owned());
         }
-        unary.visit_children_with(self);
+        walk::walk_unary_expression(self, unary);
     }
 }
 
 /// The options the script assigns statically.
-#[derive(Default)]
-struct StaticOptions(Options);
+struct StaticOptions<'a> {
+    script: Script<'a>,
+    options: Options,
+}
 
-impl Visit for StaticOptions {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left {
-            if ast::member_str(&member.prop) == Some("_cf_chl_opt") {
+impl<'a> Visit<'a> for StaticOptions<'a> {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let Some(member) = assignment.left.as_member_expression() {
+            if ast::member_str(member) == Some("_cf_chl_opt") {
                 if let Some(JsValue::Object(options)) =
-                    expression::static_value(&assignment.right, &Options::new())
+                    expression::static_value(self.script, &assignment.right, &Options::new())
                 {
-                    self.0 = Options::from(options);
+                    self.options = Options::from(options);
                 }
-            } else if expression::is_options(&member.obj)
+            } else if expression::is_options(member.object())
                 && let (Some(key), Some(value)) = (
-                    ast::member_str(&member.prop),
-                    expression::static_value(&assignment.right, &self.0),
+                    ast::member_str(member),
+                    expression::static_value(self.script, &assignment.right, &self.options),
                 )
             {
-                self.0.insert(key.to_owned(), value);
+                self.options.insert(key.to_owned(), value);
             }
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
     // Only the bootstrap IIFE, entered below, runs now. Other functions mutate the options
     // later, and their writes must not overwrite the bootstrap values.
-    fn visit_function(&mut self, _: &Function) {}
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
 
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Fn(function) = callee.unwrap_parens()
-            && let Some(body) = &function.function.body
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Expression::FunctionExpression(function) = call.callee.without_parentheses()
+            && let Some(body) = &function.body
         {
-            body.visit_with(self);
+            self.visit_function_body(body);
         }
     }
 }
 
-struct Request<'options> {
+struct Request<'options, 'a> {
+    script: Script<'a>,
     options: &'options Options,
     paths: BTreeSet<String>,
     tokens: BTreeSet<String>,
 }
 
-impl Visit for Request<'_> {
-    fn visit_expr(&mut self, expression: &Expr) {
+impl<'a> Visit<'a> for Request<'_, 'a> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
         // Only inspect string concatenations, avoiding evaluation of complete
         // function bodies or the encoded VM program.
         if matches!(
             expression,
-            Expr::Bin(_) | Expr::Tpl(_) | Expr::Lit(Lit::Str(_))
-        ) && let Some(JsValue::String(path)) = expression::static_value(expression, self.options)
+            Expression::BinaryExpression(_)
+                | Expression::LogicalExpression(_)
+                | Expression::TemplateLiteral(_)
+                | Expression::StringLiteral(_)
+        ) && let Some(JsValue::String(path)) =
+            expression::static_value(self.script, expression, self.options)
             && is_post_path(&path)
         {
             self.paths.insert(path);
         }
-        expression.visit_children_with(self);
+        walk::walk_expression(self, expression);
     }
 
     /// Finds arguments to `<request>.setRequestHeader('cf-chl', <token>)`, even when the method
     /// name comes from a variable.
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let [header, value] = &call.args[..]
-            && expression::static_value(&header.expr, self.options)
-                == Some(JsValue::String("cf-chl".into()))
-            && let Some(JsValue::String(token)) =
-                expression::static_value(&value.expr, self.options)
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        let value = |argument: &Argument<'_>| {
+            expression::static_value(self.script, argument.as_expression()?, self.options)
+        };
+        if let [header, token] = &call.arguments[..]
+            && value(header) == Some(JsValue::String("cf-chl".into()))
+            && let Some(JsValue::String(token)) = value(token)
         {
             self.tokens.insert(token);
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
@@ -317,6 +341,35 @@ pub fn inline_javascript(html: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deobfuscate;
+
+    #[test]
+    fn extracts_requests_after_folding_parenthesized_helpers_and_cached_paths() {
+        let javascript = r#"window._cf_chl_opt = {variant:'g',ray:'ray-id',token:'session-token'};
+            (function(global) {
+                var prefix, path;
+                var options = function(value) { return value._cf_chl_opt; };
+                function send(xhr) {
+                    xhr.setRequestHeader('cf-chl', (27253 ^ (36202 ^ 59167), options)(global).token);
+                    xhr.open('POST', (prefix || (prefix = '/cdn-cgi/challenge-platform/h/'))
+                        + global._cf_chl_opt.variant + (path || (path = '/fo/build/'))
+                        + global._cf_chl_opt.ray + '/' + global._cf_chl_opt.token);
+                }
+                install(send);
+            })(window);"#;
+        let text = deobfuscate::deobfuscate(javascript.to_owned()).unwrap();
+        assert!(text.unconverged.is_none());
+        let request = InitialRequest::from_javascript(
+            &text.text,
+            &Url::parse("https://example.com/").unwrap(),
+        )
+        .unwrap_or_else(|error| panic!("{error:#}\n{}", text.text));
+        assert_eq!(request.cf_chl, "session-token");
+        assert_eq!(
+            request.url.path(),
+            "/cdn-cgi/challenge-platform/h/g/fo/build/ray-id/session-token"
+        );
+    }
 
     #[test]
     fn finds_session_parameters_with_different_randomized_names() {
@@ -355,28 +408,30 @@ mod tests {
             .map(|index| format!("f{index}: {index}, "))
             .collect();
         let template = format!("{{ {fields}kind: b._cf_chl_opt.mode }}");
-        let Expr::Object(template) = ast::parse_expression("t", &template).unwrap() else {
-            panic!("not an object");
-        };
-        // An iframe uses its `chl_api_` type. A page type is valid only for an orchestrator
-        // with no `chl_api_` option.
-        for (challenge, other, expected) in [
-            ("chl_api_m", "x", true),
-            ("chl_api_ni", "x", true),
-            ("managed", "chl_api_m", false),
-            ("managed", "x", true),
-            ("unknown", "x", false),
-        ] {
-            let options = Options::from_iter([
-                ("mode".to_owned(), JsValue::from(challenge)),
-                ("other".to_owned(), JsValue::from(other)),
-            ]);
-            assert_eq!(
-                is_payload_template(&template, &options),
-                expected,
-                "{challenge}"
-            );
-        }
+        ast::with_expression(&template, |_, template| {
+            let Expression::ObjectExpression(template) = template else {
+                panic!("not an object");
+            };
+            // An iframe uses its `chl_api_` type. A page type is valid only for an orchestrator
+            // with no `chl_api_` option.
+            for (challenge, other, expected) in [
+                ("chl_api_m", "x", true),
+                ("chl_api_ni", "x", true),
+                ("managed", "chl_api_m", false),
+                ("managed", "x", true),
+                ("unknown", "x", false),
+            ] {
+                let options = Options::from_iter([
+                    ("mode".to_owned(), JsValue::from(challenge)),
+                    ("other".to_owned(), JsValue::from(other)),
+                ]);
+                assert_eq!(
+                    is_payload_template(template, &options),
+                    expected,
+                    "{challenge}"
+                );
+            }
+        });
     }
 
     #[test]

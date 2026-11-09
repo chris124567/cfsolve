@@ -7,14 +7,18 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use swc_core::ecma::ast::{
-    AssignExpr, AssignTarget, BinaryOp, BlockStmt, CallExpr, Expr, FnDecl, Function, Lit,
-    MemberProp, SimpleAssignTarget, Stmt,
+use oxc::ast::AstKind;
+use oxc::ast::ast::{
+    AssignmentExpression, AssignmentTarget, CallExpression, Expression, Function, MethodDefinition,
+    ObjectProperty, Statement,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::syntax::operator::BinaryOperator;
+use oxc::syntax::scope::ScopeFlags;
 
+use super::syntax::{assigned_member, is_optional_call, member, walk_method, walk_property};
 use super::vocabulary;
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{self, Binding, Script};
 use crate::script::Source;
 use crate::{candidates, vm};
 
@@ -52,23 +56,36 @@ impl Trace {
     /// Recovers the iframe's trace if its helpers and entry sites are present and unambiguous.
     #[must_use]
     pub fn recover(source: &Source) -> Option<Self> {
-        Self::from_parsed(source.parsed())
-    }
-
-    fn from_parsed(parsed: &ParsedScript) -> Option<Self> {
+        let script = source.script();
         let mut structure = Structure {
-            runner: vm::runner_name(&parsed.script)?,
-            ..Structure::default()
+            script,
+            runner: vm::runner_name(script)?,
+            replacements: BTreeSet::new(),
+            pushes: BTreeSet::new(),
+            initializers: BTreeSet::new(),
+            returned: BTreeSet::new(),
+            roots: Vec::new(),
         };
-        parsed.script.visit_with(&mut structure);
+        for node in script.nodes.iter() {
+            match node.kind() {
+                AstKind::Function(function) if function.is_declaration() => {
+                    structure.declaration(function);
+                }
+                AstKind::AssignmentExpression(assignment) => structure.assignment(assignment),
+                AstKind::BlockStatement(block) => structure.block(&block.body),
+                AstKind::FunctionBody(body) => structure.block(&body.statements),
+                AstKind::StaticBlock(block) => structure.block(&block.body),
+                _ => {}
+            }
+        }
         let replacement =
             candidates::exactly_one(&structure.replacements, "trace replace helper").ok()?;
-        let root = |entries: &BTreeSet<String>, what: &str| {
+        let root = |entries: &BTreeSet<Binding>, what: &str| {
             let frames: BTreeSet<&str> = structure
                 .roots
                 .iter()
                 .filter(|root| root.helper == replacement.helper && entries.contains(&root.entry))
-                .map(|root| root.frame.as_str())
+                .map(|root| root.frame)
                 .collect();
             candidates::exactly_one(frames, what)
                 .ok()
@@ -81,11 +98,11 @@ impl Trace {
             .iter()
             .filter(|push| push.array == replacement.array);
         Some(Self {
-            global: replacement.array.clone(),
-            replace: replacement.helper.clone(),
+            global: replacement.array.to_owned(),
+            replace: replacement.helper.to_owned(),
             push: candidates::exactly_one(pushes, "trace push helper")
                 .ok()
-                .map(|push| push.helper.clone()),
+                .map(|push| push.helper.to_owned()),
             initial_root: root(&structure.initializers, "initial root frame")?,
             returned_root: root(&structure.returned, "returned root frame")?,
         })
@@ -94,24 +111,27 @@ impl Trace {
 
 /// Reads a literal string through surrounding parentheses. Rejects lone surrogates because
 /// lossy conversion would produce a frame name the program never uses.
-fn string(expression: &Expr) -> Option<&str> {
-    ast::static_str(expression.unwrap_parens())
+fn string<'a>(expression: &Expression<'a>) -> Option<&'a str> {
+    ast::static_str(expression.without_parentheses())
 }
 
-fn call(statement: &Stmt) -> Option<&CallExpr> {
-    statement.as_expr()?.expr.unwrap_parens().as_call()
-}
-
-fn callee(call: &CallExpr) -> Option<&Expr> {
-    Some(call.callee.as_expr()?.unwrap_parens())
+/// The call an expression statement makes, through parentheses.
+fn call<'b, 'a>(statement: &'b Statement<'a>) -> Option<&'b CallExpression<'a>> {
+    let Statement::ExpressionStatement(statement) = statement else {
+        return None;
+    };
+    match statement.expression.without_parentheses() {
+        Expression::CallExpression(call) => Some(call),
+        _ => None,
+    }
 }
 
 /// Returns the program passed to a call of the program runner `runner`.
-fn run_program<'call>(call: &'call CallExpr, runner: &str) -> Option<&'call Expr> {
+fn run_program<'b, 'a>(call: &'b CallExpression<'a>, runner: &str) -> Option<&'b Expression<'a>> {
     if !vm::calls_runner(call, runner) {
         return None;
     }
-    Some(&*call.args.first()?.expr)
+    Some(ast::argument_expression(call.arguments.first()?))
 }
 
 /// Checks for calls running a literal program in this function's own body, as used by the
@@ -121,141 +141,148 @@ struct Calls<'runner> {
     literal_program: bool,
 }
 
-impl Visit for Calls<'_> {
-    fn visit_function(&mut self, _: &Function) {}
+impl<'a> Visit<'a> for Calls<'_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
 
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        self.literal_program |=
-            run_program(call, self.runner).is_some_and(|program| string(program).is_some());
-        call.visit_children_with(self);
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        walk_property(self, property);
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        walk_method(self, method);
+    }
+
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !is_optional_call(call) {
+            self.literal_program |=
+                run_program(call, self.runner).is_some_and(|program| string(program).is_some());
+        }
+        walk::walk_call_expression(self, call);
     }
 }
 
 /// Finds array properties modified by a helper: last-element replacement through
 /// `o.array[o.array.length - 1] = value` and append through `o.array.push(value)`.
 #[derive(Default)]
-struct Helpers {
-    replace: Option<String>,
-    push: Option<String>,
+struct Helpers<'a> {
+    replace: Option<&'a str>,
+    push: Option<&'a str>,
 }
 
-impl Visit for Helpers {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left
-            && let MemberProp::Computed(index) = &member.prop
-            && let Expr::Bin(index) = index.expr.unwrap_parens()
-            && index.op == BinaryOp::Sub
+impl<'a> Visit<'a> for Helpers<'a> {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::ComputedMemberExpression(member) = &assignment.left
+            && let Expression::BinaryExpression(index) = member.expression.without_parentheses()
+            && index.operator == BinaryOperator::Subtraction
             && matches!(
-                index.right.unwrap_parens(),
-                Expr::Lit(Lit::Num(number)) if number.value == 1.0
+                index.right.without_parentheses(),
+                Expression::NumericLiteral(number) if number.value == 1.0
             )
-            && let Expr::Member(length) = index.left.unwrap_parens()
-            && ast::member_str(&length.prop) == Some("length")
-            && let Expr::Member(array) = member.obj.unwrap_parens()
+            && let Some(length) = self::member(index.left.without_parentheses())
+            && ast::member_str(length) == Some("length")
+            && let Some(array) = self::member(member.object.without_parentheses())
         {
-            self.replace = ast::member_str(&array.prop).map(str::to_owned);
+            self.replace = ast::member_str(array);
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Some(Expr::Member(member)) = callee(call)
-            && ast::member_str(&member.prop) == Some("push")
-            && let Expr::Member(array) = member.obj.unwrap_parens()
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !is_optional_call(call)
+            && let Some(member) = self::member(call.callee.without_parentheses())
+            && ast::member_str(member) == Some("push")
+            && let Some(array) = self::member(member.object().without_parentheses())
         {
-            self.push = ast::member_str(&array.prop).map(str::to_owned);
+            self.push = ast::member_str(array);
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
 /// A helper `o.<helper> = function ...` that edits the array `o.<array>`.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct ArrayHelper {
-    helper: String,
-    array: String,
+struct ArrayHelper<'a> {
+    helper: &'a str,
+    array: &'a str,
 }
 
 /// A call `o.<helper>("<frame>")` immediately followed by a call of `<entry>`, which names a
 /// root frame when `helper` is the replace helper.
-struct RootSite {
-    helper: String,
-    frame: String,
-    entry: String,
+struct RootSite<'a> {
+    helper: &'a str,
+    frame: &'a str,
+    entry: Binding<'a>,
 }
 
 /// Script components used to recover the trace.
-#[derive(Default)]
-struct Structure {
+struct Structure<'a> {
+    script: Script<'a>,
     /// The name the program runner is installed under.
     runner: String,
-    replacements: BTreeSet<ArrayHelper>,
-    pushes: BTreeSet<ArrayHelper>,
+    replacements: BTreeSet<ArrayHelper<'a>>,
+    pushes: BTreeSet<ArrayHelper<'a>>,
     /// Functions that run a literal program (see [`Calls`]).
-    initializers: BTreeSet<String>,
+    initializers: BTreeSet<Binding<'a>>,
     /// Bindings holding callbacks returned by programs run from nonliteral inputs.
-    returned: BTreeSet<String>,
-    roots: Vec<RootSite>,
+    returned: BTreeSet<Binding<'a>>,
+    roots: Vec<RootSite<'a>>,
 }
 
-impl Visit for Structure {
-    fn visit_fn_decl(&mut self, function: &FnDecl) {
-        if let Some(body) = &function.function.body {
-            let mut calls = Calls {
-                runner: &self.runner,
-                literal_program: false,
-            };
-            body.visit_with(&mut calls);
-            if calls.literal_program {
-                self.initializers.insert(function.ident.sym.to_string());
-            }
+impl<'a> Structure<'a> {
+    /// Records a function declaration that runs a literal program.
+    fn declaration(&mut self, function: &'a Function<'a>) {
+        let (Some(name), Some(body)) = (&function.id, &function.body) else {
+            return;
+        };
+        let mut calls = Calls {
+            runner: &self.runner,
+            literal_program: false,
+        };
+        calls.visit_function_body(body);
+        if calls.literal_program {
+            self.initializers.insert(Binding::Symbol(name.symbol_id()));
         }
-        function.visit_children_with(self);
     }
 
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left
-            && let Some(helper) = ast::member_str(&member.prop)
-            && let Expr::Fn(function) = assignment.right.unwrap_parens()
-            && let Some(body) = &function.function.body
+    fn assignment(&mut self, assignment: &'a AssignmentExpression<'a>) {
+        if let Some(member) = assigned_member(&assignment.left)
+            && let Some(helper) = ast::member_str(member)
+            && let Expression::FunctionExpression(function) = assignment.right.without_parentheses()
+            && let Some(body) = &function.body
         {
             let mut helpers = Helpers::default();
-            body.visit_with(&mut helpers);
-            let edits = |array| ArrayHelper {
-                helper: helper.to_owned(),
-                array,
-            };
+            helpers.visit_function_body(body);
+            let edits = |array| ArrayHelper { helper, array };
             self.replacements.extend(helpers.replace.map(edits));
             self.pushes.extend(helpers.push.map(edits));
         }
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(name)) = &assignment.left
-            && let Expr::Call(call) = assignment.right.unwrap_parens()
+        if let AssignmentTarget::AssignmentTargetIdentifier(name) = &assignment.left
+            && let Expression::CallExpression(call) = assignment.right.without_parentheses()
             && run_program(call, &self.runner).is_some_and(|program| string(program).is_none())
         {
-            self.returned.insert(name.id.sym.to_string());
+            self.returned.insert(self.script.binding(name));
         }
-        assignment.visit_children_with(self);
     }
 
-    fn visit_block_stmt(&mut self, block: &BlockStmt) {
-        for statements in block.stmts.windows(2) {
+    /// Records root sites among a block's consecutive statements.
+    fn block(&mut self, statements: &'a [Statement<'a>]) {
+        for statements in statements.windows(2) {
             if let [trace_statement, entry_statement] = statements
                 && let Some(trace_call) = call(trace_statement)
-                && let Some(Expr::Member(member)) = callee(trace_call)
-                && let Some(helper) = ast::member_str(&member.prop)
-                && let Some(argument) = trace_call.args.first()
-                && let Some(frame) = string(&argument.expr)
+                && let Some(member) = member(trace_call.callee.without_parentheses())
+                && let Some(helper) = ast::member_str(member)
+                && let Some(argument) = trace_call.arguments.first()
+                && let Some(frame) = string(ast::argument_expression(argument))
                 && let Some(entry_call) = call(entry_statement)
-                && let Some(Expr::Ident(entry)) = callee(entry_call)
+                && let Expression::Identifier(entry) = entry_call.callee.without_parentheses()
             {
                 self.roots.push(RootSite {
-                    helper: helper.to_owned(),
-                    frame: frame.to_owned(),
-                    entry: entry.sym.to_string(),
+                    helper,
+                    frame,
+                    entry: self.script.binding(entry),
                 });
             }
         }
-        block.visit_children_with(self);
     }
 }
 
@@ -286,8 +313,7 @@ mod tests {
 
     /// The trace of a script defining `helpers` and [`ENTRIES`].
     fn recover(helpers: &str) -> Trace {
-        let parsed = ast::parse_iframe_javascript(&format!("{helpers}{ENTRIES}")).unwrap();
-        Trace::from_parsed(&parsed).unwrap()
+        Trace::recover(&Source::try_new(&format!("{helpers}{ENTRIES}")).unwrap()).unwrap()
     }
 
     #[test]

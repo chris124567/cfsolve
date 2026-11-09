@@ -4,58 +4,58 @@
 //! for (; test; effect(), i++);  // becomes for (; test; i++) { effect(); }
 //! ```
 //!
-//! Requires a final increment preceded only by effects. Moving those effects into an empty body
-//! preserves their execution point. A loop with no initializer or update becomes `while`.
+//! Moves the leading update operands into an empty body, leaving the final operand in the
+//! header. The body must be empty so those evaluations still run at the same point in each
+//! iteration. A loop with no initializer or update becomes `while`; an absent test means `true`.
 
-use std::mem;
-
-use swc_core::ecma::ast::{Bool, Expr, Lit, Program, Stmt, WhileStmt};
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use oxc::allocator::{TakeIn, Vec};
+use oxc::ast::ast::{Expression, Program, Statement};
+use oxc::ast_visit::{VisitMut, walk_mut};
 
 use super::analysis::Analysis;
-use crate::js::ast;
+use super::ast;
 
-pub(super) fn run(program: &mut Program, _: &mut Analysis) -> bool {
-    let mut restore = RestoreLoops { changed: false };
-    program.visit_mut_with(&mut restore);
-    restore.changed
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let mut loops = Loops {
+        analysis,
+        changed: false,
+    };
+    loops.visit_program(program);
+    loops.changed
 }
 
-struct RestoreLoops {
+struct Loops<'b, 'a> {
+    analysis: &'b Analysis<'a>,
     changed: bool,
 }
 
-impl VisitMut for RestoreLoops {
-    fn visit_mut_stmt(&mut self, statement: &mut Stmt) {
-        use swc_core::common::util::take::Take;
-
-        statement.visit_mut_children_with(self);
-        let Stmt::For(loop_statement) = statement else {
+impl<'a> VisitMut<'a> for Loops<'_, 'a> {
+    fn visit_statement(&mut self, statement: &mut Statement<'a>) {
+        walk_mut::walk_statement(self, statement);
+        let builder = &self.analysis.ast;
+        let Statement::ForStatement(for_statement) = statement else {
             return;
         };
-        if loop_statement.body.is_empty()
-            && let Some(update) = &mut loop_statement.update
-            && let Expr::Seq(sequence) = &mut **update
-            && let Some(last) = sequence.exprs.pop()
+        if matches!(for_statement.body, Statement::EmptyStatement(_))
+            && let Some(Expression::SequenceExpression(sequence)) = &mut for_statement.update
+            && let Some(last) = sequence.expressions.pop()
         {
-            let effects = mem::take(&mut sequence.exprs);
-            **update = *last;
-            let statements: Vec<Stmt> =
-                effects.into_iter().map(ast::expression_statement).collect();
-            *loop_statement.body = ast::block(statements);
+            let effects = sequence
+                .expressions
+                .drain(..)
+                .map(|effect| ast::expression_statement(effect, builder));
+            let effects = Vec::from_iter_in(effects, builder);
+            for_statement.body =
+                Statement::new_block_statement(for_statement.span, effects, builder);
+            for_statement.update = Some(last);
             self.changed = true;
         }
-        // An absent test is the implicit `true` that `for (;;)` means.
-        if loop_statement.init.is_none() && loop_statement.update.is_none() {
-            let span = loop_statement.span;
-            *statement = Stmt::While(WhileStmt {
-                span,
-                test: loop_statement
-                    .test
-                    .take()
-                    .unwrap_or_else(|| Box::new(Expr::Lit(Lit::Bool(Bool { span, value: true })))),
-                body: loop_statement.body.take(),
-            });
+        if for_statement.init.is_none() && for_statement.update.is_none() {
+            let span = for_statement.span;
+            let test = for_statement.test.take();
+            let test = test.unwrap_or_else(|| Expression::new_boolean_literal(span, true, builder));
+            let body = for_statement.body.take_in(builder);
+            *statement = Statement::new_while_statement(span, test, body, builder);
             self.changed = true;
         }
     }
@@ -67,17 +67,17 @@ mod tests {
 
     #[test]
     fn restores_loop_bodies_and_while_loops() {
-        let transform = |source: &str| testing::rewrite(source, super::run, /* fix= */ true);
+        let transform = |source: &str| testing::rewrite(source, super::run);
         let output = transform("for (var i = 0; i < n; use(i), tick(), i++);");
-        assert!(output.contains("for(var i = 0; i < n; i++)"), "{output}");
-        testing::assert_contains(&output, &[], &["use(i); tick();"]);
+        assert!(output.contains("for (var i = 0; i < n; i++)"), "{output}");
+        testing::assert_contains(&output, &["use(i); tick();"]);
         let output = transform("for (; ready; use(i), i++) work();");
         assert!(
-            output.contains("for(; ready; use(i), i++)"),
+            output.contains("for (; ready; use(i), i++)"),
             "only an empty body takes the effects: {output}"
         );
         let output = transform("for (;;) tick(); for (; ready;) work(); for (; ready; step());");
         let expected = ["while(true)", "while(ready)", "for(; ready; step())"];
-        testing::assert_contains(&output, &expected, &[]);
+        testing::assert_contains(&output, &expected);
     }
 }

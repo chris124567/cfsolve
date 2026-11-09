@@ -9,350 +9,292 @@
 //! Removes order and cursor assignments only if they are used solely by the dispatcher or never
 //! mentioned after the loop in the same statement list.
 
-use swc_core::atoms::Atom;
-use swc_core::common::{Span, SyntaxContext};
-use swc_core::ecma::ast::{
-    ArrowExpr, BlockStmt, BreakStmt, Class, ContinueStmt, Expr, ForStmt, Function, Id, LabeledStmt,
-    Lit, MemberProp, Program, Stmt, SwitchCase, SwitchStmt, UpdateOp, VarDeclOrExpr,
+use oxc::allocator::{CloneIn, GetAllocator, Vec};
+use oxc::ast::ast::{
+    Expression, ForStatement, Program, SimpleAssignmentTarget, Statement, SwitchStatement,
 };
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::ast_visit::{VisitMut, walk_mut};
+use oxc::span::Span;
+use oxc::syntax::operator::UpdateOperator;
 
-use super::analysis::{Analysis, Bindings, names};
-use super::{HashMap, HashSet};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::ast::LabeledContinue;
+use super::{HashMap, ast};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let mut unflatten = UnflattenSwitches {
-        bindings: analysis.bindings(program),
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let mut unflatten = Unflatten {
+        analysis,
         changed: false,
     };
-    program.visit_mut_with(&mut unflatten);
+    unflatten.visit_program(program);
     unflatten.changed
 }
 
-struct UnflattenSwitches<'bindings> {
-    bindings: &'bindings Bindings,
-    changed: bool,
-}
-
-impl UnflattenSwitches<'_> {
-    /// Checks whether dispatcher setup for `bindings` must be preserved because later
-    /// statements may use it.
-    fn keeps_setup(&self, bindings: &[Id; 2], after: Option<&[Stmt]>) -> bool {
-        bindings.iter().any(|id| self.bindings.references(id) > 1)
-            && after.is_none_or(|after| names::mentions(after, bindings))
-    }
-
-    /// Expands a `for` dispatcher in execution order. Preserves leading initializer
-    /// expressions and, if [`Self::keeps_setup`], the order and cursor assignments.
-    fn unflatten_for(&self, for_statement: &ForStmt, after: Option<&[Stmt]>) -> Option<Stmt> {
-        if is_true(for_statement.test.as_deref())
-            && for_statement.update.is_none()
-            && let Some(VarDeclOrExpr::Expr(initializer)) = &for_statement.init
-            && let Expr::Seq(initializer) = &**initializer
-            && let [prefix @ .., array_assignment, index_assignment] = initializer.exprs.as_slice()
-            && let Some(order) = split_order(array_assignment)
-            && let Some(index) = zero_index(index_assignment)
-            && let Some(dispatcher) = Dispatcher::of(&for_statement.body)
-            && dispatcher.array == order.array
-            && dispatcher.index == index
-        {
-            let prefix = if self.keeps_setup(&dispatcher.bindings(), after) {
-                &initializer.exprs[..]
-            } else {
-                prefix
-            };
-            flattened(&dispatcher, &order, prefix, for_statement.span)
-        } else {
-            None
-        }
-    }
-}
-
-impl VisitMut for UnflattenSwitches<'_> {
-    /// A `for` dispatcher used directly as another statement's body has no following statement
-    /// list to check.
-    fn visit_mut_stmt(&mut self, statement: &mut Stmt) {
-        statement.visit_mut_children_with(self);
-
-        if let Stmt::For(for_statement) = statement
-            && let Some(inlined) = self.unflatten_for(for_statement, None)
-        {
-            *statement = inlined;
-            self.changed = true;
-        }
-    }
-
-    fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
-        // Unflatten statements below, where subsequent statements are available for analysis.
-        for statement in statements.iter_mut() {
-            statement.visit_mut_children_with(self);
-        }
-
-        let mut position = 0;
-        while position < statements.len() {
-            if let Stmt::For(for_statement) = &statements[position]
-                && let Some(inlined) =
-                    self.unflatten_for(for_statement, Some(&statements[position + 1..]))
-            {
-                statements[position] = inlined;
-                self.changed = true;
-            } else if let Stmt::While(loop_) = &statements[position]
-                && is_true(Some(&loop_.test))
-                && let Some(dispatcher) = Dispatcher::of(&loop_.body)
-                && let Some(setup) = Setup::find(&statements[..position], &dispatcher)
-                && let Some(inlined) = flattened(&dispatcher, &setup.order, &[], loop_.span)
-            {
-                let bindings = dispatcher.bindings();
-                statements[position] = inlined;
-                self.changed = true;
-                // The setup only fed the loop, unless something after it reads the order or the
-                // cursor.
-                if !self.keeps_setup(&bindings, Some(&statements[position + 1..])) {
-                    for index in setup.statements {
-                        statements.remove(index);
-                    }
-                    position -= setup.statements.len();
-                }
-            }
-            position += 1;
-        }
-    }
-}
-
-/// Finds `order = "...".split(...)` and `cursor = 0` by scanning backward from a `while`
-/// dispatcher. Stops at any other reference to either binding.
-struct Setup {
-    order: SplitOrder,
-    /// Positions of the two setup statements, last first.
-    statements: [usize; 2],
-}
-
-impl Setup {
-    fn find(preceding: &[Stmt], dispatcher: &Dispatcher) -> Option<Self> {
-        let bindings = dispatcher.bindings();
-        let mut order = None;
-        let mut cursor = None;
-        let backwards = preceding.iter().enumerate().rev();
-        for (position, statement) in backwards {
-            if let Stmt::Expr(statement) = statement
-                && order.is_none()
-                && let Some(split) = split_order(&statement.expr)
-                && split.array == dispatcher.array
-            {
-                order = Some((split, position));
-            } else if let Stmt::Expr(statement) = statement
-                && cursor.is_none()
-                && zero_index(&statement.expr).is_some_and(|index| index == dispatcher.index)
-            {
-                cursor = Some(position);
-            } else if names::mentions(statement, &bindings) {
-                return None;
-            }
-            if let Some(cursor) = cursor
-                && let Some((order, order_position)) = order.take()
-            {
-                return Some(Self {
-                    order,
-                    statements: [cursor.max(order_position), cursor.min(order_position)],
-                });
-            }
-        }
-        None
-    }
-}
-
-fn is_true(test: Option<&Expr>) -> bool {
-    matches!(test, Some(Expr::Lit(Lit::Bool(value))) if value.value)
-}
-
 /// `array = "b|a".split("|")`: the case labels in execution order and their separator.
-struct SplitOrder {
-    array: Id,
-    order: String,
-    separator: String,
+struct Order<'a> {
+    id: Id,
+    order: &'a str,
+    separator: &'a str,
 }
 
-fn split_order(expression: &Expr) -> Option<SplitOrder> {
-    if let Some((array, value)) = ast::assignment(expression)
-        && let Some((order, [separator])) = ast::method_call(value, "split")
-        && separator.spread.is_none()
-        && let Some(order) = ast::static_str(order)
-        && let Some(separator) = ast::static_str(&separator.expr)
-        && !separator.is_empty()
-    {
-        Some(SplitOrder {
-            array,
-            order: order.to_owned(),
-            separator: separator.to_owned(),
-        })
-    } else {
-        None
+fn order<'a>(expression: &Expression<'a>, analysis: &Analysis<'a>) -> Option<Order<'a>> {
+    let (id, value) = analysis.assignment(expression)?;
+    let (order, [separator]) = ast::method_call(value, "split")? else {
+        return None;
+    };
+    let separator = ast::static_str(separator.as_expression()?)?;
+    if separator.is_empty() {
+        return None;
     }
+    Some(Order {
+        id,
+        order: ast::static_str(order)?,
+        separator,
+    })
 }
 
-/// `cursor = 0`: the cursor binding.
-fn zero_index(expression: &Expr) -> Option<Id> {
-    let (index, value) = ast::assignment(expression)?;
-    matches!(value, Expr::Lit(Lit::Num(value)) if value.value == 0.0).then_some(index)
+/// Matches `cursor = 0` and returns the cursor binding.
+fn zero(expression: &Expression<'_>, analysis: &Analysis<'_>) -> Option<Id> {
+    let Expression::AssignmentExpression(assignment) = expression.get_inner_expression() else {
+        return None;
+    };
+    if ast::number(&assignment.right) != Some(0.0) {
+        return None;
+    }
+    analysis.target_id(&assignment.left)
 }
 
-/// A loop body `{ switch (order[cursor++]) { ... } break; }`.
-struct Dispatcher<'body> {
-    switch: &'body SwitchStmt,
-    /// The syntax context of the loop body.
-    context: SyntaxContext,
+/// A loop body `{ switch (order[cursor++]) { ... } break; }` and its setup bindings.
+struct Dispatcher<'b, 'a> {
+    switch: &'b SwitchStatement<'a>,
     array: Id,
     index: Id,
 }
 
-impl<'body> Dispatcher<'body> {
-    fn of(body: &'body Stmt) -> Option<Self> {
-        if let Stmt::Block(body) = body
-            && let [Stmt::Switch(switch), Stmt::Break(break_statement)] = body.stmts.as_slice()
-            && break_statement.label.is_none()
-            && let Expr::Member(discriminant) = &*switch.discriminant
-            && let Some(array) = discriminant.obj.as_ident()
-            && let MemberProp::Computed(property) = &discriminant.prop
-            && let Expr::Update(increment) = &*property.expr
-            && increment.op == UpdateOp::PlusPlus
-            && !increment.prefix
-            && let Some(index) = increment.arg.as_ident()
-        {
-            Some(Self {
-                switch,
-                context: body.ctxt,
-                array: array.to_id(),
-                index: index.to_id(),
-            })
-        } else {
-            None
-        }
-    }
-
-    fn bindings(&self) -> [Id; 2] {
-        [self.array.clone(), self.index.clone()]
+impl Dispatcher<'_, '_> {
+    fn setup(&self) -> [Id; 2] {
+        [self.array, self.index]
     }
 }
 
-/// Orders case bodies after the leading loop initializer expressions. Returns `None` for
-/// unsupported cases and missing or unused labels.
-fn flattened(
-    dispatcher: &Dispatcher,
-    order: &SplitOrder,
-    prefix: &[Box<Expr>],
-    span: Span,
-) -> Option<Stmt> {
-    let mut cases = case_bodies(&dispatcher.switch.cases, &dispatcher.bindings())?;
-    let mut statements: Vec<Stmt> = prefix
-        .iter()
-        .map(|expression| ast::expression_statement(expression.clone()))
-        .collect();
-    for label in order.order.split(&order.separator) {
-        statements.extend(cases.remove(label)?);
+fn dispatcher<'b, 'a>(
+    body: &'b Statement<'a>,
+    analysis: &Analysis<'a>,
+) -> Option<Dispatcher<'b, 'a>> {
+    let Statement::BlockStatement(block) = body else {
+        return None;
+    };
+    let [
+        Statement::SwitchStatement(switch),
+        Statement::BreakStatement(jump),
+    ] = block.body.as_slice()
+    else {
+        return None;
+    };
+    if jump.label.is_some() {
+        return None;
     }
-    cases.is_empty().then(|| {
-        Stmt::Block(BlockStmt {
-            span,
-            ctxt: dispatcher.context,
-            stmts: statements,
-        })
+    let Expression::ComputedMemberExpression(member) = switch.discriminant.get_inner_expression()
+    else {
+        return None;
+    };
+    let Expression::UpdateExpression(update) = member.expression.get_inner_expression() else {
+        return None;
+    };
+    if update.operator != UpdateOperator::Increment || update.prefix {
+        return None;
+    }
+    let SimpleAssignmentTarget::AssignmentTargetIdentifier(index) = &update.argument else {
+        return None;
+    };
+    Some(Dispatcher {
+        switch,
+        array: analysis.expression_id(&member.object)?,
+        index: analysis.id(index)?,
     })
 }
 
-/// Maps case labels to their bodies. Each body must continue the dispatcher or exit execution
-/// so the bodies can be concatenated. Rejects other jumps to the switch or dispatcher loop,
-/// since those targets will be removed. Also rejects bodies that read the order or cursor,
-/// whose values depend on the loop.
-fn case_bodies(cases: &[SwitchCase], bindings: &[Id; 2]) -> Option<HashMap<String, Vec<Stmt>>> {
-    if cases
-        .iter()
-        .any(|case| names::mentions(&case.cons, bindings))
-    {
-        return None;
-    }
-    let mut bodies = HashMap::default();
-    for case in cases {
-        let label = case.test.as_deref().and_then(ast::static_str)?.to_owned();
-        let mut statements = case.cons.clone();
-        let continues_loop = matches!(
-            statements.last(),
-            Some(Stmt::Continue(continue_statement)) if continue_statement.label.is_none()
-        );
-        if continues_loop {
-            statements.pop();
-        } else if !matches!(statements.last(), Some(Stmt::Return(_) | Stmt::Throw(_))) {
+/// Orders case bodies after any initializer prefix. Each case must continue the dispatcher or
+/// return/throw, with no other jump to the removed loop or switch. Rejects bodies mentioning the
+/// order or cursor, repeated or missing labels, and labels left unused by the order string.
+fn flatten<'a>(
+    dispatcher: &Dispatcher<'_, 'a>,
+    order: &Order<'a>,
+    prefix: &[Expression<'a>],
+    span: Span,
+    analysis: &Analysis<'a>,
+) -> Option<Statement<'a>> {
+    let allocator = analysis.allocator();
+    let mut cases = HashMap::default();
+    for case in &dispatcher.switch.cases {
+        if ast::mentions(&case.consequent, &dispatcher.setup(), analysis) {
             return None;
         }
-        let mut jumps = Jumps::default();
-        statements.visit_with(&mut jumps);
-        if jumps.leaves {
+        let label = ast::static_str(case.test.as_ref()?)?;
+        let mut body = case.consequent.clone_in_with_semantic_ids(allocator);
+        match body.last() {
+            Some(Statement::ContinueStatement(jump)) if jump.label.is_none() => {
+                body.pop();
+            }
+            Some(Statement::ReturnStatement(_) | Statement::ThrowStatement(_)) => {}
+            _ => return None,
+        }
+        if ast::escapes(&body, LabeledContinue::Inner) || cases.insert(label, body).is_some() {
             return None;
         }
-        bodies.insert(label, statements);
     }
-    Some(bodies)
+    let mut flattened = Vec::new_in(analysis);
+    for expression in prefix {
+        let expression = expression.clone_in_with_semantic_ids(allocator);
+        flattened.push(ast::expression_statement(expression, &analysis.ast))
+    }
+    for label in order.order.split(order.separator) {
+        flattened.extend(cases.remove(label)?)
+    }
+    cases
+        .is_empty()
+        .then(|| Statement::new_block_statement(span, flattened, analysis))
 }
 
-/// Detects jumps from case statements to enclosing constructs: unlabeled `break` or
-/// `continue` without an internal target, or `continue` to an external label. Labeled `break`
-/// remains valid because its target still encloses the expanded cases.
-#[derive(Default)]
-struct Jumps {
-    /// Loops around the node, within the case.
-    loops: usize,
-    /// Loops and `switch` statements around the node, within the case.
-    breakable: usize,
-    /// Labels declared around the node, within the case.
-    labels: HashSet<Atom>,
-    leaves: bool,
+struct Unflatten<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    changed: bool,
 }
 
-impl Visit for Jumps {
-    fn visit_stmt(&mut self, statement: &Stmt) {
-        let depth = usize::from(matches!(
-            statement,
-            Stmt::For(_) | Stmt::ForIn(_) | Stmt::ForOf(_) | Stmt::While(_) | Stmt::DoWhile(_)
-        ));
-        self.loops += depth;
-        self.breakable += depth;
-        statement.visit_children_with(self);
-        self.loops -= depth;
-        self.breakable -= depth;
+impl<'a> Unflatten<'_, 'a> {
+    /// Keeps dispatcher setup when references after the loop may still need the order or cursor.
+    fn keeps_setup(
+        &self,
+        dispatcher: &Dispatcher<'_, 'a>,
+        after: Option<&[Statement<'a>]>,
+    ) -> bool {
+        let setup = dispatcher.setup();
+        setup
+            .iter()
+            .any(|id| self.analysis.bindings.references(id) > 1)
+            && after.is_none_or(|after| ast::mentions(after, &setup, self.analysis))
     }
 
-    fn visit_break_stmt(&mut self, jump: &BreakStmt) {
-        self.leaves |= jump.label.is_none() && self.breakable == 0;
-    }
-
-    fn visit_continue_stmt(&mut self, jump: &ContinueStmt) {
-        self.leaves |= match &jump.label {
-            Some(label) => !self.labels.contains(&label.sym),
-            None => self.loops == 0,
+    /// Expands a `for` dispatcher, preserving initializer prefixes and any setup still needed
+    /// afterwards.
+    fn for_loop(
+        &self,
+        for_loop: &ForStatement<'a>,
+        after: Option<&[Statement<'a>]>,
+    ) -> Option<Statement<'a>> {
+        let test = for_loop.test.as_ref().and_then(ast::truthiness);
+        if for_loop.update.is_some() || test != Some(true) {
+            return None;
+        }
+        let Expression::SequenceExpression(init) = for_loop
+            .init
+            .as_ref()?
+            .as_expression()?
+            .get_inner_expression()
+        else {
+            return None;
         };
+        let [prefix @ .., array, index] = init.expressions.as_slice() else {
+            return None;
+        };
+        let order = order(array, self.analysis)?;
+        let index = zero(index, self.analysis)?;
+        let dispatcher = dispatcher(&for_loop.body, self.analysis)?;
+        if dispatcher.array != order.id || dispatcher.index != index {
+            return None;
+        }
+        let prefix = if self.keeps_setup(&dispatcher, after) {
+            &init.expressions
+        } else {
+            prefix
+        };
+        flatten(&dispatcher, &order, prefix, for_loop.span, self.analysis)
     }
 
-    fn visit_labeled_stmt(&mut self, labeled: &LabeledStmt) {
-        let added = self.labels.insert(labeled.label.sym.clone());
-        labeled.body.visit_with(self);
-        if added {
-            self.labels.remove(&labeled.label.sym);
+    /// Expands a `while (true)` dispatcher at `position`, removing its setup unless later
+    /// statements still need it, and returns the expansion's new position.
+    fn while_loop(
+        &mut self,
+        statements: &mut Vec<'a, Statement<'a>>,
+        position: usize,
+    ) -> Option<usize> {
+        let analysis = self.analysis;
+        let Statement::WhileStatement(while_loop) = &statements[position] else {
+            return None;
+        };
+        if ast::truthiness(&while_loop.test) != Some(true) {
+            return None;
+        }
+        let dispatcher = dispatcher(&while_loop.body, analysis)?;
+        let setup = dispatcher.setup();
+        let mut setup_order = None;
+        let mut setup_index = None;
+        for earlier in (0..position).rev() {
+            let expression = match &statements[earlier] {
+                Statement::ExpressionStatement(statement) => Some(&statement.expression),
+                _ => None,
+            };
+            if let Some(expression) = expression
+                && setup_order.is_none()
+                && let Some(order) = order(expression, analysis)
+                && order.id == dispatcher.array
+            {
+                setup_order = Some((earlier, order));
+            } else if let Some(expression) = expression
+                && setup_index.is_none()
+                && zero(expression, analysis) == Some(dispatcher.index)
+            {
+                setup_index = Some(earlier)
+            } else if ast::mentions(&statements[earlier..=earlier], &setup, analysis) {
+                break;
+            }
+            if setup_order.is_some() && setup_index.is_some() {
+                break;
+            }
+        }
+        let ((order_position, order), index_position) = (setup_order?, setup_index?);
+        let flattened = flatten(&dispatcher, &order, &[], while_loop.span, analysis)?;
+        let keep = self.keeps_setup(&dispatcher, Some(&statements[position + 1..]));
+        statements[position] = flattened;
+        self.changed = true;
+        if keep {
+            return Some(position);
+        }
+        statements.remove(order_position.max(index_position));
+        statements.remove(order_position.min(index_position));
+        Some(position - 2)
+    }
+}
+
+impl<'a> VisitMut<'a> for Unflatten<'_, 'a> {
+    fn visit_statement(&mut self, statement: &mut Statement<'a>) {
+        walk_mut::walk_statement(self, statement);
+        if let Statement::ForStatement(for_loop) = statement
+            && let Some(flattened) = self.for_loop(for_loop, None)
+        {
+            *statement = flattened;
+            self.changed = true;
         }
     }
 
-    fn visit_switch_stmt(&mut self, switch: &SwitchStmt) {
-        switch.discriminant.visit_with(self);
-        self.breakable += 1;
-        switch.cases.visit_with(self);
-        self.breakable -= 1;
+    fn visit_statements(&mut self, statements: &mut Vec<'a, Statement<'a>>) {
+        for statement in statements.iter_mut() {
+            walk_mut::walk_statement(self, statement)
+        }
+        let mut position = 0;
+        while position < statements.len() {
+            if let Statement::ForStatement(for_loop) = &statements[position] {
+                let after = &statements[position + 1..];
+                if let Some(flattened) = self.for_loop(for_loop, Some(after)) {
+                    statements[position] = flattened;
+                    self.changed = true;
+                }
+            } else if let Some(expanded) = self.while_loop(statements, position) {
+                position = expanded;
+            }
+            position += 1;
+        }
     }
-
-    // Functions and classes have jump targets of their own.
-    fn visit_function(&mut self, _: &Function) {}
-
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-
-    fn visit_class(&mut self, _: &Class) {}
 }
 
 #[cfg(test)]

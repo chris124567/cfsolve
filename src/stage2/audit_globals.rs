@@ -3,15 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
+use oxc::ast::AstKind;
+use oxc::ast::ast::{
+    Directive, Expression, MemberExpression, MethodDefinition, ObjectProperty, PropertyDefinition,
+    PropertyKind, UpdateExpression,
+};
+use oxc::ast_visit::{Visit, walk};
+use oxc::syntax::scope::ScopeFlags;
 use serde::{Deserialize, Serialize};
-use swc_core::ecma::ast::{AssignExpr, AssignTarget, Expr, Lit, MemberExpr, SimpleAssignTarget};
-use swc_core::ecma::visit::{Visit, VisitWith};
 use url::Url;
 
+use super::syntax::assigned_member;
 use super::vocabulary;
 use crate::challenge::installed::Installed;
 use crate::challenge::program::PreparedSession;
-use crate::js::ast;
+use crate::js::ast::{self, Binding, Script};
 use crate::script::Source;
 
 /// A bag of syntax and browser API features. Local variable names, statement order, numeric
@@ -66,14 +72,34 @@ impl Globals {
 
     /// Signatures of the hex-named globals the iframe script assigns on `window` or an alias.
     pub(crate) fn recover(source: &Source) -> Self {
-        let mut aliases = Aliases(BTreeSet::from(["window".to_owned()]));
-        source.parsed().script.visit_with(&mut aliases);
-        let mut definitions = Definitions {
-            aliases: aliases.0,
-            globals: Self::default(),
-        };
-        source.parsed().script.visit_with(&mut definitions);
-        definitions.globals
+        let script = source.script();
+        let aliases = aliases(script);
+        let mut globals = Self::default();
+        for node in script.nodes.iter() {
+            let AstKind::AssignmentExpression(assignment) = node.kind() else {
+                continue;
+            };
+            if let Some(member) = assigned_member(&assignment.left)
+                && let Expression::Identifier(alias) = member.object().without_parentheses()
+                && aliases.contains(&script.binding(alias))
+                && let Some(name) = ast::member_str(member)
+                && vocabulary::is_hex_name(name)
+            {
+                let signature = globals.0.entry(name.to_owned()).or_default();
+                if signature.kind.is_empty() {
+                    signature.kind = match assignment.right.without_parentheses() {
+                        Expression::FunctionExpression(_)
+                        | Expression::ArrowFunctionExpression(_) => "function",
+                        Expression::ObjectExpression(_) => "object",
+                        Expression::ArrayExpression(_) => "array",
+                        _ => "value",
+                    }
+                    .into();
+                }
+                signature.visit_expression(&assignment.right);
+            }
+        }
+        globals
     }
 
     /// Accepts only a unique best candidate in both directions. Ambiguous definitions are
@@ -120,12 +146,8 @@ impl Signature {
         }
         let mut intersection = 0;
         let mut union = 0;
-        for key in self
-            .features
-            .keys()
-            .chain(other.features.keys())
-            .collect::<BTreeSet<_>>()
-        {
+        let keys: BTreeSet<&String> = self.features.keys().chain(other.features.keys()).collect();
+        for key in keys {
             let a = self.features.get(key).copied().unwrap_or_default();
             let b = other.features.get(key).copied().unwrap_or_default();
             intersection += a.min(b);
@@ -153,67 +175,10 @@ impl Signature {
     fn feature(&mut self, feature: String) {
         *self.features.entry(feature).or_default() += 1;
     }
-}
 
-struct Aliases(BTreeSet<String>);
-
-impl Visit for Aliases {
-    fn visit_member_expr(&mut self, member: &MemberExpr) {
-        if ast::member_str(&member.prop) == Some("_cf_chl_opt")
-            && let Expr::Ident(alias) = member.obj.unwrap_parens()
-        {
-            self.0.insert(alias.sym.to_string());
-        }
-        member.visit_children_with(self);
-    }
-}
-
-struct Definitions {
-    aliases: BTreeSet<String>,
-    globals: Globals,
-}
-
-impl Visit for Definitions {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left
-            && let Expr::Ident(alias) = member.obj.unwrap_parens()
-            && self.aliases.contains(alias.sym.as_ref())
-            && let Some(name) = ast::member_str(&member.prop)
-            && vocabulary::is_hex_name(name)
-        {
-            let signature = self.globals.0.entry(name.to_owned()).or_default();
-            if signature.kind.is_empty() {
-                signature.kind = match assignment.right.unwrap_parens() {
-                    Expr::Fn(_) | Expr::Arrow(_) => "function",
-                    Expr::Object(_) => "object",
-                    Expr::Array(_) => "array",
-                    _ => "value",
-                }
-                .into();
-            }
-            assignment.right.visit_with(signature);
-        }
-        assignment.visit_children_with(self);
-    }
-}
-
-impl Visit for Signature {
-    fn visit_expr(&mut self, expression: &Expr) {
-        let feature = match expression {
-            Expr::Bin(value) => format!("binary:{:?}", value.op),
-            Expr::Unary(value) => format!("unary:{:?}", value.op),
-            Expr::Call(_) => "call".into(),
-            Expr::New(_) => "new".into(),
-            Expr::Cond(_) => "conditional".into(),
-            Expr::Fn(_) | Expr::Arrow(_) => "function".into(),
-            Expr::Array(_) => "array".into(),
-            Expr::Object(_) => "object".into(),
-            Expr::Assign(value) => format!("assign:{:?}", value.op),
-            Expr::Lit(Lit::Bool(value)) => format!("bool:{}", value.value),
-            _ => "expression".into(),
-        };
-        self.feature(feature);
-        if let Some(text) = ast::static_str(expression)
+    /// Counts a string literal's features, as [`Visit::visit_expression`] does for an expression.
+    fn literal(&mut self, text: Option<&str>) {
+        if let Some(text) = text
             && !vocabulary::is_hex_name(text)
             && text.len() <= 64
             && text
@@ -222,22 +187,125 @@ impl Visit for Signature {
         {
             self.feature(format!("string:{text}"));
         }
-        expression.visit_children_with(self);
+    }
+}
+
+/// The global `window` and the bindings whose `_cf_chl_opt` property the script reads.
+fn aliases(script: Script<'_>) -> BTreeSet<Binding<'_>> {
+    struct Aliases<'a> {
+        script: Script<'a>,
+        found: BTreeSet<Binding<'a>>,
+    }
+    impl<'a> Visit<'a> for Aliases<'a> {
+        fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
+            if ast::member_str(member) == Some("_cf_chl_opt")
+                && let Expression::Identifier(alias) = member.object().without_parentheses()
+            {
+                self.found.insert(self.script.binding(alias));
+            }
+            walk::walk_member_expression(self, member);
+        }
+    }
+    let mut aliases = Aliases {
+        script,
+        found: BTreeSet::from([Binding::Global("window")]),
+    };
+    aliases.visit_program(script.program);
+    aliases.found
+}
+
+/// Counts the syntax and API features of a definition. Features count expressions, so property
+/// keys, shorthand values, and object methods and accessors, which are not written as
+/// expressions, add none; directives count as the string expressions they are written as.
+impl<'a> Visit<'a> for Signature {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        let feature = match expression {
+            // `super` is not an expression; see `visit_member_expression`.
+            Expression::Super(_) => return,
+            Expression::BinaryExpression(value) => format!("binary:{:?}", value.operator.as_str()),
+            Expression::LogicalExpression(value) => format!("binary:{:?}", value.operator.as_str()),
+            Expression::UnaryExpression(value) => format!("unary:{:?}", value.operator.as_str()),
+            Expression::CallExpression(_) | Expression::ImportExpression(_) => "call".into(),
+            Expression::NewExpression(_) => "new".into(),
+            Expression::ConditionalExpression(_) => "conditional".into(),
+            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_) => {
+                "function".into()
+            }
+            Expression::ArrayExpression(_) => "array".into(),
+            Expression::ObjectExpression(_) => "object".into(),
+            Expression::AssignmentExpression(value) => {
+                format!("assign:{:?}", value.operator.as_str())
+            }
+            Expression::BooleanLiteral(value) => format!("bool:{}", value.value),
+            _ => "expression".into(),
+        };
+        self.feature(feature);
+        self.literal(ast::static_str(expression));
+        walk::walk_expression(self, expression);
     }
 
-    fn visit_member_expr(&mut self, member: &MemberExpr) {
+    fn visit_directive(&mut self, directive: &Directive<'a>) {
+        self.feature("expression".into());
+        self.literal(directive.expression.value.as_str());
+    }
+
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        if property.computed {
+            self.visit_property_key(&property.key);
+        }
+        match &property.value {
+            Expression::FunctionExpression(function)
+                if property.method || property.kind != PropertyKind::Init =>
+            {
+                walk::walk_function(self, function, ScopeFlags::Function);
+            }
+            _ if property.shorthand => {}
+            value => self.visit_expression(value),
+        }
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        if method.computed {
+            self.visit_property_key(&method.key);
+        }
+        self.visit_function(&method.value, ScopeFlags::Function);
+    }
+
+    fn visit_property_definition(&mut self, property: &PropertyDefinition<'a>) {
+        if property.computed {
+            self.visit_property_key(&property.key);
+        }
+        if let Some(value) = &property.value {
+            self.visit_expression(value);
+        }
+    }
+
+    /// Counts the operand of an update, which is written as an expression.
+    fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
+        self.feature("expression".into());
+        walk::walk_update_expression(self, update);
+    }
+
+    fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
         let randomized = |name: &str| {
             vocabulary::is_hex_name(name)
                 || name.strip_prefix("_0x").is_some_and(|suffix| {
                     !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
         };
-        if let Some(name) = ast::member_str(&member.prop)
+        // A `super` property read is not a member expression.
+        if matches!(member.object(), Expression::Super(_)) {
+            if let MemberExpression::ComputedMemberExpression(member) = member {
+                self.visit_expression(&member.expression);
+            }
+            return;
+        }
+        if let Some(name) = ast::member_str(member)
             && !randomized(name)
         {
             self.feature(format!("property:{name}"));
         }
-        member.visit_children_with(self);
+        walk::walk_member_expression(self, member);
     }
 }
 

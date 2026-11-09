@@ -7,23 +7,48 @@
 //! the fast path and execute only the fallback statements. These advance the program counter,
 //! produce the switch value as the opcode, and store the next dispatch key in its register.
 
-use anyhow::{Context, Result};
-use swc_core::common::DUMMY_SP;
-use swc_core::ecma::ast::{
-    BinaryOp, BlockStmt, Decl, Expr, Function, Ident, Lit, ReturnStmt, Stmt,
-};
+use std::{ptr, slice};
+
+use anyhow::{Context, Result, bail};
+use oxc::ast::ast::{Expression, Function, Statement, VariableDeclaration};
+use oxc::syntax::operator::BinaryOperator;
 
 use super::extract::{Argument, DispatchLoop};
-use super::interpret;
+use super::interpret::{self, Routine};
 use super::session::Session;
 use super::value::Value;
+use crate::js::ast::Script;
 
-/// Function extracted from the dispatch loop to decode opcodes.
-pub(crate) struct Dispatch {
-    /// `function(<loop parameters>) { var <loop locals>; <decoding>; return <opcode>; }`.
-    decoder: Function,
+/// The opcode decoder extracted from the dispatch loop.
+pub(crate) struct Dispatch<'a> {
+    pub(super) decoder: Decoder<'a>,
     /// Values passed to each loop parameter.
-    arguments: Vec<Argument>,
+    pub(super) arguments: Vec<Argument>,
+}
+
+/// The dispatch loop's decoding statements, run as
+/// `function(<loop parameters>) { var <loop locals>; <decoding>; return <opcode>; }`.
+pub(crate) struct Decoder<'a> {
+    /// The dispatch loop, whose parameters the decoder takes.
+    pub(crate) function: &'a Function<'a>,
+    /// The loop's local declarations, run without their initializers.
+    pub(crate) declarations: Vec<&'a VariableDeclaration<'a>>,
+    pub(crate) decoding: &'a [Statement<'a>],
+    /// The switch discriminant, a local holding the opcode.
+    pub(crate) opcode: &'a Expression<'a>,
+}
+
+impl Decoder<'_> {
+    /// The decoder as a routine the interpreter runs.
+    pub(crate) fn routine(&self) -> Routine<'_> {
+        Routine {
+            parameters: &self.function.params,
+            declarations: &self.declarations,
+            statements: self.decoding,
+            returns: Some(self.opcode),
+            address: ptr::from_ref(self).addr(),
+        }
+    }
 }
 
 /// Decoded opcode and dispatch key for one program byte.
@@ -34,70 +59,67 @@ pub(crate) struct Decoded {
     pub(crate) key: u8,
 }
 
-impl Dispatch {
-    pub(crate) fn from_loop(dispatch: &DispatchLoop<'_>) -> Result<Self> {
+impl<'a> Dispatch<'a> {
+    pub(crate) fn from_loop(script: Script<'a>, dispatch: &DispatchLoop<'a>) -> Result<Self> {
         let function = dispatch.function;
         let body = function
             .body
-            .as_ref()
+            .as_deref()
             .context("the dispatch loop function has no body")?;
         let looping = body
-            .stmts
+            .statements
             .iter()
-            .find_map(Stmt::as_while_stmt)
+            .find_map(|statement| match statement {
+                Statement::WhileStatement(looping) => Some(looping),
+                _ => None,
+            })
             .context("the dispatch loop function has no loop")?;
-        let statements = match &*looping.body {
-            Stmt::Block(block) => &block.stmts[..],
-            statement => std::slice::from_ref(statement),
-        };
+        let statements = block_statements(&looping.body);
         let (at, switch) = statements
             .iter()
             .enumerate()
-            .find_map(|(at, statement)| Some((at, statement.as_switch()?)))
+            .find_map(|(at, statement)| match statement {
+                Statement::SwitchStatement(switch) => Some((at, switch)),
+                _ => None,
+            })
             .context("the dispatch loop has no switch")?;
-        let opcode = switch
-            .discriminant
-            .as_ident()
-            .context("the dispatch switch is not on a local")?
-            .clone();
+        let opcode = &switch.discriminant;
+        let Expression::Identifier(opcode_name) = opcode else {
+            bail!("the dispatch switch is not on a local");
+        };
         let prefix = &statements[..at];
         // Match `<opcode> = <fast path>; if (<opcode> < 0) { <decoding> }`.
+        let is_opcode = |expression: &Expression<'a>| {
+            matches!(expression, Expression::Identifier(name)
+                if script.binding(name) == script.binding(opcode_name))
+        };
         let decoding = match prefix.last() {
-            Some(Stmt::If(branch))
-                if branch.alt.is_none() && is_negative(&branch.test, &opcode) =>
+            Some(Statement::IfStatement(branch))
+                if branch.alternate.is_none() && is_negative(&branch.test, is_opcode) =>
             {
-                match &*branch.cons {
-                    Stmt::Block(block) => block.stmts.clone(),
-                    statement => vec![statement.clone()],
+                block_statements(&branch.consequent)
+            }
+            _ => prefix,
+        };
+        // Keep the loop local declarations, without their initializers.
+        let declarations = body
+            .statements
+            .iter()
+            .chain(prefix)
+            .filter_map(|statement| match statement {
+                Statement::VariableDeclaration(declaration) if !declaration.kind.is_using() => {
+                    Some(&**declaration)
                 }
-            }
-            _ => prefix.to_vec(),
-        };
-        // Preserve the loop local declarations without initializers.
-        let declarations = body.stmts.iter().chain(prefix).filter_map(|statement| {
-            let Stmt::Decl(Decl::Var(declaration)) = statement else {
-                return None;
-            };
-            let mut declaration = declaration.clone();
-            for declarator in &mut declaration.decls {
-                declarator.init = None;
-            }
-            Some(Stmt::Decl(Decl::Var(declaration)))
-        });
-        let returned = Stmt::Return(ReturnStmt {
-            span: DUMMY_SP,
-            arg: Some(Box::new(Expr::Ident(opcode))),
-        });
-        let decoder = Function {
-            body: Some(BlockStmt {
-                span: body.span,
-                ctxt: body.ctxt,
-                stmts: declarations.chain(decoding).chain([returned]).collect(),
-            }),
-            ..function.clone()
-        };
+                _ => None,
+            })
+            .collect();
         Ok(Self {
-            decoder,
+            decoder: Decoder {
+                function,
+                declarations,
+                decoding,
+                opcode,
+            },
             arguments: dispatch.arguments.clone(),
         })
     }
@@ -120,20 +142,26 @@ impl Dispatch {
                 Argument::Other => Value::Undefined,
             })
             .collect();
-        interpret::decode(session, program, &self.decoder, arguments, pc, key)
+        interpret::decode(session, program, self.decoder.routine(), arguments, pc, key)
+    }
+}
+
+/// The statements of a block, or `statement` alone.
+fn block_statements<'b, 'a>(statement: &'b Statement<'a>) -> &'b [Statement<'a>] {
+    match statement {
+        Statement::BlockStatement(block) => &block.body,
+        statement => slice::from_ref(statement),
     }
 }
 
 /// Matches `<opcode> < 0` or `0 > <opcode>`.
-fn is_negative(test: &Expr, opcode: &Ident) -> bool {
-    let Some(test) = test.unwrap_parens().as_bin() else {
+fn is_negative<'a>(test: &Expression<'a>, is_opcode: impl Fn(&Expression<'a>) -> bool) -> bool {
+    let Expression::BinaryExpression(test) = test.without_parentheses() else {
         return false;
     };
-    let is_opcode = |expr: &Expr| expr.as_ident().is_some_and(|name| name.sym == opcode.sym);
-    let is_zero = |expr: &Expr| matches!(expr, Expr::Lit(Lit::Num(number)) if number.value == 0.0);
-    match test.op {
-        BinaryOp::Lt => is_opcode(&test.left) && is_zero(&test.right),
-        BinaryOp::Gt => is_zero(&test.left) && is_opcode(&test.right),
+    match test.operator {
+        BinaryOperator::LessThan => is_opcode(&test.left) && test.right.is_number_0(),
+        BinaryOperator::GreaterThan => test.left.is_number_0() && is_opcode(&test.right),
         _ => false,
     }
 }

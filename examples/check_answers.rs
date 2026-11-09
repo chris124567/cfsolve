@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::{env, fs};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use cfsolve::capture::CapturedSession;
 use cfsolve::js::JsValue;
 use cfsolve::stage2::analysis;
@@ -61,6 +61,6 @@ fn main() -> Result<()> {
         println!("{path}: {checked} replayed records, {differing} differ");
         mismatched += differing;
     }
-    anyhow::ensure!(mismatched == 0, "{mismatched} records differ");
+    ensure!(mismatched == 0, "{mismatched} records differ");
     Ok(())
 }

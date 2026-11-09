@@ -3,75 +3,97 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
-use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignTarget, BinaryOp, CallExpr, Callee, Expr, Function, IfStmt,
-    SimpleAssignTarget, UnaryOp,
+use oxc::ast::AstKind;
+use oxc::ast::ast::{
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, CallExpression, Expression,
+    Function, IfStatement, MethodDefinition, ObjectProperty,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::SymbolId;
+use oxc::syntax::operator::{LogicalOperator, UnaryOperator};
+use oxc::syntax::scope::ScopeFlags;
 
 use crate::challenge::expression;
-use crate::js::{JsObject, JsValue, Options, ast};
+use crate::js::ast::{self, Binding, Script};
+use crate::js::{JsObject, JsValue, Options};
 use crate::script::Source;
+use crate::stage2::syntax::{
+    assigned_member, is_optional_call, member, plain_parameter, walk_method, walk_property,
+};
 use crate::{candidates, js};
 
 /// How many nested expressions and aliases [`Builder::value`] follows.
 const VALUE_DEPTH: usize = 16;
 
 /// Tracks member-read aliases and the functions that fill an element with a message.
-#[derive(Default)]
-struct Declarations {
-    aliases: BTreeMap<String, Box<Expr>>,
+struct Declarations<'a> {
+    /// The member read first assigned to each binding.
+    aliases: BTreeMap<Binding<'a>, &'a Expression<'a>>,
     /// Each message function, with the selectors its link binder queries.
-    messages: BTreeMap<String, Vec<String>>,
+    messages: BTreeMap<Binding<'a>, Vec<String>>,
 }
 
 /// Identifies a message function from its writes to its first parameter.
-#[derive(Default)]
-struct Adapters {
-    parameter: String,
+struct Adapters<'a> {
+    script: Script<'a>,
+    parameter: SymbolId,
     html: bool,
     /// Functions that receive an element and a computed message, such as a translation.
-    translated: Vec<String>,
+    translated: Vec<Binding<'a>>,
     /// Functions that receive the element, such as link binders.
-    forwarded: Vec<String>,
+    forwarded: Vec<Binding<'a>>,
 }
 
-impl Visit for Adapters {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(member)) = &assignment.left
-            && ast::member_str(&member.prop) == Some("innerHTML")
-            && matches!(&*member.obj, Expr::Ident(name) if name.sym == self.parameter)
+impl<'a> Visit<'a> for Adapters<'a> {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let Some(member) = assigned_member(&assignment.left)
+            && ast::member_str(member) == Some("innerHTML")
+            && self.script.refers_to(member.object(), self.parameter)
         {
             self.html = true;
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Ident(name) = &**callee
-            && call.args.first().is_some_and(|argument| {
-                matches!(&*argument.expr, Expr::Ident(name) if name.sym == self.parameter)
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !is_optional_call(call)
+            && let Expression::Identifier(name) = &call.callee
+            && call.arguments.first().is_some_and(|argument| {
+                self.script
+                    .refers_to(ast::argument_expression(argument), self.parameter)
             })
         {
-            self.forwarded.push(name.sym.to_string());
-            if call.args.get(1).is_some_and(|argument| argument.expr.is_call()) {
-                self.translated.push(name.sym.to_string());
+            let callee = self.script.binding(name);
+            self.forwarded.push(callee);
+            if call.arguments.get(1).is_some_and(|argument| {
+                matches!(
+                    ast::argument_expression(argument),
+                    Expression::CallExpression(_)
+                )
+            }) {
+                self.translated.push(callee);
             }
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
-impl Visit for Declarations {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(name)) = &assignment.left
-            && matches!(&*assignment.right, Expr::Member(_))
-        {
-            self.aliases
-                .entry(name.id.sym.to_string())
-                .or_insert_with(|| assignment.right.clone());
+impl<'a> Declarations<'a> {
+    fn new(script: Script<'a>) -> Self {
+        let mut aliases = BTreeMap::new();
+        for node in script.nodes.iter() {
+            if let AstKind::AssignmentExpression(assignment) = node.kind()
+                && let AssignmentTarget::AssignmentTargetIdentifier(name) = &assignment.left
+                && member(&assignment.right).is_some()
+            {
+                aliases
+                    .entry(script.binding(name))
+                    .or_insert(&assignment.right);
+            }
         }
-        assignment.visit_children_with(self);
+        Self {
+            aliases,
+            messages: BTreeMap::new(),
+        }
     }
 }
 
@@ -90,187 +112,212 @@ fn translation(object: &JsObject, key: &str) -> Option<String> {
 }
 
 /// The selectors a function body passes to `querySelectorAll`, in order.
-#[derive(Default)]
-struct Queries(Vec<String>);
+struct Queries<'a> {
+    script: Script<'a>,
+    found: Vec<String>,
+}
 
-impl Visit for Queries {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Some(member) = call.callee.as_expr().and_then(|callee| callee.as_member())
-            && ast::member_str(&member.prop) == Some("querySelectorAll")
-            && let Some(selector) = call.args.first()
-            && let Some(JsValue::String(selector)) =
-                expression::static_value(&selector.expr, &Options::new())
+impl<'a> Visit<'a> for Queries<'a> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if !is_optional_call(call)
+            && let Some(member) = member(&call.callee)
+            && ast::member_str(member) == Some("querySelectorAll")
+            && let Some(selector) = call.arguments.first()
+            && let Some(JsValue::String(selector)) = expression::static_value(
+                self.script,
+                ast::argument_expression(selector),
+                &Options::new(),
+            )
         {
-            self.0.push(selector);
+            self.found.push(selector);
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
 /// Statically evaluates one function body to find the elements it creates and the messages it
 /// fills. Selects known branches and skips nested functions.
-struct Builder<'input> {
-    declarations: &'input Declarations,
+struct Builder<'a, 'input> {
+    script: Script<'a>,
+    declarations: &'input Declarations<'a>,
     options: &'input Options,
-    values: BTreeMap<String, JsValue>,
-    /// The variables holding created elements, with each one's `type` attribute.
-    elements: BTreeMap<String, Option<String>>,
+    values: BTreeMap<Binding<'a>, JsValue>,
+    /// The bindings holding created elements, with each one's `type` attribute.
+    elements: BTreeMap<Binding<'a>, Option<String>>,
     /// Selectors queried by filled messages, in query order.
     queried: Vec<String>,
 }
 
-impl Builder<'_> {
-    fn value(&self, expression: &Expr, depth: usize) -> Option<JsValue> {
+impl<'a> Builder<'a, '_> {
+    fn value(&self, expression: &Expression<'a>, depth: usize) -> Option<JsValue> {
         if depth == 0 {
             return None;
         }
-        if let Some(value) = expression::static_value(expression, self.options) {
+        if let Some(value) = expression::static_value(self.script, expression, self.options) {
             return Some(value);
         }
         match expression {
-            Expr::Ident(name) => self.values.get(name.sym.as_ref()).cloned().or_else(|| {
-                self.value(self.declarations.aliases.get(name.sym.as_ref())?, depth - 1)
-            }),
-            Expr::Member(member) => self
-                .value(&member.obj, depth - 1)?
-                .get(ast::member_str(&member.prop)?)
+            Expression::Identifier(name) => {
+                let name = self.script.binding(name);
+                self.values
+                    .get(&name)
+                    .cloned()
+                    .or_else(|| self.value(self.declarations.aliases.get(&name)?, depth - 1))
+            }
+            expression if let Some(member) = member(expression) => self
+                .value(member.object(), depth - 1)?
+                .get(ast::member_str(member)?)
                 .cloned(),
-            Expr::Unary(unary) if unary.op == UnaryOp::Bang => Some(JsValue::Bool(!js::truthy(
-                &self.value(&unary.arg, depth - 1)?,
-            ))),
-            Expr::Bin(binary)
-                if matches!(binary.op, BinaryOp::LogicalOr | BinaryOp::LogicalAnd) =>
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                Some(JsValue::Bool(!js::truthy(
+                    &self.value(&unary.argument, depth - 1)?,
+                )))
+            }
+            Expression::LogicalExpression(logical)
+                if matches!(logical.operator, LogicalOperator::Or | LogicalOperator::And) =>
             {
-                let left = self.value(&binary.left, depth - 1)?;
-                if js::truthy(&left) == (binary.op == BinaryOp::LogicalOr) {
+                let left = self.value(&logical.left, depth - 1)?;
+                if js::truthy(&left) == (logical.operator == LogicalOperator::Or) {
                     Some(left)
                 } else {
-                    self.value(&binary.right, depth - 1)
+                    self.value(&logical.right, depth - 1)
                 }
             }
-            Expr::Call(call) => {
-                let key = self.value(&call.args.first()?.expr, depth - 1)?;
+            Expression::CallExpression(call) => {
+                let key =
+                    self.value(ast::argument_expression(call.arguments.first()?), depth - 1)?;
                 translation(self.options, key.as_str()?).map(JsValue::String)
             }
             _ => None,
         }
     }
     /// The expression's value as `setAttribute` converts it: `String(value)`.
-    fn text(&self, expression: &Expr) -> Option<String> {
+    fn text(&self, expression: &Expression<'a>) -> Option<String> {
         let value = self.value(expression, VALUE_DEPTH)?;
         Some(js::string(Some(&value)))
     }
     /// Whether `call` creates an element with `createElement(NS)` and a known tag.
-    fn creates(&self, call: &CallExpr) -> bool {
-        let Some(Expr::Member(member)) = call.callee.as_expr().map(|callee| &**callee) else {
+    fn creates(&self, call: &CallExpression<'a>) -> bool {
+        let Some(member) = member(&call.callee) else {
             return false;
         };
-        let tag = match ast::member_str(&member.prop) {
+        let tag = match ast::member_str(member) {
             Some("createElement") => 0,
             Some("createElementNS") => 1,
             _ => return false,
         };
-        call.args
+        call.arguments
             .get(tag)
-            .is_some_and(|tag| self.text(&tag.expr).is_some())
+            .is_some_and(|tag| self.text(ast::argument_expression(tag)).is_some())
     }
 }
 
-impl Visit for Builder<'_> {
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-    fn visit_if_stmt(&mut self, statement: &IfStmt) {
+impl<'a> Visit<'a> for Builder<'a, '_> {
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        walk_property(self, property);
+    }
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        walk_method(self, method);
+    }
+    fn visit_if_statement(&mut self, statement: &IfStatement<'a>) {
         match self.value(&statement.test, VALUE_DEPTH) {
-            Some(value) if js::truthy(&value) => statement.cons.visit_with(self),
-            Some(_) => statement.alt.visit_with(self),
-            None => statement.visit_children_with(self),
-        }
-    }
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        let expression = &*assignment.right;
-        match &assignment.left {
-            AssignTarget::Simple(SimpleAssignTarget::Ident(name)) => {
-                let name = name.id.sym.to_string();
-                if let Expr::Call(call) = expression
-                    && self.creates(call)
-                {
-                    self.elements.insert(name, None);
-                } else if let Some(value) = self.value(expression, VALUE_DEPTH) {
-                    self.values.insert(name, value);
+            Some(value) if js::truthy(&value) => self.visit_statement(&statement.consequent),
+            Some(_) => {
+                if let Some(alternate) = &statement.alternate {
+                    self.visit_statement(alternate);
                 }
             }
-            AssignTarget::Simple(SimpleAssignTarget::Member(member))
-                if ast::member_str(&member.prop) == Some("type") =>
+            None => walk::walk_if_statement(self, statement),
+        }
+    }
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        let expression = &assignment.right;
+        if let AssignmentTarget::AssignmentTargetIdentifier(name) = &assignment.left {
+            let name = self.script.binding(name);
+            if let Expression::CallExpression(call) = expression
+                && self.creates(call)
             {
-                if let Expr::Ident(name) = &*member.obj
-                    && let Some(value) = self.text(expression)
-                    && let Some(kind) = self.elements.get_mut(name.sym.as_ref())
-                {
-                    *kind = Some(value);
-                }
+                self.elements.insert(name, None);
+            } else if let Some(value) = self.value(expression, VALUE_DEPTH) {
+                self.values.insert(name, value);
             }
-            _ => {}
+        } else if let Some(member) = assigned_member(&assignment.left)
+            && ast::member_str(member) == Some("type")
+            && let Expression::Identifier(name) = member.object()
+            && let Some(value) = self.text(expression)
+            && let Some(kind) = self.elements.get_mut(&self.script.binding(name))
+        {
+            *kind = Some(value);
         }
     }
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        let Callee::Expr(callee) = &call.callee else {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        // An optional call's operands may still make calls.
+        if is_optional_call(call) {
+            walk::walk_call_expression(self, call);
             return;
-        };
-        match &**callee {
-            Expr::Member(member) => {
-                if ast::member_str(&member.prop) == Some("setAttribute")
-                    && let Expr::Ident(name) = &*member.obj
-                    && let [key, value] = &call.args[..]
-                    && let (Some(key), Some(value)) = (self.text(&key.expr), self.text(&value.expr))
-                    && key == "type"
-                    && let Some(kind) = self.elements.get_mut(name.sym.as_ref())
-                {
-                    *kind = Some(value);
-                }
+        }
+        if let Some(member) = member(&call.callee) {
+            if ast::member_str(member) == Some("setAttribute")
+                && let Expression::Identifier(name) = member.object()
+                && let [key, value] = &call.arguments[..]
+                && let (Some(key), Some(value)) = (
+                    self.text(ast::argument_expression(key)),
+                    self.text(ast::argument_expression(value)),
+                )
+                && key == "type"
+                && let Some(kind) = self.elements.get_mut(&self.script.binding(name))
+            {
+                *kind = Some(value);
             }
+        } else if let Expression::Identifier(message) = &call.callee
             // Filling a message binds its links, running their queries.
-            Expr::Ident(message) => {
-                if let Some(queries) = self.declarations.messages.get(message.sym.as_ref()) {
-                    self.queried.extend(queries.iter().cloned());
-                }
-            }
-            _ => {}
+            && let Some(queries) = self.declarations.messages.get(&self.script.binding(message))
+        {
+            self.queried.extend(queries.iter().cloned());
         }
     }
-}
-
-/// The name of `function`'s first parameter, if it is a plain identifier.
-fn first_parameter(function: &Function) -> Option<String> {
-    Some(function.params.first()?.pat.as_ident()?.id.sym.to_string())
 }
 
 /// Returns selectors queried by the checkbox constructor, in order. Includes link-binding
 /// queries from every message it fills; the iframe records all of them.
 pub fn queries(source: &Source, options: &Options) -> Result<Vec<String>> {
-    let parsed = source.parsed();
-    let functions = ast::declared_functions(&parsed.script);
-    let mut syntax = Declarations::default();
-    parsed.script.visit_with(&mut syntax);
+    let script = source.script();
+    let functions: Vec<(SymbolId, &Function)> = script
+        .in_declared_functions(|function| Some((function.id.as_ref()?.symbol_id(), function)));
+    let mut syntax = Declarations::new(script);
     let mut translators = Vec::new();
-    for (name, function) in &functions {
-        let (Some(parameter), Some(body)) = (first_parameter(function), &function.body) else {
+    for &(name, function) in &functions {
+        let (Some(parameter), Some(body)) = (
+            function.params.items.first().and_then(plain_parameter),
+            &function.body,
+        ) else {
             continue;
         };
         let mut adapter = Adapters {
+            script,
             parameter,
-            ..Adapters::default()
+            html: false,
+            translated: Vec::new(),
+            forwarded: Vec::new(),
         };
-        body.visit_with(&mut adapter);
+        adapter.visit_function_body(body);
         if adapter.html {
             // A message function hands the element it fills to a link binder.
-            let mut queries = Queries::default();
+            let mut queries = Queries {
+                script,
+                found: Vec::new(),
+            };
             for callee in &adapter.forwarded {
-                let binder = functions.iter().find(|(binder, _)| binder == callee);
+                let binder = functions
+                    .iter()
+                    .find(|(binder, _)| Binding::Symbol(*binder) == *callee);
                 if let Some(body) = binder.and_then(|(_, binder)| binder.body.as_ref()) {
-                    body.visit_with(&mut queries);
+                    queries.visit_function_body(body);
                 }
             }
-            syntax.messages.insert(name.clone(), queries.0);
+            syntax.messages.insert(Binding::Symbol(name), queries.found);
         }
         translators.push((name, adapter.translated));
     }
@@ -282,26 +329,31 @@ pub fn queries(source: &Source, options: &Options) -> Result<Vec<String>> {
             .iter()
             .find_map(|callee| syntax.messages.get(callee));
         if let Some(queries) = filled {
-            translated.insert(name.clone(), queries.clone());
+            translated.insert(Binding::Symbol(name), queries.clone());
         }
     }
     syntax.messages.extend(translated);
     let mut constructors = Vec::new();
-    for (_, function) in &functions {
+    for &(_, function) in &functions {
         let Some(body) = &function.body else {
             continue;
         };
         let mut builder = Builder {
+            script,
             declarations: &syntax,
             options,
-            values: first_parameter(function)
+            values: function
+                .params
+                .items
+                .first()
+                .and_then(plain_parameter)
                 .into_iter()
-                .map(|name| (name, JsValue::Bool(true)))
+                .map(|name| (Binding::Symbol(name), JsValue::Bool(true)))
                 .collect(),
             elements: BTreeMap::new(),
             queried: Vec::new(),
         };
-        body.visit_with(&mut builder);
+        builder.visit_function_body(body);
         if builder
             .elements
             .values()

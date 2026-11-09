@@ -419,8 +419,11 @@ fn schedule(key: [u32; 4]) -> [u32; 64] {
     keys
 }
 
+fn mix(value: u32) -> u32 {
+    ((value << 4) ^ (value >> 5)).wrapping_add(value)
+}
+
 fn encrypt_block([mut a, mut b]: [u32; 2], keys: &[u32; 64]) -> [u32; 2] {
-    let mix = |value: u32| ((value << 4) ^ (value >> 5)).wrapping_add(value);
     for [first, second] in keys.as_chunks::<2>().0 {
         a = a.wrapping_add(mix(b) ^ first);
         b = b.wrapping_add(mix(a) ^ second);
@@ -429,7 +432,6 @@ fn encrypt_block([mut a, mut b]: [u32; 2], keys: &[u32; 64]) -> [u32; 2] {
 }
 
 fn decrypt_block([mut a, mut b]: [u32; 2], keys: &[u32; 64]) -> [u32; 2] {
-    let mix = |value: u32| ((value << 4) ^ (value >> 5)).wrapping_add(value);
     let (rounds, _) = keys.as_chunks::<2>();
     for [first, second] in rounds.iter().rev() {
         b = b.wrapping_sub(mix(a) ^ second);

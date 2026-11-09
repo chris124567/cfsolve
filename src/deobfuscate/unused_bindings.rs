@@ -12,138 +12,128 @@
 //! Leaves globals, whose writes other scripts can observe, and parameters of functions using
 //! `arguments`, whose writes `arguments` reflects.
 
-use swc_core::common::util::take::Take;
-use swc_core::ecma::ast::{Decl, Expr, Id, Lit, Program, SeqExpr, Stmt, VarDeclarator};
-use swc_core::ecma::visit::{VisitMut, VisitMutWith};
+use oxc::allocator::{CloneIn, GetAllocator, Vec};
+use oxc::ast::ast::{Expression, Program, SequenceExpression, Statement, VariableDeclarator};
+use oxc::ast_visit::{VisitMut, walk_mut};
+use oxc_ecmascript::side_effects::MayHaveSideEffects;
 
-use super::analysis::{Analysis, Bindings, Globals};
-use super::{HashMap, removal};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::{HashMap, ast};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let globals = analysis.globals;
-    let mut remove = RemoveUnused {
-        bindings: analysis.bindings(program),
-        globals,
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let mut remove = Remove {
+        analysis,
         removed: HashMap::default(),
         changed: false,
     };
-    program.visit_mut_with(&mut remove);
+    remove.visit_program(program);
     remove.changed
 }
 
-struct RemoveUnused<'bindings> {
-    bindings: &'bindings Bindings,
-    globals: Globals,
-    /// How many writes of each binding this pass has removed. Statement lists are visited
-    /// after the lists they contain, so a declaration sees the definitions removed below it.
+struct Remove<'b, 'a> {
+    analysis: &'b Analysis<'a>,
     removed: HashMap<Id, usize>,
     changed: bool,
 }
 
-impl RemoveUnused<'_> {
-    fn is_unused(&self, id: &Id) -> bool {
-        id.1 != self.globals.unresolved
-            && self.bindings.references(id) == 0
-            && !self.bindings.is_mapped_parameter(id)
+impl<'a> Remove<'_, 'a> {
+    fn is_unused(&self, id: Id) -> bool {
+        !id.is_global()
+            && self.analysis.bindings.references(&id) == 0
+            && !self.analysis.bindings.is_mapped_parameter(&id)
     }
 
-    /// Recognizes an assignment of an effect-free value to an unused binding. Records the
-    /// removed write.
-    fn remove_definition(&mut self, expression: &Expr) -> bool {
-        match ast::assignment(expression) {
-            Some((id, value)) if self.is_unused(&id) && self.is_pure(value) => {
-                *self.removed.entry(id).or_default() += 1;
-                true
-            }
-            _ => false,
-        }
+    fn is_pure(&self, expression: &Expression<'a>) -> bool {
+        !matches!(expression, Expression::ObjectExpression(_))
+            && !expression.may_have_side_effects(self.analysis)
     }
 
-    /// Whether evaluating `value` has no effects and cannot throw. Reading a global can throw
-    /// or run a getter; reading a local cannot.
-    fn is_pure(&self, value: &Expr) -> bool {
-        match value {
-            Expr::Fn(_) | Expr::Arrow(_) | Expr::Lit(_) => true,
-            Expr::Ident(identifier) => identifier.ctxt != self.globals.unresolved,
-            Expr::Tpl(template) => template.exprs.is_empty(),
-            Expr::Paren(paren) => self.is_pure(&paren.expr),
-            Expr::Array(array) => array
-                .elems
-                .iter()
-                .flatten()
-                .all(|element| element.spread.is_none() && self.is_pure(&element.expr)),
-            _ => false,
-        }
-    }
-
-    /// Matches an unused binding declaration, with or without an initializer, only when no
-    /// remaining write needs the binding. Initializers must have no effects. Removing a
-    /// declaration while keeping a write could turn that write into a global assignment.
-    fn is_declaration(&self, declarator: &VarDeclarator) -> bool {
-        let Some(name) = declarator.name.as_ident() else {
+    /// Checks for a removable definition of an unused binding, and counts it as removed.
+    fn remove_definition(&mut self, expression: &Expression<'a>) -> bool {
+        let Some((id, value)) = self.analysis.assignment(expression) else {
             return false;
         };
-        let id = name.to_id();
+        let removable = self.is_unused(id) && self.is_pure(value);
+        if removable {
+            *self.removed.entry(id).or_default() += 1;
+        }
+        removable
+    }
+
+    fn is_dead_statement(&mut self, statement: &Statement<'a>) -> bool {
+        let Statement::ExpressionStatement(statement) = statement else {
+            return false;
+        };
+        let expression = &statement.expression;
+        self.remove_definition(expression)
+            || (!matches!(expression, Expression::StringLiteral(_)) && self.is_pure(expression))
+    }
+
+    /// Checks that every write to an unused declared binding has been removed except its
+    /// initializer, which must be pure.
+    fn is_dead_declarator(&self, declarator: &VariableDeclarator<'a>) -> bool {
+        let Some(id) = ast::pattern_id(&declarator.id) else {
+            return false;
+        };
         let removed = self.removed.get(&id).copied().unwrap_or(0);
-        self.is_unused(&id)
-            && self.bindings.write_count(&id) - removed == usize::from(declarator.init.is_some())
-            && declarator
-                .init
-                .as_deref()
-                .is_none_or(|value| self.is_pure(value))
+        let writes = self
+            .analysis
+            .bindings
+            .write_count(&id)
+            .saturating_sub(removed);
+        let init = declarator.init.as_ref();
+        self.is_unused(id)
+            && writes == usize::from(init.is_some())
+            && init.is_none_or(|value| self.is_pure(value))
     }
 }
 
-impl VisitMut for RemoveUnused<'_> {
-    fn visit_mut_seq_expr(&mut self, sequence: &mut SeqExpr) {
-        sequence.visit_mut_children_with(self);
-        // The last operand supplies the sequence's value.
-        if let Some(last) = sequence.exprs.pop() {
-            self.changed |= removal::retain(&mut sequence.exprs, |operand| {
-                !self.remove_definition(operand)
-            });
-            sequence.exprs.push(last);
+impl<'a> VisitMut<'a> for Remove<'_, 'a> {
+    fn visit_sequence_expression(&mut self, sequence: &mut SequenceExpression<'a>) {
+        walk_mut::walk_sequence_expression(self, sequence);
+        if let Some(last) = sequence.expressions.pop() {
+            let before = sequence.expressions.len();
+            sequence
+                .expressions
+                .retain(|expression| !self.remove_definition(expression));
+            self.changed |= sequence.expressions.len() != before;
+            sequence.expressions.push(last)
         }
     }
 
-    fn visit_mut_expr(&mut self, expression: &mut Expr) {
-        expression.visit_mut_children_with(self);
-        if let Expr::Seq(sequence) = expression
-            && sequence.exprs.len() == 1
-        {
-            *expression = *sequence.exprs.remove(0);
-        }
-        // Dropping `unused` preserves the value of `other = value`.
-        if let Some((id, value)) = ast::assignment(expression)
-            && value.is_assign()
-            && self.is_unused(&id)
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+        let allocator = self.analysis.allocator();
+        if let Some((id, value)) = self.analysis.assignment(expression)
+            && matches!(value, Expression::AssignmentExpression(_))
+            && self.is_unused(id)
         {
             *self.removed.entry(id).or_default() += 1;
-            *expression = *expression.take().expect_assign().right;
+            *expression = value.clone_in_with_semantic_ids(allocator);
+            self.changed = true
+        } else if let Expression::SequenceExpression(sequence) = expression
+            && let [only] = sequence.expressions.as_slice()
+        {
+            *expression = only.clone_in_with_semantic_ids(allocator);
             self.changed = true;
         }
     }
 
-    fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
-        statements.visit_mut_children_with(self);
-        // Remove unused definitions and statements with no side effects, including decoy arrays of
-        // helpers. Keep strings that may be directives.
-        self.changed |= removal::remove_expr_stmts(statements, |expression| {
-            self.remove_definition(expression)
-                || (!matches!(expression, Expr::Lit(Lit::Str(_))) && self.is_pure(expression))
+    fn visit_statements(&mut self, statements: &mut Vec<'a, Statement<'a>>) {
+        walk_mut::walk_statements(self, statements);
+        let before = statements.len();
+        statements.retain(|statement| !self.is_dead_statement(statement));
+        statements.retain_mut(|statement| {
+            let Statement::VariableDeclaration(declaration) = statement else {
+                return true;
+            };
+            let declarations = &mut declaration.declarations;
+            let count = declarations.len();
+            declarations.retain(|declarator| !self.is_dead_declarator(declarator));
+            self.changed |= declarations.len() != count;
+            !declarations.is_empty()
         });
-        for statement in statements.iter_mut() {
-            if let Stmt::Decl(Decl::Var(declaration)) = statement {
-                self.changed |= removal::retain(&mut declaration.decls, |declarator| {
-                    !self.is_declaration(declarator)
-                });
-            }
-        }
-        removal::retain(statements, |statement| match statement {
-            Stmt::Decl(Decl::Var(declaration)) => !declaration.decls.is_empty(),
-            _ => true,
-        });
+        self.changed |= statements.len() != before;
     }
 }
 
@@ -153,23 +143,23 @@ mod tests {
 
     #[test]
     fn removes_unread_locals_but_keeps_globals_effects_and_mapped_parameters() {
-        let transform = |source: &str| testing::rewrite(source, super::run, /* fix= */ true);
+        let transform = |source: &str| testing::rewrite(source, super::run);
         // Removing `all` leaves `add` unread, for the pipeline's next round.
         let output = transform(&transform(
             "function f(a, b) { var unused, add, all, kept = g(); \
              add = function(x) { var scratch; return x; }; all = [add, a]; return a + b; }",
         ));
         let expected = "function f(a, b) { var kept = g(); return a + b; }";
-        testing::assert_contains(&output, &[], &[expected]);
+        testing::assert_contains(&output, &[expected]);
         let output = transform(
             "global = function() {}; function f(a) { var v, w; v = g(); w = [missing]; \
              return arguments; } function h(p) { p = 1; return arguments; }",
         );
         let kept = ["global = function", "var v", "v = g()", "w = [", "p = 1"];
-        testing::assert_contains(&output, &kept, &[]);
+        testing::assert_contains(&output, &kept);
         let output = transform("function f(a) { 'use strict'; [a, function() {}]; a; g(a); }");
-        testing::assert_contains(&output, &["'use strict';"], &["{ 'use strict'; g(a); }"]);
+        testing::assert_contains(&output, &["'use strict';", "{ 'use strict'; g(a); }"]);
         let output = transform("function f() { var c, o; c = o = g(); h(c = o = 1); return o; }");
-        testing::assert_contains(&output, &["var o;", "o = g();", "h(o = 1);"], &[]);
+        testing::assert_contains(&output, &["var o;", "o = g();", "h(o = 1);"]);
     }
 }

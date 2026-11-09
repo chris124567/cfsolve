@@ -143,7 +143,7 @@ impl Channel<'_> {
             .context("reading challenge POST response")?;
         sink.json(&format!("{name}-network.json"), &network)?;
         let fetch = timer.phased(url.as_str(), waiting_ms, network.encoded_bytes);
-        sink.artifact(&format!("{name}.bin"), &body)?;
+        sink.save(&format!("{name}.bin"), &body)?;
         sink.progress(&format!(
             "POST returned HTTP {status}; saved {} bytes",
             body.len()
@@ -155,7 +155,7 @@ impl Channel<'_> {
             ));
         }
         let text = codec::decode_response(&body, request.ray()?)?;
-        sink.artifact(&format!("{name}.decoded.txt"), &text)?;
+        sink.save(&format!("{name}.decoded.txt"), &text)?;
         let received_ms = performance_clock::epoch_ms();
         let program = STANDARD.decode(text).with_context(|| {
             format!(

@@ -6,19 +6,22 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail, ensure};
 use indexmap::IndexMap;
-use serde::{Deserialize, Deserializer, Serialize};
-use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignTarget, BinaryOp, CallExpr, Expr, FnDecl, Function, Id, IfStmt,
-    MemberExpr, ObjectLit, SimpleAssignTarget, Stmt, VarDeclarator,
+use oxc::ast::ast::{
+    ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingPattern,
+    CallExpression, Expression, Function, IfStatement, MemberExpression, ObjectExpression,
+    Statement, VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::{ScopeFlags, SymbolId};
+use oxc::syntax::operator::BinaryOperator;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::candidates;
 use crate::challenge::payload::Field;
 use crate::challenge::reduced_timing::{self, ResourceTiming};
 use crate::challenge::tally::{self, CounterEvents, Tally};
 use crate::challenge::{expression, source};
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{self, Binding, Script};
 use crate::js::{JsObject, JsValue, Options, Payload, json};
 use crate::resource_timing::LoadTiming;
 
@@ -47,7 +50,7 @@ pub struct Getter {
     pub option: String,
     /// The option holding the page origin, when the getter passes each render sample's stack
     /// through a helper that replaces URLs on that origin with indices (see
-    /// [`crate::challenge::payload::split_page_urls`]).
+    /// `crate::challenge::payload::split_page_urls`).
     pub page_origin: Option<String>,
 }
 
@@ -165,22 +168,23 @@ fn unsigned<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error>
 impl ScriptState {
     #[cfg(test)]
     pub(crate) fn from_javascript(javascript: &str) -> Result<Self> {
-        let parsed = ast::parse_iframe_javascript(javascript)?;
-        Self::from_parsed(&parsed, &source::bootstrap_options(&parsed))
+        let parsed = ast::ParsedScript::parse("t", javascript)?;
+        let script = parsed.script();
+        Self::from_script(script, &source::bootstrap_options(script))
     }
 
     /// Recovers the state of a parsed script, using bootstrap options to identify its payload
     /// template.
-    pub(crate) fn from_parsed(parsed: &ParsedScript, options: &Options) -> Result<Self> {
-        let script = &parsed.script;
+    pub(crate) fn from_script(script: Script<'_>, options: &Options) -> Result<Self> {
         let mut scopes = Scopes {
+            script,
             options,
             stack: Vec::new(),
             found: Vec::new(),
         };
-        script.visit_with(&mut scopes);
-        let mut sender = Sender::default();
-        script.visit_with(&mut sender);
+        scopes.visit_program(script.program);
+        let mut sender = Sender::new(script);
+        sender.visit_program(script.program);
         let post_log = sender.post_log()?;
         let elapsed = candidates::at_most_one_distinct(sender.elapsed, "elapsed-time field")?;
         let sender_scope = elapsed.as_ref().map(|(scope, _)| *scope);
@@ -194,14 +198,14 @@ impl ScriptState {
             collected.into_iter().map(|(_, key)| key),
             "collected resource timing option",
         )?;
-        let tallies = ast::in_declared_functions(script, |function| {
-            tally::published_tally(function.function.body.as_ref()?)
+        let tallies = script.in_declared_functions(|function| {
+            tally::published_tally(script, function.body.as_ref()?)
         });
         let counters = candidates::at_most_one_distinct(tallies, "interaction tally")?;
         let timing = match collected {
             Some(option) => {
-                let reductions = ast::in_declared_functions(script, |function| {
-                    reduced_timing::reduction(function.function.body.as_ref()?)
+                let reductions = script.in_declared_functions(|function| {
+                    reduced_timing::reduction(script, function.body.as_ref()?)
                 });
                 candidates::at_most_one_distinct(reductions, "resource timing reducer")?
                     .map(|fields| ResourceTiming { option, fields })
@@ -218,7 +222,7 @@ impl ScriptState {
             elapsed: elapsed.map(|(_, elapsed)| elapsed),
             forwarded: forwarded.into_iter().map(|(_, key)| key).collect(),
             timing,
-            getters: distinct_getters(sender.getters, &sender.helpers)?,
+            getters: distinct_getters(script, sender.getters, &sender.helpers)?,
             post_log,
         })
     }
@@ -233,22 +237,19 @@ impl ScriptState {
         bail!("could not recover the iframe's input event counters: {reason}")
     }
 
-    fn builds_payload(&self, option: &str) -> bool {
-        self.marks
-            .iter()
-            .any(|mark| mark.option == option && mark.in_builder)
-    }
-
     /// Identifies the interval measured by `difference`, using `merged` as the marked option.
     /// Returns no interval if the script never marks the later timestamp.
     fn span(&self, difference: &Difference, merged: Option<&str>) -> Option<Span> {
-        let Difference { later, earlier } = difference;
-        if !self.marks.iter().any(|mark| &mark.option == later) {
-            return None;
-        }
-        Some(if self.builds_payload(later) {
+        // Whether any mark of the later timestamp is in the builder; `None` if it is never marked.
+        let in_builder = self
+            .marks
+            .iter()
+            .filter(|mark| mark.option == difference.later)
+            .map(|mark| mark.in_builder)
+            .max()?;
+        Some(if in_builder {
             Span::Collect
-        } else if Some(earlier.as_str()) == merged {
+        } else if Some(difference.earlier.as_str()) == merged {
             Span::Handoff
         } else {
             Span::Initialise
@@ -341,7 +342,8 @@ enum Span {
 /// Groups timestamps by their innermost function and finds the function containing the payload
 /// template. A template in a nested callback may subtract timestamps set by different
 /// functions.
-struct Scopes<'options> {
+struct Scopes<'options, 'a> {
+    script: Script<'a>,
     options: &'options Options,
     /// The enclosing functions, innermost last.
     stack: Vec<Scope>,
@@ -355,10 +357,10 @@ struct Scope {
     builds_payload: bool,
 }
 
-impl Scopes<'_> {
-    fn within<N: VisitWith<Self>>(&mut self, node: &N) {
+impl Scopes<'_, '_> {
+    fn within(&mut self, walk: impl FnOnce(&mut Self)) {
         self.stack.push(Scope::default());
-        node.visit_children_with(self);
+        walk(self);
         let scope = self.stack.pop().expect("entered a scope first");
         let marks = scope.marks.into_iter().map(|option| Mark {
             option,
@@ -368,81 +370,85 @@ impl Scopes<'_> {
     }
 }
 
-impl Visit for Scopes<'_> {
-    fn visit_function(&mut self, function: &Function) {
-        self.within(function);
+impl<'a> Visit<'a> for Scopes<'_, 'a> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        self.within(|scopes| walk::walk_function(scopes, function, flags));
     }
 
-    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        self.within(arrow);
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.within(|scopes| walk::walk_arrow_function_expression(scopes, arrow));
     }
 
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
         if let Some(option) = expression::option_assignment(&assignment.left)
-            && ast::is_date_now(&assignment.right)
+            && self.script.is_date_now(&assignment.right)
             && let Some(scope) = self.stack.last_mut()
         {
             scope.marks.push(option.to_owned());
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
-    fn visit_if_stmt(&mut self, conditional: &IfStmt) {
+    fn visit_if_statement(&mut self, conditional: &IfStatement<'a>) {
         let options = self.options;
         source::visit_taken_branches(self, conditional, options);
     }
 
-    fn visit_object_lit(&mut self, object: &ObjectLit) {
+    fn visit_object_expression(&mut self, object: &ObjectExpression<'a>) {
         if source::is_payload_template(object, self.options)
             && let Some(scope) = self.stack.last_mut()
         {
             scope.builds_payload = true;
         }
-        object.visit_children_with(self);
+        walk::walk_object_expression(self, object);
     }
 }
 
 /// Finds property writes that add payload fields or install namespace getters. Records the
 /// enclosing function for each write.
-#[derive(Default)]
-struct Sender {
+struct Sender<'a> {
+    script: Script<'a>,
     entered: usize,
     scopes: Vec<usize>,
     elapsed: Vec<(usize, Elapsed)>,
     copies: Vec<(usize, String)>,
-    getters: Vec<FoundGetter>,
+    getters: Vec<FoundGetter<'a>>,
     /// The first option each declared function reads, by binding.
-    helpers: HashMap<Id, String>,
-    pushes: Vec<Push>,
-    entries: Vec<LogEntry>,
-    stamps: Vec<Stamp>,
+    helpers: HashMap<SymbolId, String>,
+    pushes: Vec<Push<'a>>,
+    entries: Vec<LogEntry<'a>>,
+    stamps: Vec<Stamp<'a>>,
 }
 
 /// A namespace getter named `function` that returns the option `option`, rewriting each
 /// sample's stack with the declared function `rewrite`, if any.
-struct FoundGetter {
+struct FoundGetter<'a> {
     function: String,
     option: String,
-    rewrite: Option<Id>,
+    rewrite: Option<Binding<'a>>,
 }
 
 /// Finds `<sample>.s = <helper>(<sample>.s)`.
-#[derive(Default)]
-struct StackRewrite(Option<Id>);
+struct StackRewrite<'a> {
+    script: Script<'a>,
+    helper: Option<Binding<'a>>,
+}
 
-impl Visit for StackRewrite {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(target)) = &assignment.left
+impl<'a> Visit<'a> for StackRewrite<'a> {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let Some(target) = assignment.left.as_member_expression()
             && ast::ident_property(target) == Some("s")
-            && let Expr::Call(call) = &*assignment.right
-            && let Some(helper) = call.callee.as_expr().and_then(|callee| callee.as_ident())
-            && let [argument] = &call.args[..]
-            && let Some(read) = argument.expr.as_member()
+            && let Expression::CallExpression(call) = &assignment.right
+            && let Expression::Identifier(helper) = &call.callee
+            && let [argument] = &call.arguments[..]
+            && let Some(read) = argument
+                .as_expression()
+                .and_then(Expression::as_member_expression)
             && ast::ident_property(read) == Some("s")
         {
-            self.0 = Some(helper.to_id());
+            self.helper = Some(self.script.binding(helper));
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 }
 
@@ -450,35 +456,50 @@ impl Visit for StackRewrite {
 #[derive(Default)]
 struct OptionRead(Option<String>);
 
-impl Visit for OptionRead {
-    fn visit_member_expr(&mut self, member: &MemberExpr) {
+impl<'a> Visit<'a> for OptionRead {
+    fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
         if self.0.is_none()
-            && expression::is_options(&member.obj)
-            && let Some(option) = ast::member_str(&member.prop)
+            && expression::is_options(member.object())
+            && let Some(option) = ast::member_str(member)
         {
             self.0 = Some(option.to_owned());
         }
-        member.visit_children_with(self);
+        walk::walk_member_expression(self, member);
     }
 }
 
 /// Matches `_cf_chl_opt.<log>.push(<local>)`.
-struct Push {
+struct Push<'a> {
     log: String,
-    local: String,
+    local: Binding<'a>,
 }
 
 /// Matches `<local>.<key> = <clock>()`.
-struct Stamp {
-    local: String,
+struct Stamp<'a> {
+    local: Binding<'a>,
     key: String,
 }
 
-impl Sender {
-    fn within<N: VisitWith<Self>>(&mut self, node: &N) {
+impl<'a> Sender<'a> {
+    fn new(script: Script<'a>) -> Self {
+        Self {
+            script,
+            entered: 0,
+            scopes: Vec::new(),
+            elapsed: Vec::new(),
+            copies: Vec::new(),
+            getters: Vec::new(),
+            helpers: HashMap::new(),
+            pushes: Vec::new(),
+            entries: Vec::new(),
+            stamps: Vec::new(),
+        }
+    }
+
+    fn within(&mut self, walk: impl FnOnce(&mut Self)) {
         self.entered += 1;
         self.scopes.push(self.entered);
-        node.visit_children_with(self);
+        walk(self);
         self.scopes.pop();
     }
 
@@ -506,107 +527,114 @@ impl Sender {
 
 /// Finds a local initialized with a POST log entry: `{ url: new URL(...).href, count:
 /// _cf_chl_opt.<counter>, sent: clock() }`.
-struct LogEntry {
-    local: String,
+struct LogEntry<'a> {
+    local: Binding<'a>,
     fields: Vec<(String, Logged)>,
     counter: String,
 }
 
-impl LogEntry {
-    fn read(local: &str, value: &Expr) -> Option<Self> {
-        let Expr::Object(object) = value.unwrap_parens() else {
+impl<'a> LogEntry<'a> {
+    fn read(local: Binding<'a>, value: &Expression<'_>) -> Option<Self> {
+        let Expression::ObjectExpression(object) = value.without_parentheses() else {
             return None;
         };
         let mut fields = Vec::new();
         let mut counter = None;
         for property in ast::key_values(object) {
-            let value = property.value.unwrap_parens();
+            let value = property.value.without_parentheses();
             let logged = if let Some(option) = expression::option_key(value) {
                 counter = Some(option.to_owned());
                 Logged::Count
-            } else if value.as_call().is_some_and(|call| call.args.is_empty()) {
+            } else if matches!(value, Expression::CallExpression(call) if call.arguments.is_empty())
+            {
                 Logged::Sent
-            } else if let Expr::Member(member) = value
-                && ast::member_str(&member.prop) == Some("href")
-                && member.obj.unwrap_parens().is_new()
+            } else if let Some(member) = value.as_member_expression()
+                && ast::member_str(member) == Some("href")
+                && matches!(
+                    member.object().without_parentheses(),
+                    Expression::NewExpression(_)
+                )
             {
                 Logged::Url
             } else {
                 return None;
             };
-            fields.push((ast::key_str(&property.key)?.to_owned(), logged));
+            fields.push((
+                ast::key_str(&property.key, property.computed)?.to_owned(),
+                logged,
+            ));
         }
         let complete = fields.len() == 3
             && [Logged::Url, Logged::Count, Logged::Sent]
                 .iter()
                 .all(|logged| fields.iter().any(|(_, field)| field == logged));
         complete.then_some(Self {
-            local: local.to_owned(),
+            local,
             fields,
             counter: counter?,
         })
     }
 }
 
-impl Visit for Sender {
-    fn visit_function(&mut self, function: &Function) {
-        self.within(function);
-    }
-
-    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        let mut read = OptionRead::default();
-        declaration.function.visit_with(&mut read);
-        if let Some(option) = read.0 {
-            self.helpers.insert(declaration.ident.to_id(), option);
+impl<'a> Visit<'a> for Sender<'a> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        if function.is_declaration()
+            && let Some(name) = &function.id
+        {
+            let mut read = OptionRead::default();
+            read.visit_function(function, flags);
+            if let Some(option) = read.0 {
+                self.helpers.insert(name.symbol_id(), option);
+            }
         }
-        declaration.visit_children_with(self);
+        self.within(|sender| walk::walk_function(sender, function, flags));
     }
 
-    fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-        self.within(arrow);
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.within(|sender| walk::walk_arrow_function_expression(sender, arrow));
     }
 
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Some(local) = declarator.name.as_ident()
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(local) = &declarator.id
             && let Some(init) = &declarator.init
-            && let Some(entry) = LogEntry::read(&local.sym, init)
+            && let Some(entry) = LogEntry::read(Binding::Symbol(local.symbol_id()), init)
         {
             self.entries.push(entry);
         }
-        declarator.visit_children_with(self);
+        walk::walk_variable_declarator(self, declarator);
     }
 
-    fn visit_call_expr(&mut self, call: &CallExpr) {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         // `_cf_chl_opt.<log>.push(<entry>)`
-        if let Some(callee) = call.callee.as_expr().and_then(|callee| callee.as_member())
-            && ast::member_str(&callee.prop) == Some("push")
-            && let Some(option) = expression::option_key(&callee.obj)
-            && let [entry] = &call.args[..]
-            && let Some(local) = entry.expr.as_ident()
+        if let Some(callee) = call.callee.as_member_expression()
+            && ast::member_str(callee) == Some("push")
+            && let Some(option) = expression::option_key(callee.object())
+            && let [entry] = &call.arguments[..]
+            && let Some(Expression::Identifier(local)) = entry.as_expression()
         {
             self.pushes.push(Push {
                 log: option.to_owned(),
-                local: local.sym.to_string(),
+                local: self.script.binding(local),
             });
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
         let scope = self.scopes.last().copied().unwrap_or_default();
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(local)) = &assignment.left
-            && let Some(entry) = LogEntry::read(&local.sym, &assignment.right)
+        if let AssignmentTarget::AssignmentTargetIdentifier(local) = &assignment.left
+            && let Some(entry) = LogEntry::read(self.script.binding(local), &assignment.right)
         {
             self.entries.push(entry);
         }
-        if let AssignTarget::Simple(SimpleAssignTarget::Member(target)) = &assignment.left
+        if let Some(target) = assignment.left.as_member_expression()
             && let Some(key) = ast::ident_property(target)
         {
-            match &*assignment.right {
+            match &assignment.right {
                 // `payload.<key> = Date.now() - _cf_chl_opt.<mark>`
-                Expr::Bin(binary)
-                    if binary.op == BinaryOp::Sub
-                        && ast::is_date_now(&binary.left)
+                Expression::BinaryExpression(binary)
+                    if binary.operator == BinaryOperator::Subtraction
+                        && self.script.is_date_now(&binary.left)
                         && let Some(mark) = expression::option_key(&binary.right) =>
                 {
                     let elapsed = Elapsed {
@@ -616,18 +644,24 @@ impl Visit for Sender {
                     self.elapsed.push((scope, elapsed));
                 }
                 // `<namespace>.<key> = function () { var ...; local = _cf_chl_opt.<option>; ... }`
-                Expr::Fn(getter)
-                    if let Some(body) = &getter.function.body
-                        && let Some(first) = body.stmts.iter().find_map(Stmt::as_expr)
-                        && let Expr::Assign(first) = &*first.expr
+                Expression::FunctionExpression(getter)
+                    if let Some(body) = &getter.body
+                        && let Some(Statement::ExpressionStatement(first)) =
+                            body.statements.iter().find(|statement| {
+                                matches!(statement, Statement::ExpressionStatement(_))
+                            })
+                        && let Expression::AssignmentExpression(first) = &first.expression
                         && let Some(option) = expression::option_key(&first.right) =>
                 {
-                    let mut rewrite = StackRewrite::default();
-                    getter.function.visit_with(&mut rewrite);
+                    let mut rewrite = StackRewrite {
+                        script: self.script,
+                        helper: None,
+                    };
+                    rewrite.visit_function(getter, ScopeFlags::Function);
                     self.getters.push(FoundGetter {
                         function: key.to_owned(),
                         option: option.to_owned(),
-                        rewrite: rewrite.0,
+                        rewrite: rewrite.helper,
                     });
                 }
                 // `payload.<key> = _cf_chl_opt.<key>`
@@ -635,27 +669,28 @@ impl Visit for Sender {
                     self.copies.push((scope, key.to_owned()));
                 }
                 // `entry.<key> = clock()`
-                Expr::Call(call)
-                    if call.args.is_empty()
-                        && let Some(local) = target.obj.as_ident() =>
+                Expression::CallExpression(call)
+                    if call.arguments.is_empty()
+                        && let Expression::Identifier(local) = target.object() =>
                 {
                     self.stamps.push(Stamp {
-                        local: local.sym.to_string(),
+                        local: self.script.binding(local),
                         key: key.to_owned(),
                     });
                 }
                 _ => {}
             }
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 }
 
 /// Resolves each getter's stack rewrite to the option its helper reads. Rejects a getter name
 /// that returns different options.
 fn distinct_getters(
-    getters: Vec<FoundGetter>,
-    helpers: &HashMap<Id, String>,
+    script: Script<'_>,
+    getters: Vec<FoundGetter<'_>>,
+    helpers: &HashMap<SymbolId, String>,
 ) -> Result<BTreeMap<String, Getter>> {
     let mut distinct = BTreeMap::new();
     for found in getters {
@@ -663,11 +698,13 @@ fn distinct_getters(
         let page_origin = found
             .rewrite
             .map(|helper| {
-                helpers.get(&helper).cloned().with_context(|| {
-                    format!(
-                        "getter {function} rewrites stacks with unknown helper {}",
-                        helper.0
-                    )
+                let declared = match helper {
+                    Binding::Symbol(symbol) => helpers.get(&symbol),
+                    Binding::Global(_) => None,
+                };
+                declared.cloned().with_context(|| {
+                    let name = script.name(helper);
+                    format!("getter {function} rewrites stacks with unknown helper {name}")
                 })
             })
             .transpose()?;
@@ -797,12 +834,7 @@ mod tests {
             .enumerate()
             .map(|(index, (later, earlier))| {
                 let text = format!("e._cf_chl_opt.{later} - e._cf_chl_opt.{earlier}");
-                Field {
-                    name: format!("f{index}"),
-                    expression: ast::parse_expression("t", &text).unwrap(),
-                    text,
-                    bootstrap_value: None,
-                }
+                Field::parse(format!("f{index}"), text, None).unwrap()
             })
             .collect();
         let intervals = &Intervals {

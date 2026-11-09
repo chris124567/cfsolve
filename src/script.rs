@@ -1,44 +1,55 @@
 //! One parsed, deobfuscated iframe or orchestrator script shared across session extractors.
 
-use std::sync::OnceLock;
+use anyhow::{Result, anyhow};
+use self_cell::self_cell;
 
-use anyhow::Result;
-
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{ParsedScript, Script};
 use crate::vm::{Definition, Listing, Machine};
+
+/// The VM a script defines, or why recovery failed. Recovery runs with the parse because the
+/// definition borrows the tree; the error surfaces only when the VM is requested.
+struct Recovered<'a>(Result<Definition<'a>>);
+
+self_cell!(
+    struct Cell {
+        owner: ParsedScript,
+        #[covariant]
+        dependent: Recovered,
+    }
+);
 
 /// A parsed iframe script shared by encoder extraction, parameter merging, scene recovery, and
 /// VM analysis. Rejects scripts with recoverable parse errors.
-pub struct Source {
-    parsed: ParsedScript,
-    /// Lazily recovered VM, needed only when the session analyzes a program.
-    definition: OnceLock<Definition>,
-}
+pub struct Source(Cell);
+
+// SAFETY: The definition holds only shared references into the tree the `ParsedScript` owns, and
+// plain data. `ParsedScript` is `Send` and `Sync` because the tree is immutable once built; see
+// its implementations.
+unsafe impl Send for Source {}
+// SAFETY: See `Send` above.
+unsafe impl Sync for Source {}
 
 impl Source {
-    /// Parses `text`. Defers VM recovery and its possible errors until the VM is requested.
+    /// Parses `text` and recovers its VM. Errors from VM recovery are deferred until the VM is
+    /// requested.
     pub fn try_new(text: &str) -> Result<Self> {
-        Ok(Self {
-            parsed: ast::parse_iframe_javascript(text)?,
-            definition: OnceLock::new(),
-        })
+        let parsed = ParsedScript::parse("deobfuscated script", text)?;
+        Ok(Self(Cell::new(parsed, |parsed| {
+            Recovered(Definition::from_script(parsed.script()))
+        })))
     }
 
     #[must_use]
-    pub(crate) fn parsed(&self) -> &ParsedScript {
-        &self.parsed
+    pub(crate) fn script(&self) -> Script<'_> {
+        self.0.borrow_owner().script()
     }
 
     /// The VM the script defines, ready to decode one program.
     pub fn machine(&self) -> Result<Machine<'_>> {
-        let definition = match self.definition.get() {
-            Some(definition) => definition,
-            None => {
-                let definition = Definition::from_script(&self.parsed.script)?;
-                self.definition.get_or_init(|| definition)
-            }
-        };
-        Machine::try_new(definition)
+        match &self.0.borrow_dependent().0 {
+            Ok(definition) => Machine::try_new(definition),
+            Err(error) => Err(anyhow!("{error:#}")),
+        }
     }
 
     /// Disassembles `program` from its entry using [`Machine::disassemble`]. Probe analysis

@@ -2,13 +2,16 @@
 //! randomly named `_cf_chl_opt` options.
 
 use anyhow::{Context, Result};
-use swc_core::ecma::ast::{
-    AssignTarget, BinaryOp, CallExpr, Callee, Decl, Expr, FnDecl, SimpleAssignTarget, Stmt, UnaryOp,
+use oxc::ast::ast::{
+    AssignmentTarget, BindingPattern, CallExpression, Expression, FormalParameter, Function,
+    IdentifierReference, Statement,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::SymbolId;
+use oxc::syntax::operator::{LogicalOperator, UnaryOperator};
 
 use crate::challenge::expression;
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{self, Binding, Script};
 use crate::js::{JsValue, Options, json};
 use crate::{candidates, js};
 
@@ -48,18 +51,19 @@ pub struct Mapping(pub Vec<OptionEntry>);
 impl Mapping {
     #[cfg(test)]
     pub(crate) fn from_javascript(source: &str) -> Result<Self> {
-        Self::from_parsed(&ast::parse_iframe_javascript(source)?)
+        Self::from_script(ast::ParsedScript::parse("t", source)?.script())
     }
 
-    pub(crate) fn from_parsed(parsed: &ParsedScript) -> Result<Self> {
-        let merges = ast::in_declared_functions(&parsed.script, merge_function);
+    pub(crate) fn from_script(script: Script<'_>) -> Result<Self> {
+        let merges = script.in_declared_functions(|function| merge_function(script, function));
         let merge =
             candidates::exactly_one(merges, "function merging the embedding page's parameters")?;
         let mut calls = Calls {
+            script,
             merge: &merge,
             roles: Vec::new(),
         };
-        parsed.script.visit_with(&mut calls);
+        calls.visit_program(script.program);
         let roles = candidates::at_most_one_distinct(calls.roles, "merge call arguments")?
             .context("could not find where the merge is called")?;
         let entries = merge.writes.into_iter().map(|write| write.entry(&roles));
@@ -199,20 +203,23 @@ enum Role {
 
 /// A candidate merge function.
 struct Merge {
-    name: String,
+    function: SymbolId,
     arity: usize,
     writes: Vec<OptionWrite>,
 }
 
 /// A function declaration that writes enough options from parameter fields to be the merge.
-fn merge_function(function: &FnDecl) -> Option<Merge> {
-    let writes = writes(function);
+fn merge_function(script: Script<'_>, function: &Function<'_>) -> Option<Merge> {
+    let writes = writes(script, function);
     let fields = writes
         .iter()
         .filter(|write| matches!(write.value, Written::Field { key: Some(_), .. }));
-    (fields.count() >= MINIMUM_FIELDS).then(|| Merge {
-        name: function.ident.sym.to_string(),
-        arity: function.function.params.len(),
+    if fields.count() < MINIMUM_FIELDS {
+        return None;
+    }
+    Some(Merge {
+        function: function.id.as_ref()?.symbol_id(),
+        arity: function.params.parameters_count(),
         writes,
     })
 }
@@ -220,22 +227,25 @@ fn merge_function(function: &FnDecl) -> Option<Merge> {
 /// Identifies arguments in merge calls that pass the message exactly once and have no unknown
 /// arguments. Calls that deliver the message also pass its origin. Other calls use stored local
 /// variables; treating them as message delivery would produce incorrect field mappings.
-struct Calls<'merge> {
+struct Calls<'merge, 'a> {
+    script: Script<'a>,
     merge: &'merge Merge,
     roles: Vec<Vec<Role>>,
 }
 
-impl Visit for Calls<'_> {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Ident(ident) = &**callee
-            && ident.sym == *self.merge.name
-            && call.args.len() == self.merge.arity
+impl<'a> Visit<'a> for Calls<'_, 'a> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if self.script.refers_to(&call.callee, self.merge.function)
+            && call.arguments.len() == self.merge.arity
         {
             let roles: Vec<Role> = call
-                .args
+                .arguments
                 .iter()
-                .map(|argument| role(&argument.expr))
+                .map(|argument| {
+                    argument
+                        .as_expression()
+                        .map_or(Role::Unknown, |argument| role(self.script, argument))
+                })
                 .collect();
             if roles.iter().filter(|role| **role == Role::Message).count() == 1
                 && !roles.contains(&Role::Unknown)
@@ -243,21 +253,26 @@ impl Visit for Calls<'_> {
                 self.roles.push(roles);
             }
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
-fn role(expression: &Expr) -> Role {
+fn role(script: Script<'_>, expression: &Expression<'_>) -> Role {
     match expression {
-        Expr::Ident(_) => Role::Message,
-        Expr::Bin(binary) if binary.op == BinaryOp::LogicalOr => match role(&binary.left) {
-            Role::Field { key, .. } => Role::Field {
-                key,
-                fallback: expression::static_value(&binary.right, &Options::new()),
-            },
-            other => other,
-        },
-        _ => match expression.as_member().and_then(ast::ident_property) {
+        Expression::Identifier(_) => Role::Message,
+        Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+            match role(script, &logical.left) {
+                Role::Field { key, .. } => Role::Field {
+                    key,
+                    fallback: expression::static_value(script, &logical.right, &Options::new()),
+                },
+                other => other,
+            }
+        }
+        _ => match expression
+            .as_member_expression()
+            .and_then(ast::ident_property)
+        {
             Some("origin") => Role::Origin,
             Some(key) => Role::Field {
                 key: key.to_owned(),
@@ -269,48 +284,58 @@ fn role(expression: &Expr) -> Role {
 }
 
 /// Every `_cf_chl_opt.<name> = ...` in a function's own body.
-fn writes(function: &FnDecl) -> Vec<OptionWrite> {
-    let parameters: Vec<&str> = function
-        .function
-        .params
-        .iter()
-        .map(|parameter| parameter.pat.as_ident().map_or("", |ident| &*ident.id.sym))
-        .collect();
-    let Some(body) = &function.function.body else {
+fn writes(script: Script<'_>, function: &Function<'_>) -> Vec<OptionWrite> {
+    // Destructured, defaulted, and rest parameters have no single binding.
+    let plain = |parameter: &FormalParameter<'_>| match &parameter.pattern {
+        BindingPattern::BindingIdentifier(name) if parameter.initializer.is_none() => {
+            Some(name.symbol_id())
+        }
+        _ => None,
+    };
+    let mut parameters: Vec<Option<SymbolId>> = function.params.items.iter().map(plain).collect();
+    if function.params.rest.is_some() {
+        parameters.push(None);
+    }
+    let Some(body) = &function.body else {
         return Vec::new();
     };
     // Some options pass through a local so stored browser state can override them before they
     // are written back.
-    let mut staged: Vec<(&str, &str)> = Vec::new();
+    let mut staged: Vec<(Binding, &str)> = Vec::new();
     let mut writes = Vec::new();
-    for statement in &body.stmts {
-        if let Some(write) = sampled(statement, &parameters) {
+    for statement in &body.statements {
+        if let Some(write) = sampled(script, statement, &parameters) {
             writes.push(write);
             continue;
         }
-        if let Stmt::Decl(Decl::Var(declaration)) = statement {
-            staged.extend(declaration.decls.iter().filter_map(|declarator| {
-                let local = &*declarator.name.as_ident()?.id.sym;
-                Some((local, expression::option_key(declarator.init.as_deref()?)?))
+        if let Statement::VariableDeclaration(declaration) = statement {
+            staged.extend(declaration.declarations.iter().filter_map(|declarator| {
+                let BindingPattern::BindingIdentifier(local) = &declarator.id else {
+                    return None;
+                };
+                let option = expression::option_key(declarator.init.as_ref()?)?;
+                Some((Binding::Symbol(local.symbol_id()), option))
             }));
             continue;
         }
         let Some(assignment) = expression::assignment(statement) else {
             continue;
         };
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(local)) = &assignment.left
+        if let AssignmentTarget::AssignmentTargetIdentifier(local) = &assignment.left
             && let Some(option) = expression::option_key(&assignment.right)
         {
-            staged.push((&local.id.sym, option));
+            staged.push((script.binding(local), option));
             continue;
         }
         let Some(option) = expression::option_assignment(&assignment.left).map(str::to_owned)
         else {
             continue;
         };
-        let (mut value, default) = read(&assignment.right, &parameters);
-        if let (Written::Other, Expr::Ident(ident)) = (&value, &*assignment.right)
-            && let Some((_, from)) = staged.iter().rfind(|(local, _)| *local == &*ident.sym)
+        let (mut value, default) = read(script, &assignment.right, &parameters);
+        if let (Written::Other, Expression::Identifier(ident)) = (&value, &assignment.right)
+            && let Some((_, from)) = staged
+                .iter()
+                .rfind(|(local, _)| *local == script.binding(ident))
         {
             value = Written::Copied((*from).to_owned());
         }
@@ -325,18 +350,23 @@ fn writes(function: &FnDecl) -> Vec<OptionWrite> {
 
 /// Recognizes the first sample copy: `if (!_cf_chl_opt.<option>.length) {
 /// copy(<parameter>.<key>); }`.
-fn sampled(statement: &Stmt, parameters: &[&str]) -> Option<OptionWrite> {
-    if let Stmt::If(branch) = statement
-        && let Expr::Unary(test) = &*branch.test
-        && test.op == UnaryOp::Bang
-        && let Expr::Member(length) = &*test.arg
-        && ast::member_str(&length.prop) == Some("length")
-        && let Some(option) = expression::option_key(&length.obj)
-        && let Stmt::Block(block) = &*branch.cons
-        && let [Stmt::Expr(copy)] = &block.stmts[..]
-        && let Expr::Call(copy) = &*copy.expr
-        && let [argument] = &copy.args[..]
-        && let (Written::Field { parameter, key }, _) = read(&argument.expr, parameters)
+fn sampled(
+    script: Script<'_>,
+    statement: &Statement<'_>,
+    parameters: &[Option<SymbolId>],
+) -> Option<OptionWrite> {
+    if let Statement::IfStatement(branch) = statement
+        && let Expression::UnaryExpression(test) = &branch.test
+        && test.operator == UnaryOperator::LogicalNot
+        && let Some(length) = test.argument.as_member_expression()
+        && ast::member_str(length) == Some("length")
+        && let Some(option) = expression::option_key(length.object())
+        && let Statement::BlockStatement(block) = &branch.consequent
+        && let [Statement::ExpressionStatement(copy)] = &block.body[..]
+        && let Expression::CallExpression(copy) = &copy.expression
+        && let [argument] = &copy.arguments[..]
+        && let Some(argument) = argument.as_expression()
+        && let (Written::Field { parameter, key }, _) = read(script, argument, parameters)
         && let Some(key) = key
     {
         Some(OptionWrite {
@@ -368,26 +398,36 @@ fn samples(entries: Option<&JsValue>) -> JsValue {
 }
 
 /// Resolves `expression` and its literal fallback for falsy values.
-fn read(expression: &Expr, parameters: &[&str]) -> (Written, Option<JsValue>) {
-    let field = |name: &str, key: Option<&str>| {
-        let parameter = parameters.iter().position(|parameter| *parameter == name)?;
+fn read(
+    script: Script<'_>,
+    expression: &Expression<'_>,
+    parameters: &[Option<SymbolId>],
+) -> (Written, Option<JsValue>) {
+    let field = |name: &IdentifierReference<'_>, key: Option<&str>| {
+        let symbol = script.symbol(name)?;
+        let parameter = parameters
+            .iter()
+            .position(|parameter| *parameter == Some(symbol))?;
         let key = key.map(str::to_owned);
         Some(Written::Field { parameter, key })
     };
     let written = match expression {
-        Expr::Paren(paren) => return read(&paren.expr, parameters),
-        Expr::Bin(binary) if binary.op == BinaryOp::LogicalOr => {
-            let (written, _) = read(&binary.left, parameters);
-            let fallback = expression::static_value(&binary.right, &Options::new());
+        Expression::ParenthesizedExpression(paren) => {
+            return read(script, &paren.expression, parameters);
+        }
+        Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::Or => {
+            let (written, _) = read(script, &logical.left, parameters);
+            let fallback = expression::static_value(script, &logical.right, &Options::new());
             return (written, fallback);
         }
-        Expr::Ident(ident) => field(&ident.sym, None),
-        Expr::Member(member) => match (&*member.obj, ast::member_str(&member.prop)) {
-            (Expr::Ident(object), Some(key)) => field(&object.sym, Some(key)),
-            _ => None,
-        },
-        Expr::Call(_) if ast::is_date_now(expression) => Some(Written::Now),
-        _ => None,
+        Expression::Identifier(ident) => field(ident, None),
+        Expression::CallExpression(_) if script.is_date_now(expression) => Some(Written::Now),
+        _ => expression.as_member_expression().and_then(|member| {
+            match (member.object(), ast::member_str(member)) {
+                (Expression::Identifier(object), Some(key)) => field(object, Some(key)),
+                _ => None,
+            }
+        }),
     };
     (written.unwrap_or(Written::Other), None)
 }

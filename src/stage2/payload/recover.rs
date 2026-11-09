@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use indexmap::IndexMap;
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
 use super::{Expression, Layout, RecordTemplate, Scope, Template};
 use crate::candidates;
@@ -126,7 +126,7 @@ fn resolve(term: &Term, frame: &Frame<Held>, pool: &str) -> Option<Known<Held>> 
             }
             _ => return None,
         },
-        Term::Binary(BinaryOp::Sub, left, right) => match resolve(left)? {
+        Term::Binary(BinaryOperator::Subtraction, left, right) => match resolve(left)? {
             Known::Ext(Held::Now) => Known::Ext(Held::Elapsed),
             left => Known::Ext(Held::Expression(Expression::Subtract {
                 left: Box::new(expression(left)?),

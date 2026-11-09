@@ -11,85 +11,34 @@
 //! Because decoding has no side effects, constant calls can be replaced wherever they occur.
 //! Removes the decoder when no reads remain.
 
+use anyhow::Result;
+use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use swc_core::atoms::Wtf8Atom;
-use swc_core::atoms::wtf8::Wtf8Buf;
-use swc_core::ecma::ast::{BinaryOp, Expr, Id, Lit, Program, Script, Str, VarDeclarator};
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::allocator::{Allocator, GetAllocator};
+use oxc::ast::ast::{
+    BinaryExpression, Expression, Program, Statement, VariableDeclaration, VariableDeclarator,
+};
+use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
+use oxc::str::{JSStr, JSStrBuilder};
+use oxc::syntax::operator::BinaryOperator;
+use oxc::syntax::scope::ScopeFlags;
 
-use super::analysis::Analysis;
-use super::{HashMap, HashSet, removal};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::{HashMap, ast, pipeline, removal};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let bindings = analysis.bindings(program);
-    let mut decoders = Decoders::default();
-    program.visit_with(&mut decoders);
-    decoders.0.retain(|id, _| bindings.is_written_once(id));
-    if decoders.0.is_empty() {
-        return false;
-    }
-    let mut decode = DecodeCalls {
-        decoders: &decoders.0,
-        decoded: HashMap::default(),
-    };
-    program.visit_mut_with(&mut decode);
-    let unread = removal::unread(&decode.decoded, bindings);
-    program.visit_mut_with(&mut DropDecoders(unread));
-    !decode.decoded.is_empty()
-}
-
-/// A string decoder call with constant arguments in the original script, including the encoded
-/// input, key, and decoded text.
+/// A constant decoder call in the original script, with its encoded input, key, and decoded text.
 pub(crate) struct Encoded {
     pub(crate) encoded: String,
     pub(crate) key: u16,
     pub(crate) decoded: String,
 }
 
-/// Finds constant decoder calls in `script` before name resolution. Identifies decoders by their
-/// declared names.
-pub(crate) fn inline_strings(script: &Script) -> Vec<Encoded> {
-    struct Calls<'decoders> {
-        decoders: &'decoders HashMap<Id, u16>,
-        found: Vec<Encoded>,
-    }
-    impl Visit for Calls<'_> {
-        fn visit_expr(&mut self, expression: &Expr) {
-            if let Some((callee, [argument])) = ast::direct_call(expression)
-                && argument.spread.is_none()
-                && let Some(&key) = self.decoders.get(&callee.to_id())
-                && let Some(encoded) = ast::static_str(&argument.expr)
-                && let Some(decoded) = decode(encoded, key)
-                && let Some(decoded) = decoded.as_str()
-            {
-                self.found.push(Encoded {
-                    encoded: encoded.to_owned(),
-                    key,
-                    decoded: decoded.to_owned(),
-                });
-            }
-            expression.visit_children_with(self);
-        }
-    }
-    let mut decoders = Decoders::default();
-    script.visit_with(&mut decoders);
-    let mut calls = Calls {
-        decoders: &decoders.0,
-        found: Vec::new(),
-    };
-    script.visit_with(&mut calls);
-    calls.found
-}
-
-/// Encodes `text` so that [`decode`] with `key` returns it.
+/// Encodes `text` so that [`decode`] with the same key recovers its UTF-16 code units.
 pub(crate) fn encode(text: &str, mut key: u16) -> String {
-    use base64::Engine;
-
     let mut bytes = Vec::new();
     let mut push = |byte: u8| {
         key = key.rotate_left(8);
-        bytes.push(byte ^ (key >> 8) as u8);
+        bytes.push(byte ^ (key >> 8) as u8)
     };
     for unit in text.encode_utf16() {
         match u8::try_from(unit) {
@@ -105,179 +54,238 @@ pub(crate) fn encode(text: &str, mut key: u16) -> String {
     STANDARD.encode(bytes)
 }
 
-/// Decodes `encoded` as the decoder holding `key` does, or `None` if it is not base64.
-fn decode(encoded: &str, mut key: u16) -> Option<Wtf8Atom> {
-    use base64::Engine;
-
+/// Decodes base64 with the key's alternating byte order. A 255 byte escapes a little-endian
+/// UTF-16 code unit. The arena string preserves lone surrogates; malformed base64 or a truncated
+/// escape returns `None` instead of inventing replacement characters.
+fn decode<'a>(encoded: &str, mut key: u16, allocator: &'a Allocator) -> Option<JSStr<'a>> {
     let mut bytes = STANDARD.decode(encoded).ok()?.into_iter();
     let mut next = || {
         key = key.rotate_left(8);
         Some(bytes.next()? ^ (key >> 8) as u8)
     };
-    let mut units = vec![];
+    let mut decoded = JSStrBuilder::new_in(&allocator);
     while let Some(unit) = next() {
-        units.push(if unit == 255 {
+        decoded.push_code_unit(if unit == 255 {
             u16::from_le_bytes([next()?, next()?])
         } else {
             u16::from(unit)
-        });
+        })
     }
-    Some(Wtf8Atom::from(Wtf8Buf::from_ill_formed_utf16(&units)))
+    Some(decoded.into_js_str())
 }
 
-/// Decoders by binding, with their keys.
-#[derive(Default)]
-struct Decoders(HashMap<Id, u16>);
-
-impl Visit for Decoders {
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Some(name) = declarator.name.as_ident()
-            && let Some(key) = declarator.init.as_deref().and_then(decoder_key)
-        {
-            self.0.insert(name.to_id(), key);
-        }
-        declarator.visit_children_with(self);
-    }
-}
-
-/// The key of `function(global) { ...; return function(encoded) { ... } }(globalThis)`. The
-/// inner decoder declares it beside `bytes = global.atob(encoded)` and rotates it by
-/// `key = (key << 8 | key >>> 8) & 65535`.
-fn decoder_key(expression: &Expr) -> Option<u16> {
-    let call = expression.as_call()?;
-    let [global] = &call.args[..] else {
+/// Recognizes `function(global) { ...; return function(encoded) { ... } }(globalThis)` and returns
+/// its key.
+fn decoder_key<'a>(expression: &Expression<'a>, analysis: &Analysis<'a>) -> Option<u16> {
+    let Expression::CallExpression(call) = expression.get_inner_expression() else {
         return None;
     };
-    if global.spread.is_some() || global.expr.as_ident()?.sym != "globalThis" {
-        return None;
-    }
-    let outer = call.callee.as_expr()?.unwrap_parens().as_fn_expr()?;
-    let returned = outer
-        .function
-        .body
-        .as_ref()?
-        .stmts
-        .last()?
-        .as_return_stmt()?;
-    let decoder = &returned.arg.as_deref()?.as_fn_expr()?.function;
-    let [parameter] = &decoder.params[..] else {
+    let [global] = call.arguments.as_slice() else {
         return None;
     };
-    let mut keys = Keys {
-        encoded: parameter.pat.as_ident()?.to_id(),
+    if global.as_expression()?.get_identifier_reference()?.name != "globalThis" {
+        return None;
+    }
+    let Expression::FunctionExpression(outer) = call.callee.get_inner_expression() else {
+        return None;
+    };
+    let Statement::ReturnStatement(returned) = outer.body.as_ref()?.statements.last()? else {
+        return None;
+    };
+    let Expression::FunctionExpression(decoder) =
+        returned.argument.as_ref()?.get_inner_expression()
+    else {
+        return None;
+    };
+    let [parameter] = decoder.params.items.as_slice() else {
+        return None;
+    };
+    let mut search = KeySearch {
+        analysis,
+        encoded: ast::pattern_id(&parameter.pattern)?,
         key: None,
+        value: 0,
         rotated: false,
     };
-    decoder.visit_with(&mut keys);
-    let (_, key) = keys.key?;
-    keys.rotated.then_some(key)
+    search.visit_function(decoder, ScopeFlags::Function);
+    (search.key.is_some() && search.rotated).then_some(search.value)
 }
 
-/// Finds the key declaration and its rotation in an inner decoder.
-struct Keys {
+/// Finds the key declared beside `bytes = global.atob(encoded)`, and whether that same binding is
+/// rotated with `(key << 8 | key >>> 8) & 65535`. Resolved identities distinguish shadows.
+struct KeySearch<'b, 'a> {
+    analysis: &'b Analysis<'a>,
     encoded: Id,
-    key: Option<(Id, u16)>,
+    key: Option<Id>,
+    /// The initial value of `key`.
+    value: u16,
     rotated: bool,
 }
 
-impl Visit for Keys {
-    fn visit_var_declarators(&mut self, declarators: &[VarDeclarator]) {
-        for pair in declarators.windows(2) {
-            if let [bytes, key] = pair
-                && let Some(init) = bytes.init.as_deref()
+impl<'a> KeySearch<'_, 'a> {
+    /// Matches `key << 8` or `key >>> 8`.
+    fn shifts(&self, expression: &Expression<'a>, operator: BinaryOperator, key: Id) -> bool {
+        matches!(
+            expression.get_inner_expression(),
+            Expression::BinaryExpression(shift) if shift.operator == operator
+                && self.analysis.expression_id(&shift.left) == Some(key)
+                && ast::number(&shift.right) == Some(8.0)
+        )
+    }
+}
+
+impl<'a> Visit<'a> for KeySearch<'_, 'a> {
+    fn visit_variable_declaration(&mut self, declaration: &VariableDeclaration<'a>) {
+        for pair in declaration.declarations.windows(2) {
+            let [bytes, key] = pair else { continue };
+            if let Some(init) = &bytes.init
                 && let Some((_, [argument])) = ast::method_call(init, "atob")
                 && argument
-                    .expr
-                    .as_ident()
-                    .is_some_and(|id| id.to_id() == self.encoded)
-                && let Some(name) = key.name.as_ident()
-                && let Some(value) = key.init.as_deref().and_then(ast::number)
+                    .as_expression()
+                    .and_then(Expression::get_identifier_reference)
+                    .is_some_and(|encoded| self.analysis.id(encoded) == Some(self.encoded))
+                && let Some(id) = ast::pattern_id(&key.id)
+                && let Some(value) = key.init.as_ref().and_then(ast::number)
                 && value.fract() == 0.0
-                && let Ok(value) = u16::try_from(value as i64)
+                && (0.0..=u16::MAX as f64).contains(&value)
             {
-                self.key = Some((name.to_id(), value));
+                self.key = Some(id);
+                self.value = value as u16;
             }
         }
-        declarators.visit_children_with(self);
+        walk::walk_variable_declaration(self, declaration)
     }
 
-    fn visit_expr(&mut self, expression: &Expr) {
-        if let Some((key, _)) = &self.key
-            && is_rotation(expression, key)
+    fn visit_binary_expression(&mut self, binary: &BinaryExpression<'a>) {
+        if let Some(key) = self.key
+            && binary.operator == BinaryOperator::BitwiseAnd
+            && ast::number(&binary.right) == Some(65535.0)
+            && let Expression::BinaryExpression(swap) = binary.left.get_inner_expression()
+            && swap.operator == BinaryOperator::BitwiseOR
         {
-            self.rotated = true;
+            self.rotated |= self.shifts(&swap.left, BinaryOperator::ShiftLeft, key)
+                && self.shifts(&swap.right, BinaryOperator::ShiftRightZeroFill, key);
         }
-        expression.visit_children_with(self);
+        walk::walk_binary_expression(self, binary)
     }
 }
 
-/// `(key << 8 | key >>> 8) & 65535`.
-fn is_rotation(expression: &Expr, key: &Id) -> bool {
-    let shifts_key = |expression: &Expr, op| {
-        expression.as_bin().is_some_and(|shift| {
-            shift.op == op
-                && shift
-                    .left
-                    .as_ident()
-                    .is_some_and(|name| name.to_id() == *key)
-                && ast::number(&shift.right) == Some(8.0)
-        })
+/// Finds decoder initializers by their declared binding and recovers each key.
+fn decoders<'a>(program: &Program<'a>, analysis: &Analysis<'a>) -> HashMap<Id, u16> {
+    let mut decoders = Decoders {
+        analysis,
+        found: HashMap::default(),
     };
-    let Some(mask) = expression.as_bin() else {
+    decoders.visit_program(program);
+    decoders.found
+}
+
+struct Decoders<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    found: HashMap<Id, u16>,
+}
+
+impl<'a> Visit<'a> for Decoders<'_, 'a> {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(id) = ast::pattern_id(&declarator.id)
+            && let Some(value) = &declarator.init
+            && let Some(key) = decoder_key(value, self.analysis)
+        {
+            self.found.insert(id, key);
+        }
+        walk::walk_variable_declarator(self, declarator)
+    }
+}
+
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let mut decoders = decoders(program, analysis);
+    decoders.retain(|id, _| analysis.bindings.is_written_once(id));
+    let mut inline = Inline {
+        analysis,
+        decoders: &decoders,
+        replaced: HashMap::default(),
+    };
+    inline.visit_program(program);
+    if inline.replaced.is_empty() {
         return false;
-    };
-    let Some(swap) = mask.left.unwrap_parens().as_bin() else {
-        return false;
-    };
-    mask.op == BinaryOp::BitAnd
-        && ast::number(&mask.right) == Some(65535.0)
-        && swap.op == BinaryOp::BitOr
-        && shifts_key(&swap.left, BinaryOp::LShift)
-        && shifts_key(&swap.right, BinaryOp::ZeroFillRShift)
+    }
+    let unread = removal::unread(&inline.replaced, analysis);
+    removal::remove_initializers(program, &unread);
+    true
 }
 
-/// Replaces `decoder(encoded)` with its result, counting the calls replaced per decoder.
-struct DecodeCalls<'decoders> {
-    decoders: &'decoders HashMap<Id, u16>,
-    decoded: HashMap<Id, usize>,
+struct Inline<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    decoders: &'b HashMap<Id, u16>,
+    /// Replacement counts by decoder.
+    replaced: HashMap<Id, usize>,
 }
 
-impl VisitMut for DecodeCalls<'_> {
-    fn visit_mut_expr(&mut self, expression: &mut Expr) {
-        expression.visit_mut_children_with(self);
-        if let Some((callee, [encoded])) = ast::direct_call(expression)
-            && encoded.spread.is_none()
-            && let Some(&key) = self.decoders.get(&callee.to_id())
-            && let Some(value) = ast::static_str(&encoded.expr).and_then(|text| decode(text, key))
+impl<'a> VisitMut<'a> for Inline<'_, 'a> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+        if let Some((callee, [argument])) = ast::direct_call(expression)
+            && let Some(id) = self.analysis.id(callee)
+            && let Some(&key) = self.decoders.get(&id)
+            && let Some(encoded) = argument.as_expression().and_then(ast::static_str)
+            && let Some(value) = decode(encoded, key, self.analysis.allocator())
         {
-            *self.decoded.entry(callee.to_id()).or_default() += 1;
-            *expression = Expr::Lit(Lit::Str(Str {
-                span: callee.span,
-                value,
-                raw: None,
-            }));
+            *self.replaced.entry(id).or_default() += 1;
+            *expression =
+                Expression::new_string_literal(callee.span, value, None, &self.analysis.ast);
         }
     }
 }
 
-/// Drops the initializers of decoders nothing reads, leaving `var decoder;`.
-struct DropDecoders(HashSet<Id>);
+/// Parses and resolves the original script as deobfuscation does, then finds constant calls to
+/// recognized decoders. Returns an owned inventory for capture rewriting; strings with lone
+/// surrogates are omitted from this Rust-string inventory, while the AST rewrite preserves their
+/// code units.
+pub(crate) fn inline_strings(source: &str) -> Result<Vec<Encoded>> {
+    let allocator = Allocator::default();
+    let (program, analysis) = pipeline::parse(&allocator, source)?;
+    let decoders = decoders(&program, &analysis);
+    let mut calls = Calls {
+        analysis: &analysis,
+        decoders: &decoders,
+        found: Vec::new(),
+    };
+    calls.visit_program(&program);
+    Ok(calls.found)
+}
 
-impl VisitMut for DropDecoders {
-    fn visit_mut_var_declarator(&mut self, declarator: &mut VarDeclarator) {
-        if declarator
-            .name
-            .as_ident()
-            .is_some_and(|name| self.0.contains(&name.to_id()))
+struct Calls<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    decoders: &'b HashMap<Id, u16>,
+    found: Vec<Encoded>,
+}
+
+impl<'a> Visit<'a> for Calls<'_, 'a> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if let Some((callee, [argument])) = ast::direct_call(expression)
+            && let Some(&key) = self
+                .analysis
+                .id(callee)
+                .and_then(|id| self.decoders.get(&id))
+            && let Some(encoded) = argument.as_expression().and_then(ast::static_str)
+            && let Some(decoded) = decode(encoded, key, self.analysis.allocator())
+            && let Some(decoded) = decoded.as_str()
         {
-            declarator.init = None;
+            self.found.push(Encoded {
+                encoded: encoded.to_owned(),
+                key,
+                decoded: decoded.to_owned(),
+            })
         }
-        declarator.visit_mut_children_with(self);
+        walk::walk_expression(self, expression)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
+    use oxc::allocator::Allocator;
+
     use crate::deobfuscate::testing;
 
     /// The decoder of a challenge script, with its key.
@@ -311,19 +319,14 @@ mod tests {
 
     #[test]
     fn decodes_constant_calls_and_drops_an_unread_decoder() {
-        let transform = |source: &str| {
-            testing::rewrite(
-                &format!("{DECODER}\n{source}"),
-                super::run,
-                /* fix= */ true,
-            )
-        };
+        let transform =
+            |source: &str| testing::rewrite(&format!("{DECODER}\n{source}"), super::run);
         let output = transform("f(decode(`ZJd1i3w=`), decode('ZoZpiw=='));");
-        testing::assert_contains(&output, &["\"apply\"", "\"call\""], &["var decode;"]);
+        testing::assert_contains(&output, &["\"apply\"", "\"call\"", "var decode;"]);
         // Dynamic calls keep the decoder; reassignment disables decoding.
         let output = transform("f(decode(`ZJd1i3w=`), decode(name));");
-        let expected = ["\"apply\"", "decode(name)"];
-        testing::assert_contains(&output, &expected, &["var decode = function"]);
+        let expected = ["\"apply\"", "decode(name)", "var decode = function"];
+        testing::assert_contains(&output, &expected);
         let output = transform("decode = other; f(decode(`ZJd1i3w=`));");
         assert!(output.contains("decode(`ZJd1i3w=`)"), "{output}");
     }
@@ -331,8 +334,7 @@ mod tests {
     #[test]
     fn finds_and_reencodes_the_strings_a_served_script_decodes() {
         let source = format!("{DECODER}\nf(decode(`ZJd1i3w=`), decode('ZoZpiw=='), other(`x`));");
-        let parsed = crate::js::ast::parse_javascript("x.js", &source).unwrap();
-        let strings = super::inline_strings(&parsed.script);
+        let strings = super::inline_strings(&source).unwrap();
         let decoded: Vec<(&str, &str)> = strings
             .iter()
             .map(|string| (string.encoded.as_str(), string.decoded.as_str()))
@@ -341,20 +343,13 @@ mod tests {
         assert_eq!(super::encode("apply", strings[0].key), "ZJd1i3w=");
         // Code units of 255 or greater need an escape byte followed by two bytes.
         let encoded = super::encode("a€", 59141);
-        assert_eq!(super::decode(&encoded, 59141).unwrap().as_str(), Some("a€"));
-    }
-
-    #[test]
-    fn decodes_escaped_code_units() {
-        use base64::Engine;
-
+        let allocator = Allocator::default();
+        let decoded = super::decode(&encoded, 59141, &allocator).expect("valid encoding");
+        assert_eq!(decoded.as_str(), Some("a€"));
         // 255 escapes the code unit U+D800, a lone surrogate. The bytes 255, 0x00, 0xd8 are
         // XORed with the key 59141 (0xe705), low byte first.
         let encoded = super::STANDARD.encode([255 ^ 0x05, 0xe7, 0xd8 ^ 0x05]);
-        let decoded = super::decode(&encoded, 59141).unwrap();
-        assert_eq!(
-            decoded.as_wtf8().to_ill_formed_utf16().collect::<Vec<_>>(),
-            [0xd800]
-        );
+        let decoded = super::decode(&encoded, 59141, &allocator).expect("valid encoding");
+        assert_eq!(decoded.encode_utf16().collect::<Vec<_>>(), [0xd800]);
     }
 }

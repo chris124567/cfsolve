@@ -199,7 +199,7 @@ pub(crate) async fn render_page(
     document: PageDocument,
     widget: Option<&Widget>,
 ) -> Result<EmbeddingPage> {
-    sink.artifact("page.html", document.html.as_bytes())?;
+    sink.save("page.html", document.html.as_bytes())?;
     let widget_id = extra_params::widget_id();
     let rendered = RenderedPage::render(&document.html, document.url.clone(), &widget_id, widget)?;
     // A page that renders its widget from script may load the loader from script too.
@@ -277,10 +277,10 @@ pub(super) async fn fetch(
     let timer = Timer::start();
     let iframe = http::fetch_iframe(client, iframe_url, referrer.as_deref()).await?;
     let navigation = timer.overall(iframe.url.as_str(), iframe.navigation.encoded_bytes);
-    sink.artifact("iframe.html", iframe.html.as_bytes())?;
+    sink.save("iframe.html", iframe.html.as_bytes())?;
     let javascript = source::inline_javascript(&iframe.html)?;
-    sink.artifact("iframe.js", javascript.as_bytes())?;
-    sink.artifact("iframe-url.txt", iframe.url.as_str().as_bytes())?;
+    sink.save("iframe.js", javascript.as_bytes())?;
+    sink.save("iframe-url.txt", iframe.url.as_str().as_bytes())?;
     sink.json("iframe-network.json", &iframe.navigation)?;
     sink.progress(&format!(
         "Fetched {} bytes of HTML; deobfuscating {} bytes of JavaScript",
@@ -288,7 +288,7 @@ pub(super) async fn fetch(
         javascript.len()
     ));
     let (text, cases) = deobfuscate(sink, javascript.clone()).await?;
-    sink.artifact("iframe.deobfuscated.js", text.as_bytes())?;
+    sink.save("iframe.deobfuscated.js", text.as_bytes())?;
     let source = Source::try_new(&text).context("parsing the deobfuscated iframe")?;
     Ok(Fetched {
         iframe,

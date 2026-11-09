@@ -7,12 +7,15 @@ use std::ops::RangeInclusive;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD;
 use num_bigint::BigUint;
-use serde::Serialize;
-use swc_core::ecma::ast::{
-    ArrowExpr, AssignExpr, AssignTarget, BindingIdent, BlockStmt, CallExpr, Callee, ClassDecl,
-    Expr, FnDecl, Function, IfStmt, ObjectLit, Script, SimpleAssignTarget, Stmt, VarDeclarator,
+use oxc::ast::AstKind;
+use oxc::ast::ast::{
+    Argument, ArrowFunctionExpression, AssignmentExpression, AssignmentTarget, BindingPattern,
+    CallExpression, Expression, Function, FunctionBody, IfStatement, ObjectExpression, Statement,
+    VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::ScopeFlags;
+use serde::Serialize;
 use url::Url;
 
 use crate::challenge::codec::{Codec, KEY_LENGTH, SEED_LENGTH};
@@ -22,7 +25,7 @@ use crate::challenge::merge::Mapping;
 use crate::challenge::payload::Field;
 use crate::challenge::source::{self, InitialRequest};
 use crate::challenge::state::ScriptState;
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{self, Binding, Script};
 use crate::js::{JsValue, Options, Payload};
 use crate::script::Source;
 use crate::{candidates, vm};
@@ -57,15 +60,10 @@ impl ExtractedProgram {
     pub fn session_encoder(&self) -> Result<SessionEncoder> {
         let mut seed = [0; SEED_LENGTH];
         getrandom::fill(&mut seed).context("drawing the session key seed")?;
-        Ok(self.session_encoder_with_seed(seed))
-    }
-
-    #[must_use]
-    pub fn session_encoder_with_seed(&self, seed: [u8; SEED_LENGTH]) -> SessionEncoder {
-        SessionEncoder {
+        Ok(SessionEncoder {
             codec: self.codec.clone(),
             seed,
-        }
+        })
     }
 
     #[must_use]
@@ -122,7 +120,7 @@ pub struct ExportedField<'program> {
 /// An extracted program and its parsed source. Parameter merging and iframe state are recovered
 /// from the source on demand.
 pub struct PreparedSession<'source> {
-    parsed: &'source ParsedScript,
+    script: Script<'source>,
     program: ExtractedProgram,
 }
 
@@ -132,33 +130,32 @@ impl<'source> PreparedSession<'source> {
     pub fn try_new(source: &'source Source, iframe_url: &Url) -> Result<Self> {
         use base64::Engine;
 
-        let parsed = source.parsed();
-        let request = InitialRequest::from_parsed(parsed, iframe_url)?;
-        let runner =
-            vm::runner_name(&parsed.script).context("the script installs no program runner")?;
+        let script = source.script();
+        let request = InitialRequest::from_script(script, iframe_url)?;
+        let runner = vm::runner_name(script).context("the script installs no program runner")?;
         let mut components = Components {
-            parsed,
+            script,
             options: &request.options,
             runner,
             encoders: BTreeSet::new(),
             programs: BTreeMap::new(),
             templates: Vec::new(),
         };
-        parsed.script.visit_with(&mut components);
+        components.visit_program(script.program);
         let encoder = candidates::exactly_one(components.encoders, "XHR body encoder")?;
         let (initial_program, initialize_key) =
             candidates::exactly_one(components.programs, "literal initial VM program")?;
         let payload_fields =
-            candidates::exactly_one(components.templates, "first payload template")?;
+            candidates::exactly_one(components.templates, "first payload template")??;
 
         // The encoder assignment may be a standalone statement or part of a sequence or chain.
         // Search within IIFE statements without entering their nested functions.
         let mut root = EncoderRoot {
-            parsed,
-            encoder: &encoder,
+            script,
+            encoder,
             found: None,
         };
-        parsed.script.visit_with(&mut root);
+        root.visit_program(script.program);
         let root = root
             .found
             .context("could not locate encoder's enclosing IIFE")??;
@@ -185,7 +182,7 @@ impl<'source> PreparedSession<'source> {
         let program = ExtractedProgram {
             request,
             iframe_url: iframe_url.clone(),
-            encoder,
+            encoder: script.name(encoder).to_owned(),
             key_transform: root.key_transform,
             initialize_key,
             installed,
@@ -193,7 +190,7 @@ impl<'source> PreparedSession<'source> {
             codec: Codec::try_new(&root.alphabet, root.modulus, secret)?,
             payload_fields,
         };
-        Ok(Self { parsed, program })
+        Ok(Self { script, program })
     }
 
     #[must_use]
@@ -208,11 +205,11 @@ impl<'source> PreparedSession<'source> {
 
     /// How this session merges the embedding page's `extraParams`.
     pub fn mapping(&self) -> Result<Mapping> {
-        Mapping::from_parsed(self.parsed)
+        Mapping::from_script(self.script)
     }
 
     pub fn state(&self) -> Result<ScriptState> {
-        ScriptState::from_parsed(self.parsed, &self.program.request.options)
+        ScriptState::from_script(self.script, &self.program.request.options)
     }
 }
 
@@ -225,76 +222,72 @@ struct Root {
 }
 
 impl Root {
-    fn read(root: &BlockStmt, definition: &Expr, parsed: &ParsedScript) -> Result<Self> {
+    fn read<'a>(
+        script: Script<'a>,
+        root: &FunctionBody<'a>,
+        definition: &Expression<'a>,
+    ) -> Result<Self> {
         Ok(Self {
-            key_transform: key_transform(&parsed.script, definition)?,
-            alphabet: base64_alphabet(ast::string_literals(root))?,
-            modulus: rsa_modulus(root)?,
-            bootstrap: bootstrap(root, parsed),
+            key_transform: key_transform(script, definition)?,
+            alphabet: base64_alphabet(ast::string_literals(|literals| {
+                literals.visit_function_body(root);
+            }))?,
+            modulus: rsa_modulus(script, root)?,
+            bootstrap: bootstrap(script, root),
         })
     }
 }
 
 /// Finds the outermost immediately invoked function that defines the encoder. Calls `read`
 /// while the borrowed syntax node is valid.
-struct EncoderRoot<'session> {
-    parsed: &'session ParsedScript,
-    encoder: &'session str,
+struct EncoderRoot<'a> {
+    script: Script<'a>,
+    encoder: Binding<'a>,
     found: Option<Result<Root>>,
 }
 
-impl Visit for EncoderRoot<'_> {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
+impl<'a> Visit<'a> for EncoderRoot<'a> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if self.found.is_some() {
             return;
         }
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Fn(function) = callee.unwrap_parens()
-            && let Some(body) = &function.function.body
+        if let Expression::FunctionExpression(function) = call.callee.without_parentheses()
+            && let Some(body) = &function.body
             && let Some(definition) = body
-                .stmts
+                .statements
                 .iter()
-                .find_map(|statement| defines(statement, self.encoder))
+                .find_map(|statement| defines(self.script, statement, self.encoder))
         {
-            self.found = Some(Root::read(body, &definition, self.parsed));
+            self.found = Some(Root::read(self.script, body, definition));
             return;
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
-/// Finds the encoder callee created by the VM at runtime. It is the only callee without a binding
-/// in the script; any remaining deobfuscation helpers have bindings.
-fn key_transform(script: &Script, definition: &Expr) -> Result<String> {
-    let mut calls = Calls::default();
-    definition.visit_with(&mut calls);
-    let mut bound = Bound::default();
-    script.visit_with(&mut bound);
+/// Finds the encoder callee created by the VM at runtime. It is the only callee in `definition`
+/// that no binding of the script declares and that the script never assigns as a global; any
+/// remaining deobfuscation helpers have bindings.
+fn key_transform(script: Script<'_>, definition: &Expression<'_>) -> Result<String> {
+    let mut calls = Calls {
+        script,
+        globals: BTreeSet::new(),
+    };
+    calls.visit_expression(definition);
+    let unresolved = script.scoping.root_unresolved_references();
+    let assigned = |name: &str| {
+        unresolved.get(name).is_some_and(|references| {
+            references
+                .iter()
+                .any(|&reference| script.scoping.get_reference(reference).is_write())
+        })
+    };
     let unbound = calls
-        .0
+        .globals
         .into_iter()
-        .filter(|name| name != "Number" && !bound.0.contains(name));
+        .filter(|name| *name != "Number" && !assigned(name))
+        .map(str::to_owned);
     candidates::exactly_one(unbound, "VM-defined key transform")
-}
-
-/// Names declared or assigned anywhere in the script.
-#[derive(Default)]
-struct Bound(BTreeSet<String>);
-
-impl Visit for Bound {
-    fn visit_binding_ident(&mut self, identifier: &BindingIdent) {
-        self.0.insert(identifier.sym.to_string());
-    }
-
-    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        self.0.insert(declaration.ident.sym.to_string());
-        declaration.visit_children_with(self);
-    }
-
-    fn visit_class_decl(&mut self, declaration: &ClassDecl) {
-        self.0.insert(declaration.ident.sym.to_string());
-        declaration.visit_children_with(self);
-    }
 }
 
 /// Finds the custom base64 alphabet in `candidates`: a string with 64 distinct ASCII characters and
@@ -313,177 +306,208 @@ pub(crate) fn base64_alphabet(candidates: impl IntoIterator<Item = String>) -> R
 }
 
 /// Finds the `BigInt("0x...")` modulus wide enough to encrypt the seed.
-fn rsa_modulus(root: &BlockStmt) -> Result<BigUint> {
+fn rsa_modulus(script: Script<'_>, root: &FunctionBody<'_>) -> Result<BigUint> {
     let moduli = expression::assignments(root)
-        .filter_map(|assignment| big_int(&assignment.right))
+        .filter_map(|assignment| big_int(script, &assignment.right))
         .filter_map(|literal| BigUint::parse_bytes(literal.strip_prefix("0x")?.as_bytes(), 16))
         .filter(|modulus| modulus.bits().div_ceil(8) == SEED_LENGTH as u64);
     candidates::exactly_one(moduli, "RSA modulus")
 }
 
-/// The string `BigInt` is called with.
-fn big_int(expression: &Expr) -> Option<&str> {
+/// The string the global `BigInt` is called with.
+fn big_int<'a>(script: Script<'_>, expression: &Expression<'a>) -> Option<&'a str> {
     let (name, arguments) = ast::direct_call(expression)?;
-    ast::static_str(&arguments.first()?.expr).filter(|_| name.sym == "BigInt")
+    let global = name.name == "BigInt" && script.symbol(name).is_none();
+    ast::static_str(arguments.first()?.as_expression()?).filter(|_| global)
 }
 
 /// Returns source for the IIFE without browser activity. Keeps VM tables, declarations, key
 /// generation, and the encoder. Removes startup calls, timers, UI code, and event collection.
-fn bootstrap(root: &BlockStmt, parsed: &ParsedScript) -> String {
+fn bootstrap(script: Script<'_>, root: &FunctionBody<'_>) -> String {
     let inert: Vec<&str> = root
-        .stmts
+        .statements
         .iter()
         .filter(|statement| is_inert(statement))
-        .map(|statement| parsed.text(statement))
+        .map(|statement| script.text(statement))
         .collect();
     inert.join("\n")
 }
 
 /// Whether a top-level statement can run without starting browser work.
-fn is_inert(statement: &Stmt) -> bool {
+fn is_inert(statement: &Statement<'_>) -> bool {
     match statement {
         // A conditional that only installs functions does not run their bodies.
-        Stmt::If(conditional) => conditional.cons.as_block().is_some_and(|block| {
-            block.stmts.iter().all(|statement| {
-                expression::assignment(statement)
-                    .is_some_and(|assigned| matches!(&*assigned.right, Expr::Fn(_)))
-            })
-        }),
+        Statement::IfStatement(conditional) => match &conditional.consequent {
+            Statement::BlockStatement(block) => block.body.iter().all(|statement| {
+                expression::assignment(statement).is_some_and(|assigned| {
+                    matches!(assigned.right, Expression::FunctionExpression(_))
+                })
+            }),
+            _ => false,
+        },
         // A property assignment from a call publishes browser work that must be skipped.
         // Indexed writes such as `seed[0] = Number(two)` update encoder state and are allowed.
-        Stmt::Expr(statement) => !matches!(&*statement.expr, Expr::Assign(assignment)
-            if matches!(&assignment.left, AssignTarget::Simple(SimpleAssignTarget::Member(member))
-                if !member.prop.is_computed())
-                && matches!(&*assignment.right, Expr::Call(_))),
+        Statement::ExpressionStatement(statement) => {
+            !matches!(&statement.expression, Expression::AssignmentExpression(assignment)
+                if matches!(
+                    assignment.left,
+                    AssignmentTarget::StaticMemberExpression(_)
+                        | AssignmentTarget::PrivateFieldExpression(_)
+                ) && matches!(assignment.right, Expression::CallExpression(_)))
+        }
         _ => true,
     }
 }
 
-fn payload_fields(template: &ObjectLit, parsed: &ParsedScript, options: &Options) -> Vec<Field> {
-    ast::key_values(template)
-        .filter_map(|property| {
-            Some(Field {
-                name: ast::static_key_str(&property.key)?.to_owned(),
-                // Reparsing the exported expression removes outer parentheses. Remove them here
-                // too.
-                expression: property.value.unwrap_parens().clone(),
-                text: parsed.text(&*property.value).to_owned(),
-                bootstrap_value: expression::static_value(&property.value, options),
-            })
-        })
-        .collect()
+/// Reads the fields of a payload `template`, parsing each from its source in `script`.
+fn payload_fields(
+    script: Script<'_>,
+    template: &ObjectExpression<'_>,
+    options: &Options,
+) -> Result<Vec<Field>> {
+    let fields = ast::key_values(template).filter_map(|property| {
+        Some(Field::parse(
+            ast::static_key_str(&property.key, property.computed)?.to_owned(),
+            script.text(&property.value).to_owned(),
+            expression::static_value(script, &property.value, options),
+        ))
+    });
+    fields.collect()
 }
 
-/// Finds the function assigned to `name` within a statement.
-fn defines(statement: &Stmt, name: &str) -> Option<Expr> {
-    let mut definition = Definition { name, found: None };
-    statement.visit_with(&mut definition);
+/// Finds the function assigned to `encoder` within a statement.
+fn defines<'a>(
+    script: Script<'a>,
+    statement: &Statement<'a>,
+    encoder: Binding<'a>,
+) -> Option<&'a Expression<'a>> {
+    let mut definition = Definition {
+        script,
+        encoder,
+        found: None,
+    };
+    definition.visit_statement(statement);
     definition.found
 }
 
-struct Definition<'name> {
-    name: &'name str,
-    found: Option<Expr>,
+struct Definition<'a> {
+    script: Script<'a>,
+    encoder: Binding<'a>,
+    found: Option<&'a Expression<'a>>,
 }
 
-impl Visit for Definition<'_> {
+impl<'a> Visit<'a> for Definition<'a> {
     // A declared function's own body belongs to it, not to the IIFE around it.
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
+    fn visit_function(&mut self, _: &Function<'a>, _: ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
 
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(target)) = &assignment.left
-            && target.id.sym == *self.name
-            && let Some(function) = yielded_function(&assignment.right)
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(target) = &assignment.left
+            && self.script.binding(target) == self.encoder
+            && let Some(function) = yielded_function(
+                &self
+                    .script
+                    .lend(assignment, AstKind::as_assignment_expression)
+                    .right,
+            )
         {
-            self.found = Some(function.clone());
+            self.found = Some(function);
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Some(target) = declarator.name.as_ident()
-            && target.id.sym == *self.name
-            && let Some(function) = declarator.init.as_deref().and_then(yielded_function)
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(target) = &declarator.id
+            && Binding::Symbol(target.symbol_id()) == self.encoder
+            && let Some(init) = &self
+                .script
+                .lend(declarator, AstKind::as_variable_declarator)
+                .init
+            && let Some(function) = yielded_function(init)
         {
-            self.found = Some(function.clone());
+            self.found = Some(function);
         }
-        declarator.visit_children_with(self);
+        walk::walk_variable_declarator(self, declarator);
     }
 }
 
 /// Finds the function produced by `value`, including through sequence expressions. Some sessions
 /// reset the seed just before returning the encoder function.
-fn yielded_function(value: &Expr) -> Option<&Expr> {
-    let mut value = value.unwrap_parens();
-    while let Expr::Seq(sequence) = value {
-        value = sequence.exprs.last()?.unwrap_parens();
+fn yielded_function<'b, 'a>(value: &'b Expression<'a>) -> Option<&'b Expression<'a>> {
+    let mut value = value.without_parentheses();
+    while let Expression::SequenceExpression(sequence) = value {
+        value = sequence.expressions.last()?.without_parentheses();
     }
-    matches!(value, Expr::Fn(_) | Expr::Arrow(_)).then_some(value)
+    matches!(
+        value,
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+    )
+    .then_some(value)
 }
 
-/// The names called directly, as `name(...)`.
-#[derive(Default)]
-struct Calls(BTreeSet<String>);
+/// The globals called directly, as `name(...)`.
+struct Calls<'a> {
+    script: Script<'a>,
+    globals: BTreeSet<&'a str>,
+}
 
-impl Visit for Calls {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Ident(name) = &**callee
+impl<'a> Visit<'a> for Calls<'a> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        if let Expression::Identifier(name) = &call.callee
+            && self.script.symbol(name).is_none()
         {
-            self.0.insert(name.sym.to_string());
+            self.globals.insert(name.name.as_str());
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
 /// Collects components for [`PreparedSession::try_new`].
-struct Components<'session> {
-    parsed: &'session ParsedScript,
+struct Components<'session, 'a> {
+    script: Script<'a>,
     options: &'session Options,
     /// The name the program runner is installed under.
     runner: String,
     /// Functions whose result is handed straight to `send`.
-    encoders: BTreeSet<String>,
+    encoders: BTreeSet<Binding<'a>>,
     /// Literal programs passed to the runner, each with the source of its first call.
     /// Orchestrators may repeat a program for different startup paths.
     programs: BTreeMap<String, String>,
-    templates: Vec<Vec<Field>>,
+    templates: Vec<Result<Vec<Field>>>,
 }
 
-impl Visit for Components<'_> {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
+impl<'a> Visit<'a> for Components<'_, 'a> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         if vm::calls_runner(call, &self.runner)
             && let Some(program) = call
-                .args
+                .arguments
                 .first()
-                .and_then(|argument| ast::static_str(&argument.expr))
+                .and_then(|argument| ast::static_str(argument.as_expression()?))
         {
-            let text = self.parsed.text(call).to_owned();
+            let text = self.script.text(call).to_owned();
             self.programs.entry(program.to_owned()).or_insert(text);
         }
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Member(member) = callee.unwrap_parens()
-            && ast::member_str(&member.prop) == Some("send")
-            && let Some(argument) = call.args.first()
-            && let Some((encoder, _)) = ast::direct_call(&argument.expr)
+        if let Some(member) = call.callee.without_parentheses().as_member_expression()
+            && ast::member_str(member) == Some("send")
+            && let Some(argument) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some((encoder, _)) = ast::direct_call(argument)
         {
-            self.encoders.insert(encoder.sym.to_string());
+            self.encoders.insert(self.script.binding(encoder));
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 
-    fn visit_if_stmt(&mut self, conditional: &IfStmt) {
+    fn visit_if_statement(&mut self, conditional: &IfStatement<'a>) {
         let options = self.options;
         source::visit_taken_branches(self, conditional, options);
     }
 
-    fn visit_object_lit(&mut self, object: &ObjectLit) {
+    fn visit_object_expression(&mut self, object: &ObjectExpression<'a>) {
         if source::is_payload_template(object, self.options) {
             self.templates
-                .push(payload_fields(object, self.parsed, self.options));
+                .push(payload_fields(self.script, object, self.options));
         }
-        object.visit_children_with(self);
+        walk::walk_object_expression(self, object);
     }
 }
 
@@ -504,15 +528,13 @@ impl SessionEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::js::ast::ParsedScript;
 
-    fn statement(source: &str) -> Stmt {
-        ast::parse_javascript("t.js", source)
-            .unwrap()
-            .script
-            .body
-            .into_iter()
-            .next()
-            .unwrap()
+    /// Whether the first statement of `source` defines the global `P3`.
+    fn defines_p3(source: &str) -> bool {
+        let parsed = ParsedScript::parse("t.js", source).unwrap();
+        let script = parsed.script();
+        defines(script, &script.program.body[0], Binding::Global("P3")).is_some()
     }
 
     #[test]
@@ -525,17 +547,14 @@ mod tests {
             "P3 = (Ge[0] = 0, function(Z) { return Z; });",
             "P3 = (Ge[0] = 0, (Ge[1] = 1, (Z => Z)));",
         ] {
-            assert!(
-                defines(&statement(source), "P3").is_some(),
-                "missed the encoder in: {source}"
-            );
+            assert!(defines_p3(source), "missed the encoder in: {source}");
         }
         assert!(
-            defines(&statement("function f() { P3 = function() {}; }"), "P3").is_none(),
+            !defines_p3("function f() { P3 = function() {}; }"),
             "a declared function's own body is not the IIFE's, so an assignment inside one must \
              not claim the enclosing statement"
         );
-        assert!(defines(&statement("P3 = 1;"), "P3").is_none());
-        assert!(defines(&statement("P3 = (function() {}, 1);"), "P3").is_none());
+        assert!(!defines_p3("P3 = 1;"));
+        assert!(!defines_p3("P3 = (function() {}, 1);"));
     }
 }

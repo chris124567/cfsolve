@@ -1,6 +1,6 @@
-//! Compiles JavaScript into plans run by [`super::evaluate`]. Slot plans store function locals
+//! Compiles JavaScript into plans, which [`super::compile`] turns into closures. Slot plans store function locals
 //! in numbered slots, except locals that nested functions mention, which stay in the call's
-//! scope for those functions to capture. Scoped plans resolve all names through scopes.
+//! scope for those functions to capture. Scoped plans resolve every binding through scopes.
 //! Unsupported syntax becomes a node that stops evaluation if reached.
 
 #[cfg(test)]
@@ -9,59 +9,94 @@ use std::cell::RefCell;
 use std::ptr;
 use std::rc::Rc;
 
-use rustc_hash::FxHashSet as HashSet;
-use swc_core::atoms::{Atom, atom};
-use swc_core::ecma::ast::{
-    ArrowExpr, AssignTarget, BinaryOp, BlockStmt, BlockStmtOrExpr, Callee, CatchClause, Class,
-    Decl, DoWhileStmt, Expr, ExprOrSpread, FnDecl, Function, Ident, Lit, MemberExpr, MemberProp,
-    Pat, Prop, PropName, PropOrSpread, SimpleAssignTarget, Stmt, UnaryOp, UpdateOp, VarDecl,
-    VarDeclKind, VarDeclOrExpr, VarDeclarator, WhileStmt,
+use oxc::ast::ast::{
+    Argument, ArrayExpressionElement, ArrowFunctionBody, ArrowFunctionExpression,
+    BindingIdentifier, BindingPattern, CatchClause, Class, Expression as Expr, ForStatementInit,
+    FormalParameters, Function, IdentifierReference, MemberExpression, ObjectPropertyKind,
+    PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement as Stmt, VariableDeclaration,
+    VariableDeclarationKind, VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::{ScopeFlags, SymbolId};
+use oxc::syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator, UpdateOperator};
 
 use super::compile::{self, Code};
 use super::semantics;
-use crate::vm::HashMap;
+use crate::js::ast::{Binding, Script};
 use crate::vm::value::Value;
+use crate::vm::{HashMap, HashSet, extract};
+
+/// What a call runs: parameters, then a body. A script function's body is its statements; the
+/// dispatch decoder's is assembled from the dispatch loop (see [`crate::vm::dispatch`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Routine<'ast> {
+    pub(crate) parameters: &'ast FormalParameters<'ast>,
+    /// Declarations run first without their initializers, so they only declare their names.
+    pub(crate) declarations: &'ast [&'ast VariableDeclaration<'ast>],
+    pub(crate) statements: &'ast [Stmt<'ast>],
+    /// What the routine returns after its statements, if they do not return.
+    pub(crate) returns: Option<&'ast Expr<'ast>>,
+    /// Identifies the routine's plans: the address of the function body or decoder.
+    pub(crate) address: usize,
+}
+
+impl<'ast> Routine<'ast> {
+    /// The routine of a function with a body.
+    pub(crate) fn function(function: &'ast Function<'ast>) -> Option<Self> {
+        let body = function.body.as_deref()?;
+        Some(Self {
+            parameters: &function.params,
+            declarations: &[],
+            statements: &body.statements,
+            returns: None,
+            address: ptr::from_ref(body).addr(),
+        })
+    }
+}
 
 /// Caches plans by source-node address. The session's definition keeps those nodes alive longer
 /// than the cache.
 #[derive(Default)]
 pub(crate) struct Plans<'ast> {
-    /// `None` marks functions that need a scoped plan.
+    /// `None` marks routines that need a scoped plan.
     pub(super) slot_plans: RefCell<HashMap<usize, Option<Rc<FunctionPlan<'ast>>>>>,
-    scoped_plans: RefCell<HashMap<usize, Rc<[Statement<'ast>]>>>,
+    scoped_plans: RefCell<HashMap<usize, Rc<[Code<'ast>]>>>,
     /// Forces scoped plans for comparison tests.
     #[cfg(test)]
     pub(super) disabled: Cell<bool>,
 }
 
 impl<'ast> Plans<'ast> {
-    pub(super) fn slots(&self, function: &'ast Function) -> Option<Rc<FunctionPlan<'ast>>> {
+    pub(super) fn slots(
+        &self,
+        script: Script<'ast>,
+        routine: Routine<'ast>,
+    ) -> Option<Rc<FunctionPlan<'ast>>> {
         #[cfg(test)]
         if self.disabled.get() {
             return None;
         }
-        let address = ptr::from_ref(function).addr();
-        if let Some(plan) = self.slot_plans.borrow().get(&address) {
+        if let Some(plan) = self.slot_plans.borrow().get(&routine.address) {
             return plan.clone();
         }
-        let plan = FunctionPlan::compile(function).map(Rc::new);
-        self.slot_plans.borrow_mut().insert(address, plan.clone());
+        let plan = FunctionPlan::compile(script, routine).map(Rc::new);
+        self.slot_plans
+            .borrow_mut()
+            .insert(routine.address, plan.clone());
         plan
     }
 
-    /// Returns the scoped plan of a function body or arrow, compiling it on first use.
-    pub(super) fn scoped<T>(
+    /// Returns the scoped plan of the routine or arrow at `address`, compiling `plan` on first
+    /// use.
+    pub(super) fn scoped(
         &self,
-        code: &'ast T,
-        compile: impl FnOnce(&'ast T) -> Vec<Statement<'ast>>,
-    ) -> Rc<[Statement<'ast>]> {
-        let address = ptr::from_ref(code).addr();
+        address: usize,
+        plan: impl FnOnce() -> Vec<Statement<'ast>>,
+    ) -> Rc<[Code<'ast>]> {
         if let Some(plan) = self.scoped_plans.borrow().get(&address) {
             return plan.clone();
         }
-        let plan: Rc<[Statement<'ast>]> = compile(code).into();
+        let plan: Rc<[Code<'ast>]> = compile::statements(&plan()).into();
         self.scoped_plans.borrow_mut().insert(address, plan.clone());
         plan
     }
@@ -82,131 +117,222 @@ impl<'ast> FunctionPlan<'ast> {
     /// Attempts to compile a slot plan. Returns `None` to request a scoped plan for unsupported
     /// syntax, parenthesized callees, computed object keys, logical assignments, parameter
     /// patterns, variables named `arguments`, or arrows reading `arguments`.
-    pub(super) fn compile(function: &'ast Function) -> Option<Self> {
-        let body = function.body.as_ref()?;
+    pub(super) fn compile(script: Script<'ast>, routine: Routine<'ast>) -> Option<Self> {
         let mut compiler = PlanCompiler {
-            captured: captured(body),
-            ..PlanCompiler::default()
+            captured: captured(script, routine),
+            ..PlanCompiler::new(script)
         };
-        let mut parameters = Vec::with_capacity(function.params.len());
-        for parameter in &function.params {
-            let name = &parameter.pat.as_ident()?.sym;
-            if name == "arguments" {
+        let parameters = extract::parameters(routine.parameters)?;
+        let mut names = Vec::with_capacity(parameters.len());
+        for parameter in parameters {
+            if parameter.name == "arguments" {
                 return None;
             }
-            compiler.local(name);
-            parameters.push(compiler.name(name));
+            let binding = Binding::Symbol(parameter.symbol_id());
+            compiler.local(binding);
+            names.push(compiler.name(binding));
         }
-        body.visit_with(&mut compiler);
-        let body = compiler.body(&body.stmts);
+        for declaration in routine.declarations {
+            for declarator in &declaration.declarations {
+                compiler.declared(declarator);
+            }
+        }
+        for statement in routine.statements {
+            compiler.visit_statement(statement);
+        }
+        let body = compiler.routine(routine);
         if compiler.rejected {
             return None;
         }
         Some(Self {
-            parameters,
-            arguments: compiler.locals.get(&atom!("arguments")).copied(),
+            parameters: names,
+            arguments: compiler.locals.get(&Binding::Global("arguments")).copied(),
             locals: compiler.locals.len(),
             code: compile::statements(&body),
         })
     }
 }
 
-pub(super) fn scoped(statements: &[Stmt]) -> Vec<Statement<'_>> {
-    PlanCompiler::default().statements(statements)
+pub(super) fn scoped_statement<'ast>(
+    script: Script<'ast>,
+    statement: &'ast Stmt<'ast>,
+) -> Statement<'ast> {
+    PlanCompiler::new(script).statement(statement, None)
 }
 
-/// Scoped execution plan for a function body. Function declarations bind their names at the start
-/// of the call.
-pub(super) fn scoped_body(statements: &[Stmt]) -> Vec<Statement<'_>> {
-    PlanCompiler::default().body(statements)
+/// Scoped execution plan for a routine's body. Function declarations bind their names at the
+/// start of the call.
+pub(super) fn scoped_routine<'ast>(
+    script: Script<'ast>,
+    routine: Routine<'ast>,
+) -> Vec<Statement<'ast>> {
+    PlanCompiler::new(script).routine(routine)
 }
 
-pub(super) fn scoped_expression(expression: &Expr) -> Expression<'_> {
-    PlanCompiler::default().expression(expression)
+pub(super) fn scoped_expression<'ast>(
+    script: Script<'ast>,
+    expression: &'ast Expr<'ast>,
+) -> Expression<'ast> {
+    PlanCompiler::new(script).expression(expression)
 }
 
-pub(super) fn scoped_arrow(arrow: &ArrowExpr) -> Vec<Statement<'_>> {
-    match &*arrow.body {
-        BlockStmtOrExpr::BlockStmt(body) => scoped_body(&body.stmts),
-        BlockStmtOrExpr::Expr(body) => vec![Statement::Return(Some(scoped_expression(body)))],
+pub(super) fn scoped_arrow<'ast>(
+    script: Script<'ast>,
+    arrow: &'ast ArrowFunctionExpression<'ast>,
+) -> Vec<Statement<'ast>> {
+    let mut compiler = PlanCompiler::new(script);
+    match &arrow.body {
+        ArrowFunctionBody::FunctionBody(body) => compiler.body(&body.statements),
+        body => {
+            let body = body
+                .as_expression()
+                .expect("an arrow body is a block or an expression");
+            vec![Statement::Return(Some(compiler.expression(body)))]
+        }
     }
 }
 
-#[derive(Default)]
-struct PlanCompiler {
+struct PlanCompiler<'a> {
+    script: Script<'a>,
     /// Slots of a slot plan's locals; empty for scoped plans.
-    locals: HashMap<Atom, usize>,
-    /// Names nested functions mention. Locals with these names stay in the call's scope.
-    captured: HashSet<Atom>,
+    locals: HashMap<Binding<'a>, usize>,
+    /// Bindings nested functions mention. These locals stay in the call's scope.
+    captured: HashSet<SymbolId>,
     /// Whether compilation needs a scoped plan. Ignored when compiling scoped plans.
     rejected: bool,
 }
 
-impl Visit for PlanCompiler {
-    fn visit_var_declarator(&mut self, declaration: &VarDeclarator) {
-        if let Pat::Ident(name) = &declaration.name {
-            self.local(&name.sym);
-        }
-        declaration.visit_children_with(self);
+impl<'a> Visit<'a> for PlanCompiler<'a> {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        self.declared(declarator);
+        walk::walk_variable_declarator(self, declarator);
     }
 
-    fn visit_ident(&mut self, name: &Ident) {
-        if name.sym == "arguments" {
-            self.local(&name.sym);
+    fn visit_identifier_reference(&mut self, reference: &IdentifierReference<'a>) {
+        if reference.name == "arguments" {
+            self.local(self.script.binding(reference));
         }
     }
 
-    /// Treat a nested function declaration as a local binding in the enclosing function.
-    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        self.local(&declaration.ident.sym);
+    /// Treat a nested function declaration as a local binding in the enclosing function. A
+    /// nested function's own locals remain separate.
+    fn visit_function(&mut self, function: &Function<'a>, _: ScopeFlags) {
+        if function.is_declaration()
+            && let Some(name) = &function.id
+        {
+            self.local(Binding::Symbol(name.symbol_id()));
+        }
     }
 
     /// Treat a `catch` parameter as a function local in the execution plan.
-    fn visit_catch_clause(&mut self, clause: &CatchClause) {
-        if let Some(Pat::Ident(name)) = &clause.param {
-            self.local(&name.sym);
+    fn visit_catch_clause(&mut self, clause: &CatchClause<'a>) {
+        if let Some(parameter) = &clause.param
+            && let BindingPattern::BindingIdentifier(name) = &parameter.pattern
+        {
+            self.local(Binding::Symbol(name.symbol_id()));
         }
-        clause.visit_children_with(self);
+        walk::walk_catch_clause(self, clause);
     }
 
-    // A nested function's own locals remain separate.
-    fn visit_function(&mut self, _: &Function) {}
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
-    fn visit_class(&mut self, _: &Class) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
 }
 
-/// Every name a nested function mentions, at any depth.
+/// The symbols of a routine's own bindings that functions, arrows, and classes nested in it
+/// reference. A function's `arguments` has no symbol; arrows reading it are rejected.
+fn captured<'a>(script: Script<'a>, routine: Routine<'a>) -> HashSet<SymbolId> {
+    #[derive(Default)]
+    struct Bindings(HashSet<SymbolId>);
+
+    impl<'a> Visit<'a> for Bindings {
+        fn visit_binding_identifier(&mut self, name: &BindingIdentifier<'a>) {
+            self.0.insert(name.symbol_id());
+        }
+
+        fn visit_function(&mut self, function: &Function<'a>, _: ScopeFlags) {
+            if function.is_declaration()
+                && let Some(name) = &function.id
+            {
+                self.0.insert(name.symbol_id());
+            }
+        }
+
+        fn visit_class(&mut self, class: &Class<'a>) {
+            if class.is_declaration()
+                && let Some(name) = &class.id
+            {
+                self.0.insert(name.symbol_id());
+            }
+        }
+
+        fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    }
+
+    struct References<'s, 'a> {
+        script: Script<'a>,
+        bindings: &'s HashSet<SymbolId>,
+        captured: HashSet<SymbolId>,
+    }
+
+    impl<'a> Visit<'a> for References<'_, 'a> {
+        fn visit_identifier_reference(&mut self, reference: &IdentifierReference<'a>) {
+            if let Some(symbol) = self.script.symbol(reference)
+                && self.bindings.contains(&symbol)
+            {
+                self.captured.insert(symbol);
+            }
+        }
+    }
+
+    struct Nested<'s, 'a>(References<'s, 'a>);
+
+    impl<'a> Visit<'a> for Nested<'_, 'a> {
+        fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+            self.0.visit_function(function, flags);
+        }
+
+        fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+            self.0.visit_arrow_function_expression(arrow);
+        }
+
+        fn visit_class(&mut self, class: &Class<'a>) {
+            self.0.visit_class(class);
+        }
+    }
+
+    let mut bindings = Bindings::default();
+    bindings.visit_formal_parameters(routine.parameters);
+    for declaration in routine.declarations {
+        for declarator in &declaration.declarations {
+            bindings.visit_binding_pattern(&declarator.id);
+        }
+    }
+    for statement in routine.statements {
+        bindings.visit_statement(statement);
+    }
+    let mut nested = Nested(References {
+        script,
+        bindings: &bindings.0,
+        captured: HashSet::default(),
+    });
+    for statement in routine.statements {
+        nested.visit_statement(statement);
+    }
+    nested.0.captured
+}
+
+/// Whether a visited node mentions `arguments`, to reject arrows that read the enclosing one.
 #[derive(Default)]
-struct Names(HashSet<Atom>);
+struct MentionsArguments(bool);
 
-impl Visit for Names {
-    fn visit_ident(&mut self, name: &Ident) {
-        self.0.insert(name.sym.clone());
-    }
-}
-
-/// The names that functions, arrows, and classes nested in `body` mention, except `arguments`,
-/// which functions shadow and arrows reading it are rejected for.
-fn captured(body: &BlockStmt) -> HashSet<Atom> {
-    struct Nested(Names);
-
-    impl Visit for Nested {
-        fn visit_function(&mut self, function: &Function) {
-            function.visit_with(&mut self.0);
-        }
-        fn visit_arrow_expr(&mut self, arrow: &ArrowExpr) {
-            arrow.visit_with(&mut self.0);
-        }
-        fn visit_class(&mut self, class: &Class) {
-            class.visit_with(&mut self.0);
-        }
+impl<'a> Visit<'a> for MentionsArguments {
+    fn visit_identifier_reference(&mut self, name: &IdentifierReference<'a>) {
+        self.0 |= name.name == "arguments";
     }
 
-    let mut nested = Nested(Names::default());
-    body.visit_with(&mut nested);
-    let Nested(Names(mut names)) = nested;
-    names.remove(&atom!("arguments"));
-    names
+    fn visit_binding_identifier(&mut self, name: &BindingIdentifier<'a>) {
+        self.0 |= name.name == "arguments";
+    }
 }
 
 pub(super) struct Case<'ast> {
@@ -241,11 +367,11 @@ pub(super) enum Statement<'ast> {
         body: Box<Statement<'ast>>,
         /// Whether the body runs once before the test, as in `do ... while`.
         body_first: bool,
-        label: Option<&'ast Atom>,
+        label: Option<&'ast str>,
     },
-    Break(Option<&'ast Atom>),
-    Continue(Option<&'ast Atom>),
-    Label(&'ast Atom, Box<Statement<'ast>>),
+    Break(Option<&'ast str>),
+    Continue(Option<&'ast str>),
+    Label(&'ast str, Box<Statement<'ast>>),
     /// A `try` statement with its catch parameter, catch body, and finally body.
     Try {
         block: Vec<Statement<'ast>>,
@@ -258,7 +384,7 @@ pub(super) enum Statement<'ast> {
 
 pub(super) enum Expression<'ast> {
     Logical {
-        operator: BinaryOp,
+        operator: LogicalOperator,
         left: Box<Expression<'ast>>,
         right: Box<Expression<'ast>>,
         /// Whether the right side is [`pure`].
@@ -271,20 +397,22 @@ pub(super) enum Expression<'ast> {
     Member(Box<Expression<'ast>>, Property<'ast>),
     Call(Box<Expression<'ast>>, Vec<Expression<'ast>>),
     New(Box<Expression<'ast>>, Vec<Expression<'ast>>),
-    Binary(BinaryOp, Box<Expression<'ast>>, Box<Expression<'ast>>),
+    Binary(BinaryOperator, Box<Expression<'ast>>, Box<Expression<'ast>>),
     /// An arithmetic or bitwise operator, with its operation on numbers (see
     /// [`semantics::numeric`]).
     Arithmetic {
-        operator: BinaryOp,
+        operator: BinaryOperator,
         operation: fn(f64, f64) -> f64,
         left: Box<Expression<'ast>>,
         right: Box<Expression<'ast>>,
     },
-    Unary(UnaryOp, Box<Expression<'ast>>),
-    Assign(Target<'ast>, Option<BinaryOp>, Box<Expression<'ast>>),
+    Unary(UnaryOperator, Box<Expression<'ast>>),
+    Assign(Target<'ast>, Option<BinaryOperator>, Box<Expression<'ast>>),
+    /// `&&=`, `||=` or `??=`, which stops evaluation once its target is located.
+    LogicalAssign(Target<'ast>),
     Update {
         target: Target<'ast>,
-        operator: UpdateOp,
+        operator: UpdateOperator,
         prefix: bool,
     },
     Conditional(
@@ -294,8 +422,8 @@ pub(super) enum Expression<'ast> {
     ),
     Array(Vec<Option<Expression<'ast>>>),
     Object(Vec<(Property<'ast>, Expression<'ast>)>),
-    Function(Option<&'ast Atom>, &'ast Function),
-    Arrow(&'ast ArrowExpr),
+    Function(Option<&'ast str>, &'ast Function<'ast>),
+    Arrow(&'ast ArrowFunctionExpression<'ast>),
     /// Syntax the interpreter does not follow, described for diagnostics.
     Unsupported(&'static str),
 }
@@ -310,97 +438,157 @@ pub(super) enum Target<'ast> {
     Member(Box<Expression<'ast>>, Property<'ast>),
 }
 
-/// A name a plan reads or writes: a local, by its slot, or a name resolved through scopes.
+/// A binding a plan reads or writes: a local, by its slot, or a binding resolved through
+/// scopes.
 #[derive(Clone, Copy)]
 pub(super) enum Name<'ast> {
-    Local(usize, &'ast Atom),
-    Global(&'ast Atom),
+    Local(usize, Binding<'ast>),
+    Scoped(Binding<'ast>),
 }
 
 impl<'ast> Name<'ast> {
-    pub(super) fn atom(self) -> &'ast Atom {
+    pub(super) fn binding(self) -> Binding<'ast> {
         match self {
-            Self::Local(_, name) | Self::Global(name) => name,
+            Self::Local(_, binding) | Self::Scoped(binding) => binding,
         }
     }
 }
 
-impl PlanCompiler {
-    /// Gives local `name` a slot unless a nested function mentions it.
-    fn local(&mut self, name: &Atom) {
-        if !self.captured.contains(name) {
-            let next = self.locals.len();
-            self.locals.entry(name.clone()).or_insert(next);
+impl<'a> PlanCompiler<'a> {
+    fn new(script: Script<'a>) -> Self {
+        Self {
+            script,
+            locals: HashMap::default(),
+            captured: HashSet::default(),
+            rejected: false,
         }
+    }
+
+    /// Gives local `binding` a slot unless a nested function mentions it.
+    fn local(&mut self, binding: Binding<'a>) {
+        if let Binding::Symbol(symbol) = binding
+            && self.captured.contains(&symbol)
+        {
+            return;
+        }
+        let next = self.locals.len();
+        self.locals.entry(binding).or_insert(next);
+    }
+
+    /// Gives the variable `declarator` declares a slot.
+    fn declared(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(name) = &declarator.id {
+            self.local(Binding::Symbol(name.symbol_id()));
+        }
+    }
+
+    /// Plans a routine: its function declarations, then its declarations without initializers,
+    /// its statements, and what it returns.
+    fn routine(&mut self, routine: Routine<'a>) -> Vec<Statement<'a>> {
+        let mut plan = self.hoisted(routine.statements);
+        for declaration in routine.declarations {
+            plan.push(self.variables(declaration, false));
+        }
+        plan.extend(self.statements(routine.statements));
+        if let Some(returned) = routine.returns {
+            plan.push(Statement::Return(Some(self.expression(returned))));
+        }
+        plan
     }
 
     /// Plans a function body or block, binding its function declarations before executing
     /// statements, as JavaScript hoists them to the start of the body or block. Declarations
-    /// beside the VM class are planned as statements and resolved as globals.
-    fn body<'a>(&mut self, statements: &'a [Stmt]) -> Vec<Statement<'a>> {
-        let mut plan = Vec::with_capacity(statements.len());
-        for statement in statements {
-            if let Stmt::Decl(Decl::Fn(declaration)) = statement {
-                let name = &declaration.ident.sym;
-                plan.push(Statement::Declare(vec![Declaration {
-                    name: self.name(name),
-                    init: Some(Expression::Function(Some(name), &declaration.function)),
-                    keeps: false,
-                }]));
-            }
-        }
+    /// beside the VM class are planned as statements and resolve through the session.
+    fn body(&mut self, statements: &'a [Stmt<'a>]) -> Vec<Statement<'a>> {
+        let mut plan = self.hoisted(statements);
         plan.extend(self.statements(statements));
         plan
     }
 
-    fn statements<'a>(&mut self, statements: &'a [Stmt]) -> Vec<Statement<'a>> {
+    /// Declarations binding the functions `statements` declare.
+    fn hoisted(&mut self, statements: &'a [Stmt<'a>]) -> Vec<Statement<'a>> {
+        let mut plan = Vec::with_capacity(statements.len());
+        for statement in statements {
+            if let Stmt::FunctionDeclaration(function) = statement
+                && let Some(name) = &function.id
+            {
+                plan.push(Statement::Declare(vec![Declaration {
+                    name: self.name(Binding::Symbol(name.symbol_id())),
+                    init: Some(Expression::Function(Some(name.name.as_str()), function)),
+                    keeps: false,
+                }]));
+            }
+        }
+        plan
+    }
+
+    fn statements(&mut self, statements: &'a [Stmt<'a>]) -> Vec<Statement<'a>> {
         statements
             .iter()
             .map(|statement| self.statement(statement, None))
             .collect()
     }
 
-    fn statement<'a>(&mut self, statement: &'a Stmt, label: Option<&'a Atom>) -> Statement<'a> {
+    fn statement(&mut self, statement: &'a Stmt<'a>, label: Option<&'a str>) -> Statement<'a> {
         match statement {
-            Stmt::Expr(expression) => Statement::Expression(self.expression(&expression.expr)),
-            Stmt::Decl(Decl::Var(declaration)) => self.variables(declaration),
-            // Declarations do not bind their names; the names resolve as globals.
-            Stmt::Decl(Decl::Fn(_) | Decl::Class(_)) | Stmt::Empty(_) => Statement::Empty,
-            Stmt::Decl(_) => Statement::Expression(self.unsupported("a declaration")),
-            Stmt::Block(block) => Statement::Block(self.body(&block.stmts)),
-            Stmt::If(branch) => Statement::If(
-                self.expression(&branch.test),
-                Box::new(self.statement(&branch.cons, None)),
-                branch
-                    .alt
-                    .as_ref()
-                    .map(|alt| Box::new(self.statement(alt, None))),
-            ),
-            Stmt::Return(returned) => {
-                Statement::Return(returned.arg.as_ref().map(|arg| self.expression(arg)))
+            Stmt::ExpressionStatement(expression) => {
+                Statement::Expression(self.expression(&expression.expression))
             }
-            Stmt::Throw(thrown) => Statement::Throw(self.expression(&thrown.arg)),
-            Stmt::Switch(switch) => {
+            Stmt::VariableDeclaration(declaration) if !declaration.kind.is_using() => {
+                self.variables(declaration, true)
+            }
+            // Declarations do not bind their names; the names resolve through scopes.
+            Stmt::FunctionDeclaration(_) | Stmt::ClassDeclaration(_) | Stmt::EmptyStatement(_) => {
+                Statement::Empty
+            }
+            Stmt::BlockStatement(block) => Statement::Block(self.body(&block.body)),
+            Stmt::IfStatement(branch) => Statement::If(
+                self.expression(&branch.test),
+                Box::new(self.statement(&branch.consequent, None)),
+                branch
+                    .alternate
+                    .as_ref()
+                    .map(|alternate| Box::new(self.statement(alternate, None))),
+            ),
+            Stmt::ReturnStatement(returned) => Statement::Return(
+                returned
+                    .argument
+                    .as_ref()
+                    .map(|argument| self.expression(argument)),
+            ),
+            Stmt::ThrowStatement(thrown) => Statement::Throw(self.expression(&thrown.argument)),
+            Stmt::SwitchStatement(switch) => {
                 let discriminant = self.expression(&switch.discriminant);
                 let cases = switch.cases.iter().map(|case| Case {
                     test: case.test.as_ref().map(|test| self.expression(test)),
-                    body: self.statements(&case.cons),
+                    body: self.statements(&case.consequent),
                 });
                 Statement::Switch(discriminant, cases.collect())
             }
-            Stmt::Break(branch) => Statement::Break(branch.label.as_ref().map(|label| &label.sym)),
-            Stmt::Continue(branch) => {
-                Statement::Continue(branch.label.as_ref().map(|label| &label.sym))
+            Stmt::BreakStatement(branch) => {
+                Statement::Break(branch.label.as_ref().map(|label| label.name.as_str()))
             }
-            Stmt::Labeled(labeled) => Statement::Label(
-                &labeled.label.sym,
-                Box::new(self.statement(&labeled.body, Some(&labeled.label.sym))),
-            ),
-            Stmt::For(looping) => Statement::Loop {
+            Stmt::ContinueStatement(branch) => {
+                Statement::Continue(branch.label.as_ref().map(|label| label.name.as_str()))
+            }
+            Stmt::LabeledStatement(labeled) => {
+                let name = labeled.label.name.as_str();
+                Statement::Label(name, Box::new(self.statement(&labeled.body, Some(name))))
+            }
+            Stmt::ForStatement(looping) => Statement::Loop {
                 init: looping.init.as_ref().map(|init| {
                     Box::new(match init {
-                        VarDeclOrExpr::VarDecl(declaration) => self.variables(declaration),
-                        VarDeclOrExpr::Expr(init) => Statement::Expression(self.expression(init)),
+                        ForStatementInit::VariableDeclaration(declaration)
+                            if !declaration.kind.is_using() =>
+                        {
+                            self.variables(declaration, true)
+                        }
+                        ForStatementInit::VariableDeclaration(_) => {
+                            Statement::Expression(self.unsupported("a declaration"))
+                        }
+                        init => Statement::Expression(
+                            self.expression(init.as_expression().expect("an expression")),
+                        ),
                     })
                 }),
                 test: looping.test.as_ref().map(|test| self.expression(test)),
@@ -412,46 +600,64 @@ impl PlanCompiler {
                 body_first: false,
                 label,
             },
-            Stmt::While(WhileStmt { test, body, .. })
-            | Stmt::DoWhile(DoWhileStmt { test, body, .. }) => Statement::Loop {
+            Stmt::WhileStatement(looping) => Statement::Loop {
                 init: None,
-                test: Some(self.expression(test)),
+                test: Some(self.expression(&looping.test)),
                 update: None,
-                body: Box::new(self.statement(body, None)),
-                body_first: matches!(statement, Stmt::DoWhile(_)),
+                body: Box::new(self.statement(&looping.body, None)),
+                body_first: false,
                 label,
             },
-            Stmt::Try(attempt) => {
-                let handler = attempt.handler.as_ref();
+            Stmt::DoWhileStatement(looping) => Statement::Loop {
+                init: None,
+                test: Some(self.expression(&looping.test)),
+                update: None,
+                body: Box::new(self.statement(&looping.body, None)),
+                body_first: true,
+                label,
+            },
+            Stmt::TryStatement(attempt) => {
+                let handler = attempt.handler.as_deref();
                 let parameter = match handler.and_then(|handler| handler.param.as_ref()) {
                     None => None,
-                    Some(Pat::Ident(name)) => Some(self.name(&name.sym)),
-                    Some(_) => {
-                        return Statement::Expression(self.unsupported("a destructuring catch"));
-                    }
+                    Some(parameter) => match &parameter.pattern {
+                        BindingPattern::BindingIdentifier(name) => {
+                            Some(self.name(Binding::Symbol(name.symbol_id())))
+                        }
+                        _ => {
+                            return Statement::Expression(
+                                self.unsupported("a destructuring catch"),
+                            );
+                        }
+                    },
                 };
                 Statement::Try {
-                    block: self.body(&attempt.block.stmts),
+                    block: self.body(&attempt.block.body),
                     parameter,
-                    handler: handler.map(|handler| self.body(&handler.body.stmts)),
-                    finalizer: attempt
-                        .finalizer
-                        .as_ref()
-                        .map(|body| self.body(&body.stmts)),
+                    handler: handler.map(|handler| self.body(&handler.body.body)),
+                    finalizer: attempt.finalizer.as_ref().map(|body| self.body(&body.body)),
                 }
             }
-            Stmt::ForIn(_) | Stmt::ForOf(_) => {
+            Stmt::ForInStatement(_) | Stmt::ForOfStatement(_) => {
                 Statement::Expression(self.unsupported("a for-in or for-of loop"))
             }
-            Stmt::With(_) => Statement::Expression(self.unsupported("a with statement")),
-            Stmt::Debugger(_) => Statement::Expression(self.unsupported("a debugger statement")),
+            Stmt::WithStatement(_) => Statement::Expression(self.unsupported("a with statement")),
+            Stmt::DebuggerStatement(_) => {
+                Statement::Expression(self.unsupported("a debugger statement"))
+            }
+            _ => Statement::Expression(self.unsupported("a declaration")),
         }
     }
 
-    fn variables<'a>(&mut self, declaration: &'a VarDecl) -> Statement<'a> {
-        let mut declarations = Vec::with_capacity(declaration.decls.len());
-        for declarator in &declaration.decls {
-            let Pat::Ident(name) = &declarator.name else {
+    /// Plans a variable declaration, with its initializers if `initialized`.
+    fn variables(
+        &mut self,
+        declaration: &'a VariableDeclaration<'a>,
+        initialized: bool,
+    ) -> Statement<'a> {
+        let mut declarations = Vec::with_capacity(declaration.declarations.len());
+        for declarator in &declaration.declarations {
+            let BindingPattern::BindingIdentifier(name) = &declarator.id else {
                 // The declarators before it run first.
                 let stop = self.unsupported("a destructuring declaration");
                 return Statement::Block(vec![
@@ -459,256 +665,290 @@ impl PlanCompiler {
                     Statement::Expression(stop),
                 ]);
             };
-            self.rejected |= name.sym == "arguments";
+            self.rejected |= name.name == "arguments";
+            let init = declarator.init.as_ref().filter(|_| initialized);
             declarations.push(Declaration {
-                name: self.name(&name.sym),
-                init: declarator.init.as_ref().map(|init| self.expression(init)),
-                keeps: declaration.kind == VarDeclKind::Var && declarator.init.is_none(),
+                name: self.name(Binding::Symbol(name.symbol_id())),
+                init: init.map(|init| self.expression(init)),
+                keeps: declaration.kind == VariableDeclarationKind::Var && init.is_none(),
             });
         }
         Statement::Declare(declarations)
     }
 
-    fn property<'a>(&mut self, property: &'a MemberProp) -> Property<'a> {
-        match property {
-            MemberProp::Ident(name) => Property::Name(&name.sym),
-            MemberProp::Computed(key) => Property::Computed(Box::new(self.expression(&key.expr))),
-            MemberProp::PrivateName(_) => self.unsupported_key("a private name"),
+    fn name(&self, binding: Binding<'a>) -> Name<'a> {
+        match self.locals.get(&binding) {
+            Some(&slot) => Name::Local(slot, binding),
+            None => Name::Scoped(binding),
         }
     }
 
-    fn name<'a>(&self, name: &'a Atom) -> Name<'a> {
-        match self.locals.get(name) {
-            Some(&slot) => Name::Local(slot, name),
-            None => Name::Global(name),
+    fn reference(&self, reference: &IdentifierReference<'a>) -> Name<'a> {
+        self.name(self.script.binding(reference))
+    }
+
+    /// Plans the object and property of `member`, or returns `None` for a `super` property.
+    fn member(
+        &mut self,
+        member: &'a MemberExpression<'a>,
+    ) -> Option<(Expression<'a>, Property<'a>)> {
+        if matches!(member.object(), Expr::Super(_)) {
+            return None;
         }
+        let object = self.expression(member.object());
+        let property = match member {
+            MemberExpression::StaticMemberExpression(member) => {
+                Property::Name(member.property.name.as_str())
+            }
+            MemberExpression::ComputedMemberExpression(member) => {
+                Property::Computed(Box::new(self.expression(&member.expression)))
+            }
+            MemberExpression::PrivateFieldExpression(_) => self.unsupported_key("a private name"),
+        };
+        Some((object, property))
     }
 
-    fn member_target<'a>(&mut self, member: &'a MemberExpr) -> Target<'a> {
-        Target::Member(
-            Box::new(self.expression(&member.obj)),
-            self.property(&member.prop),
-        )
-    }
-
-    fn arguments<'a>(&mut self, arguments: &'a [ExprOrSpread]) -> Vec<Expression<'a>> {
+    fn arguments(&mut self, arguments: &'a [Argument<'a>]) -> Vec<Expression<'a>> {
         arguments
             .iter()
-            .map(|argument| match argument.spread {
-                None => self.expression(&argument.expr),
-                Some(_) => self.unsupported("a spread argument"),
+            .map(|argument| match argument.as_expression() {
+                Some(argument) => self.expression(argument),
+                None => self.unsupported("a spread argument"),
             })
             .collect()
     }
 
     /// Compiles a `key: value` property. Unsupported property forms stop evaluation before the
     /// value.
-    fn object_property<'a>(
+    fn object_property(
         &mut self,
-        property: &'a PropOrSpread,
+        property: &'a ObjectPropertyKind<'a>,
     ) -> (Property<'a>, Expression<'a>) {
         let property = match property {
-            PropOrSpread::Prop(property) => match &**property {
-                Prop::KeyValue(property) => property,
-                _ => return self.unsupported_property("an object method or shorthand"),
-            },
-            PropOrSpread::Spread(_) => return self.unsupported_property("a spread property"),
+            ObjectPropertyKind::ObjectProperty(property)
+                if property.kind == PropertyKind::Init
+                    && !property.method
+                    && !property.shorthand =>
+            {
+                property
+            }
+            ObjectPropertyKind::ObjectProperty(_) => {
+                return self.unsupported_property("an object method or shorthand");
+            }
+            ObjectPropertyKind::SpreadProperty(_) => {
+                return self.unsupported_property("a spread property");
+            }
         };
         let key = match &property.key {
-            PropName::Ident(name) => Property::Name(&name.sym),
+            key if property.computed => {
+                self.rejected = true;
+                let key = key
+                    .as_expression()
+                    .expect("a computed key is an expression");
+                Property::Computed(Box::new(self.expression(key)))
+            }
+            PropertyKey::StaticIdentifier(name) => Property::Name(name.name.as_str()),
             // Property keys require text; lone-surrogate strings have no text representation.
-            PropName::Str(name) => match name.value.as_str() {
+            PropertyKey::StringLiteral(name) => match name.value.as_str() {
                 Some(name) => Property::Name(name),
                 None => self.unsupported_key("an object key with a lone surrogate"),
             },
-            PropName::Num(number) => {
+            PropertyKey::NumericLiteral(number) => {
                 Property::Computed(Box::new(Expression::Constant(Value::Number(number.value))))
             }
-            PropName::Computed(key) => {
-                self.rejected = true;
-                Property::Computed(Box::new(self.expression(&key.expr)))
-            }
-            PropName::BigInt(_) => self.unsupported_key("a bigint key"),
+            PropertyKey::BigIntLiteral(_) => self.unsupported_key("a bigint key"),
+            _ => self.unsupported_key("a private name"),
         };
         (key, self.expression(&property.value))
     }
 
     /// Compiles unsupported syntax as a node that stops evaluation. Slot-plan compilation
     /// rejects it.
-    fn unsupported<'a>(&mut self, reason: &'static str) -> Expression<'a> {
+    fn unsupported(&mut self, reason: &'static str) -> Expression<'a> {
         self.rejected = true;
         Expression::Unsupported(reason)
     }
 
-    fn unsupported_key<'a>(&mut self, reason: &'static str) -> Property<'a> {
+    fn unsupported_key(&mut self, reason: &'static str) -> Property<'a> {
         Property::Computed(Box::new(self.unsupported(reason)))
     }
 
     /// A property that stops at its key; its value is never reached.
-    fn unsupported_property<'a>(&mut self, reason: &'static str) -> (Property<'a>, Expression<'a>) {
+    fn unsupported_property(&mut self, reason: &'static str) -> (Property<'a>, Expression<'a>) {
         (
             self.unsupported_key(reason),
             Expression::Unsupported(reason),
         )
     }
 
-    fn expression<'a>(&mut self, expression: &'a Expr) -> Expression<'a> {
+    /// Plans a name or member target, or returns `None` for other targets.
+    fn target(&mut self, target: &'a SimpleAssignmentTarget<'a>) -> Option<Target<'a>> {
+        match target {
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(name) => {
+                Some(Target::Name(self.reference(name)))
+            }
+            target => {
+                let (object, property) = self.member(target.as_member_expression()?)?;
+                Some(Target::Member(Box::new(object), property))
+            }
+        }
+    }
+
+    fn expression(&mut self, expression: &'a Expr<'a>) -> Expression<'a> {
         match expression {
-            Expr::Lit(literal) => Expression::Constant(match literal {
-                Lit::Num(number) => Value::Number(number.value),
-                // Literals may hold lone surrogates, which only code units keep.
-                Lit::Str(text) => Value::String(text.value.to_ill_formed_utf16().collect()),
-                Lit::Bool(value) => Value::Bool(value.value),
-                Lit::Null(_) => Value::Null,
-                _ => return self.unsupported("a regular expression or bigint literal"),
-            }),
-            Expr::Tpl(template) if template.exprs.is_empty() => {
-                match template
-                    .quasis
-                    .first()
-                    .and_then(|quasi| quasi.cooked.as_ref())
-                {
+            Expr::NumericLiteral(number) => Expression::Constant(Value::Number(number.value)),
+            // Literals may hold lone surrogates, which only code units keep.
+            Expr::StringLiteral(text) => {
+                Expression::Constant(Value::String(text.value.encode_utf16().collect()))
+            }
+            Expr::BooleanLiteral(value) => Expression::Constant(Value::Bool(value.value)),
+            Expr::NullLiteral(_) => Expression::Constant(Value::Null),
+            Expr::RegExpLiteral(_) | Expr::BigIntLiteral(_) => {
+                self.unsupported("a regular expression or bigint literal")
+            }
+            Expr::TemplateLiteral(template) if template.expressions.is_empty() => {
+                match template.quasis.first().and_then(|quasi| quasi.value.cooked) {
                     Some(cooked) => {
-                        Expression::Constant(Value::String(cooked.to_ill_formed_utf16().collect()))
+                        Expression::Constant(Value::String(cooked.encode_utf16().collect()))
                     }
                     None => self.unsupported("a raw template"),
                 }
             }
-            Expr::Ident(name) => Expression::Name(self.name(&name.sym)),
-            Expr::This(_) => Expression::This,
-            Expr::Paren(paren) => self.expression(&paren.expr),
-            Expr::Seq(sequence) => Expression::Sequence(
+            Expr::Identifier(name) => Expression::Name(self.reference(name)),
+            Expr::ThisExpression(_) => Expression::This,
+            Expr::ParenthesizedExpression(paren) => self.expression(&paren.expression),
+            Expr::SequenceExpression(sequence) => Expression::Sequence(
                 sequence
-                    .exprs
+                    .expressions
                     .iter()
                     .map(|expression| self.expression(expression))
                     .collect(),
             ),
-            Expr::Member(member) => Expression::Member(
-                Box::new(self.expression(&member.obj)),
-                self.property(&member.prop),
-            ),
-            Expr::Call(call) => {
-                let Callee::Expr(callee) = &call.callee else {
+            Expr::StaticMemberExpression(_)
+            | Expr::ComputedMemberExpression(_)
+            | Expr::PrivateFieldExpression(_) => {
+                let member = expression
+                    .as_member_expression()
+                    .expect("a member expression");
+                match self.member(member) {
+                    Some((object, property)) => Expression::Member(Box::new(object), property),
+                    None => self.unsupported("a super property expression"),
+                }
+            }
+            Expr::CallExpression(call) => {
+                let callee = &call.callee;
+                if matches!(callee, Expr::Super(_)) {
                     return self.unsupported("a super or import call");
-                };
-                self.rejected |= matches!(&**callee, Expr::Paren(_));
+                }
+                self.rejected |= matches!(callee, Expr::ParenthesizedExpression(_));
                 // The interpreter calls parenthesized members without a receiver, like
                 // `(0, o.f)()`. JavaScript normally preserves the receiver in `(o.f)()`.
-                let callee = match (&**callee, self.expression(callee)) {
-                    (Expr::Paren(_), member @ Expression::Member(..)) => {
+                let callee = match (callee, self.expression(callee)) {
+                    (Expr::ParenthesizedExpression(_), member @ Expression::Member(..)) => {
                         Expression::Sequence(vec![member])
                     }
                     (_, callee) => callee,
                 };
-                Expression::Call(Box::new(callee), self.arguments(&call.args))
+                Expression::Call(Box::new(callee), self.arguments(&call.arguments))
             }
-            Expr::New(construction) => Expression::New(
+            Expr::ImportExpression(_) => self.unsupported("a super or import call"),
+            Expr::NewExpression(construction) => Expression::New(
                 Box::new(self.expression(&construction.callee)),
-                match &construction.args {
-                    Some(arguments) => self.arguments(arguments),
-                    None => Vec::new(),
-                },
+                self.arguments(&construction.arguments),
             ),
-            Expr::Bin(binary) => {
+            Expr::LogicalExpression(logical) => Expression::Logical {
+                operator: logical.operator,
+                left: Box::new(self.expression(&logical.left)),
+                right: Box::new(self.expression(&logical.right)),
+                pure: pure(&logical.right),
+            },
+            Expr::BinaryExpression(binary) => {
                 let left = Box::new(self.expression(&binary.left));
                 let right = Box::new(self.expression(&binary.right));
-                match binary.op {
-                    operator @ (BinaryOp::LogicalAnd
-                    | BinaryOp::LogicalOr
-                    | BinaryOp::NullishCoalescing) => Expression::Logical {
+                let operator = binary.operator;
+                match semantics::numeric(operator) {
+                    Some(operation) => Expression::Arithmetic {
                         operator,
+                        operation,
                         left,
                         right,
-                        pure: pure(&binary.right),
                     },
-                    operator => match semantics::numeric(operator) {
-                        Some(operation) => Expression::Arithmetic {
-                            operator,
-                            operation,
-                            left,
-                            right,
-                        },
-                        None => Expression::Binary(operator, left, right),
-                    },
+                    None => Expression::Binary(operator, left, right),
                 }
             }
-            Expr::Unary(unary) if unary.op == UnaryOp::Delete => self.unsupported("delete"),
-            Expr::Unary(unary) => {
-                Expression::Unary(unary.op, Box::new(self.expression(&unary.arg)))
+            Expr::UnaryExpression(unary) if unary.operator == UnaryOperator::Delete => {
+                self.unsupported("delete")
             }
-            Expr::Assign(assign) => {
-                let target = match &assign.left {
-                    AssignTarget::Simple(SimpleAssignTarget::Ident(name)) => {
-                        Target::Name(self.name(&name.id.sym))
-                    }
-                    AssignTarget::Simple(SimpleAssignTarget::Member(member)) => {
-                        self.member_target(member)
-                    }
-                    _ => return self.unsupported("a destructuring assignment"),
+            Expr::UnaryExpression(unary) => {
+                Expression::Unary(unary.operator, Box::new(self.expression(&unary.argument)))
+            }
+            Expr::AssignmentExpression(assignment) => {
+                let target = assignment.left.as_simple_assignment_target();
+                let Some(target) = target.and_then(|target| self.target(target)) else {
+                    return self.unsupported("a destructuring assignment");
                 };
-                let operator = assign.op.to_update();
-                self.rejected |= matches!(
-                    operator,
-                    Some(BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::NullishCoalescing)
-                );
-                let right = Box::new(self.expression(&assign.right));
+                if assignment.operator.is_logical() {
+                    self.rejected = true;
+                    return Expression::LogicalAssign(target);
+                }
+                let operator = assignment.operator.to_binary_operator();
+                let right = Box::new(self.expression(&assignment.right));
                 Expression::Assign(target, operator, right)
             }
-            Expr::Update(update) => Expression::Update {
-                target: match &*update.arg {
-                    Expr::Ident(name) => Target::Name(self.name(&name.sym)),
-                    Expr::Member(member) => self.member_target(member),
-                    _ => return self.unsupported("an increment of an expression"),
+            Expr::UpdateExpression(update) => match self.target(&update.argument) {
+                Some(target) => Expression::Update {
+                    target,
+                    operator: update.operator,
+                    prefix: update.prefix,
                 },
-                operator: update.op,
-                prefix: update.prefix,
+                None => self.unsupported("an increment of an expression"),
             },
-            Expr::Cond(conditional) => Expression::Conditional(
+            Expr::ConditionalExpression(conditional) => Expression::Conditional(
                 Box::new(self.expression(&conditional.test)),
-                Box::new(self.expression(&conditional.cons)),
-                Box::new(self.expression(&conditional.alt)),
+                Box::new(self.expression(&conditional.consequent)),
+                Box::new(self.expression(&conditional.alternate)),
             ),
-            Expr::Array(array) => Expression::Array(
+            Expr::ArrayExpression(array) => Expression::Array(
                 array
-                    .elems
+                    .elements
                     .iter()
                     .map(|element| match element {
-                        Some(element) if element.spread.is_none() => {
-                            Some(self.expression(&element.expr))
+                        ArrayExpressionElement::Elision(_) => None,
+                        ArrayExpressionElement::SpreadElement(_) => {
+                            Some(self.unsupported("a spread element"))
                         }
-                        Some(_) => Some(self.unsupported("a spread element")),
-                        None => None,
+                        element => {
+                            Some(self.expression(element.as_expression().expect("an element")))
+                        }
                     })
                     .collect(),
             ),
-            Expr::Object(object) => Expression::Object(
+            Expr::ObjectExpression(object) => Expression::Object(
                 object
-                    .props
+                    .properties
                     .iter()
                     .map(|property| self.object_property(property))
                     .collect(),
             ),
-            Expr::Fn(function) => {
-                let name = function.ident.as_ref().map(|ident| &ident.sym);
-                Expression::Function(name, &function.function)
+            Expr::FunctionExpression(function) => {
+                let name = function.id.as_ref().map(|name| name.name.as_str());
+                Expression::Function(name, function)
             }
             // Arrows inherit `arguments`, which slot plans keep out of scopes.
-            Expr::Arrow(arrow) => {
-                let mut names = Names::default();
-                arrow.visit_with(&mut names);
-                self.rejected |= names.0.contains(&atom!("arguments"));
+            Expr::ArrowFunctionExpression(arrow) => {
+                let mut mentions = MentionsArguments::default();
+                mentions.visit_arrow_function_expression(arrow);
+                self.rejected |= mentions.0;
                 Expression::Arrow(arrow)
             }
             expression => self.unsupported(match expression {
-                Expr::Tpl(_) => "a template expression",
-                Expr::TaggedTpl(_) => "a tagged template expression",
-                Expr::OptChain(_) => "an optional chain expression",
-                Expr::Await(_) => "an await expression",
-                Expr::Yield(_) => "a yield expression",
-                Expr::Class(_) => "a class expression",
-                Expr::MetaProp(_) => "a meta property expression",
-                Expr::SuperProp(_) => "a super property expression",
+                Expr::TemplateLiteral(_) => "a template expression",
+                Expr::TaggedTemplateExpression(_) => "a tagged template expression",
+                Expr::ChainExpression(_) => "an optional chain expression",
+                Expr::AwaitExpression(_) => "an await expression",
+                Expr::YieldExpression(_) => "a yield expression",
+                Expr::ClassExpression(_) => "a class expression",
+                Expr::ImportMeta(_) | Expr::NewTarget(_) => "a meta property expression",
                 _ => "an unsupported expression",
             }),
         }
@@ -717,21 +957,29 @@ impl PlanCompiler {
 
 /// Checks whether `expr` only produces a value or throws. Rejects calls, writes, and
 /// register-dependent branches.
-fn pure(expr: &Expr) -> bool {
+fn pure(expr: &Expr<'_>) -> bool {
     match expr {
-        Expr::Lit(_) | Expr::Ident(_) | Expr::This(_) | Expr::Fn(_) | Expr::Arrow(_) => true,
-        Expr::Tpl(template) => template.exprs.is_empty(),
-        Expr::Paren(paren) => pure(&paren.expr),
-        Expr::Seq(sequence) => sequence.exprs.iter().all(|expr| pure(expr)),
-        Expr::Member(member) => {
-            pure(&member.obj)
-                && match &member.prop {
-                    MemberProp::Computed(computed) => pure(&computed.expr),
-                    _ => true,
-                }
+        Expr::NumericLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NullLiteral(_)
+        | Expr::BigIntLiteral(_)
+        | Expr::RegExpLiteral(_)
+        | Expr::Identifier(_)
+        | Expr::ThisExpression(_)
+        | Expr::FunctionExpression(_)
+        | Expr::ArrowFunctionExpression(_) => true,
+        Expr::TemplateLiteral(template) => template.expressions.is_empty(),
+        Expr::ParenthesizedExpression(paren) => pure(&paren.expression),
+        Expr::SequenceExpression(sequence) => sequence.expressions.iter().all(pure),
+        Expr::StaticMemberExpression(member) => pure(&member.object),
+        Expr::PrivateFieldExpression(member) => pure(&member.object),
+        Expr::ComputedMemberExpression(member) => pure(&member.object) && pure(&member.expression),
+        Expr::UnaryExpression(unary) => {
+            unary.operator != UnaryOperator::Delete && pure(&unary.argument)
         }
-        Expr::Unary(unary) => unary.op != UnaryOp::Delete && pure(&unary.arg),
-        Expr::Bin(binary) => pure(&binary.left) && pure(&binary.right),
+        Expr::BinaryExpression(binary) => pure(&binary.left) && pure(&binary.right),
+        Expr::LogicalExpression(logical) => pure(&logical.left) && pure(&logical.right),
         _ => false,
     }
 }

@@ -15,18 +15,20 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use anyhow::{Context, Result};
-use swc_core::atoms::Atom;
-use swc_core::common::BytePos;
-use swc_core::ecma::ast::{
-    BinaryOp, CallExpr, Callee, CondExpr, Expr, FnDecl, Function, KeyValueProp, Lit, MemberExpr,
-    MemberProp, Pat, PropName, ReturnStmt, TryStmt, UnaryOp, VarDeclarator,
+use oxc::ast::ast::{
+    Argument, BindingPattern, CallExpression, ConditionalExpression, Expression, Function,
+    MemberExpression, ObjectPropertyKind, PropertyKey, ReturnStatement, TryStatement,
+    VariableDeclarator,
 };
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::{ScopeFlags, SymbolId};
+use oxc::span::GetSpan;
+use oxc::syntax::operator::{BinaryOperator, UnaryOperator};
 use url::Url;
 
 use crate::candidates;
 use crate::engine::{Engine, StackFrame, V8_STACK_LIMIT};
-use crate::js::ast::{self, ParsedScript};
+use crate::js::ast::{self, Binding, ParsedScript, Script};
 
 /// The loader's entry point for widgets declared in markup.
 const IMPLICIT_RENDER: &str = "runImplicitRender";
@@ -42,10 +44,10 @@ pub(crate) struct RenderSample {
 }
 
 impl RenderSample {
-    /// Rebuilds the stack for markup-triggered rendering from `parsed`, using `engine`'s format
+    /// Rebuilds the stack for markup-triggered rendering from `script`, using `engine`'s format
     /// and `url` as the script name.
-    pub(crate) fn from_parsed(parsed: &ParsedScript, url: &Url, engine: Engine) -> Result<Self> {
-        let loader = Loader::read(parsed);
+    pub(crate) fn from_script(script: Script<'_>, url: &Url, engine: Engine) -> Result<Self> {
+        let loader = Loader::read(script);
         let (method, mut frames) = loader.sampled(IMPLICIT_RENDER, engine)?;
         // The outer frames cover queue insertion and the DOM-ready handler draining that queue.
         let queued = candidates::at_most_one_distinct(
@@ -58,13 +60,13 @@ impl RenderSample {
         let drained = loader
             .calls
             .iter()
-            .find(|call| call.scope.as_ref() == Some(ready))
+            .find(|call| call.scope.map(Binding::Symbol) == Some(*ready))
             .context("the ready handler calls nothing it queued")?;
-        frames.push((queued.function.to_string(), &queued.site));
-        frames.push((ready.to_string(), &drained.site));
+        frames.push((loader.name(queued.function).to_owned(), &queued.site));
+        frames.push((script.name(*ready).to_owned(), &drained.site));
         Ok(Self {
             method,
-            stack: engine.error_stack(placed(parsed, url, &frames, engine)),
+            stack: engine.error_stack(placed(script, url, &frames, engine)),
         })
     }
 
@@ -78,11 +80,12 @@ impl RenderSample {
         caller: impl IntoIterator<Item = StackFrame<'caller>>,
         engine: Engine,
     ) -> Result<Self> {
-        let parsed = ast::parse_javascript("the Turnstile loader", source)?;
-        let loader = Loader::read(&parsed);
+        let parsed = ParsedScript::parse("the Turnstile loader", source)?;
+        let script = parsed.script();
+        let loader = Loader::read(script);
         let (method, frames) = loader.sampled(EXPLICIT_RENDER, engine)?;
         let caller = caller.into_iter().map(|frame| StackFrame { ..frame });
-        let frames = placed(&parsed, url, &frames, engine)
+        let frames = placed(script, url, &frames, engine)
             .into_iter()
             .chain(caller);
         let stack = match engine {
@@ -94,7 +97,7 @@ impl RenderSample {
                 )?
                 .context("loader never calls an onload callback")?;
                 let timer = [(String::new(), onload)];
-                engine.error_stack(frames.chain(placed(&parsed, url, &timer, engine)))
+                engine.error_stack(frames.chain(placed(script, url, &timer, engine)))
             }
         };
         Ok(Self { method, stack })
@@ -104,7 +107,7 @@ impl RenderSample {
 /// Places loader frames for `engine`, leaving out the frames JavaScriptCore's tail calls
 /// replace.
 fn placed<'a>(
-    parsed: &ParsedScript,
+    script: Script<'_>,
     url: &'a Url,
     frames: &'a [(String, &Site)],
     engine: Engine,
@@ -116,7 +119,7 @@ fn placed<'a>(
             Engine::WebKit if site.tail => continue,
             Engine::WebKit => site.jsc,
         };
-        let (line, column) = parsed.position(at);
+        let (line, column) = script.position(at);
         surviving.push(StackFrame {
             function,
             url: url.as_str(),
@@ -127,13 +130,13 @@ fn placed<'a>(
     surviving
 }
 
-/// Engine-specific source positions for a call frame.
+/// Engine-specific source offsets for a call frame.
 #[derive(Debug, PartialEq)]
 struct Site {
     /// The start of the callee, V8's position.
-    v8: BytePos,
+    v8: u32,
     /// The opening argument parenthesis, used by JavaScriptCore.
-    jsc: BytePos,
+    jsc: u32,
     /// Whether this call is directly returned and therefore eligible for JavaScriptCore
     /// tail-call replacement.
     tail: bool,
@@ -141,39 +144,42 @@ struct Site {
 
 /// A call through a plain identifier.
 #[derive(Debug, PartialEq)]
-struct Call {
-    scope: Option<Atom>,
-    callee: Atom,
+struct Call<'a> {
+    /// The named function containing the call.
+    scope: Option<SymbolId>,
+    callee: Binding<'a>,
     site: Site,
-    first: Option<Atom>,
+    /// The first argument, when it is a plain identifier.
+    first: Option<Binding<'a>>,
 }
 
 /// A frame position inside the named function `function`.
 #[derive(Debug, PartialEq)]
 struct FunctionSite {
-    function: Atom,
+    function: SymbolId,
     site: Site,
 }
 
 /// Finds the functions and calls involved in stack sampling.
-#[derive(Default)]
-struct Loader {
-    scope: Option<Atom>,
+struct Loader<'a> {
+    script: Script<'a>,
+    /// The named function being visited.
+    scope: Option<SymbolId>,
     /// `new Error().stack` reads, at the error's construction site.
     samples: Vec<FunctionSite>,
-    calls: Vec<Call>,
+    calls: Vec<Call<'a>>,
     /// `runImplicitRender` property calls.
     implicit_calls: Vec<FunctionSite>,
-    /// Calls returned directly outside `try` blocks.
-    tail_calls: HashSet<BytePos>,
+    /// Starts of calls returned directly outside `try` blocks.
+    tail_calls: HashSet<u32>,
     /// Whether the visit is inside a `try` block of the current function.
     in_try: bool,
     /// `key: function` in object literals.
-    properties: HashMap<Atom, Atom>,
+    properties: HashMap<&'a str, Binding<'a>>,
     /// Variables initialised to a number.
-    numbers: HashMap<Atom, f64>,
+    numbers: HashMap<SymbolId, f64>,
     /// The functions handed to `addEventListener("DOMContentLoaded", ...)`.
-    ready: Vec<Atom>,
+    ready: Vec<Binding<'a>>,
     /// Delay of the timer whose callback is currently being visited.
     timer_delay: Option<f64>,
     /// Calls to the page's defined `onload` callback from a timer with no delay. Another timer
@@ -181,11 +187,29 @@ struct Loader {
     onload_calls: Vec<Site>,
 }
 
-impl Loader {
-    fn read(parsed: &ParsedScript) -> Self {
-        let mut loader = Self::default();
-        parsed.script.visit_with(&mut loader);
+impl<'a> Loader<'a> {
+    fn read(script: Script<'a>) -> Self {
+        let mut loader = Self {
+            script,
+            scope: None,
+            samples: Vec::new(),
+            calls: Vec::new(),
+            implicit_calls: Vec::new(),
+            tail_calls: HashSet::new(),
+            in_try: false,
+            properties: HashMap::new(),
+            numbers: HashMap::new(),
+            ready: Vec::new(),
+            timer_delay: None,
+            onload_calls: Vec::new(),
+        };
+        loader.visit_program(script.program);
         loader
+    }
+
+    /// The declared name of the function `symbol` binds.
+    fn name(&self, symbol: SymbolId) -> &'a str {
+        self.script.scoping.symbol_name(symbol)
     }
 
     /// Returns the sampling method code for loader export `property` and its frames, innermost
@@ -196,196 +220,209 @@ impl Loader {
         let wrapper = candidates::at_most_one_distinct(
             self.calls
                 .iter()
-                .filter(|call| call.callee == sample.function),
+                .filter(|call| call.callee == Binding::Symbol(sample.function)),
             "calls of the stack sampler",
         )?
         .context("loader never calls its stack sampler")?;
         let measured = wrapper
             .scope
-            .as_ref()
             .context("the stack sampler is called from an anonymous function")?;
-        let exported = self
+        let exported = *self
             .properties
-            .get(&Atom::from(property))
+            .get(property)
             .with_context(|| format!("loader exports no {property}"))?;
         let call = candidates::at_most_one_distinct(
-            self.calls
-                .iter()
-                .filter(|call| call.scope.as_ref() == Some(exported) && call.callee == *measured),
+            self.calls.iter().filter(|call| {
+                call.scope.map(Binding::Symbol) == Some(exported)
+                    && call.callee == Binding::Symbol(measured)
+            }),
             "stack samples in the exported render",
         )?
         .with_context(|| format!("the loader's {property} takes no stack sample"))?;
-        let method = call
-            .first
-            .as_ref()
-            .and_then(|code| self.numbers.get(code))
-            .with_context(|| format!("the loader's {property} has no constant method code"))?;
+        let method = match call.first {
+            Some(Binding::Symbol(code)) => self.numbers.get(&code),
+            _ => None,
+        }
+        .with_context(|| format!("the loader's {property} has no constant method code"))?;
+        let exported = self.script.name(exported);
         let exported = match engine {
             Engine::Chromium => format!("Object.{exported} [as {property}]"),
-            Engine::WebKit => exported.to_string(),
+            Engine::WebKit => exported.to_owned(),
         };
         Ok((
             *method,
             vec![
-                (sample.function.to_string(), &sample.site),
-                (measured.to_string(), &wrapper.site),
+                (self.name(sample.function).to_owned(), &sample.site),
+                (self.name(measured).to_owned(), &wrapper.site),
                 (exported, &call.site),
             ],
         ))
     }
 
-    fn within(&mut self, name: Option<Atom>, function: &Function) {
+    /// Visits `function` as the body of the function `name` binds, or of an anonymous one.
+    fn within(&mut self, name: Option<SymbolId>, function: &Function<'a>, flags: ScopeFlags) {
         let previous = mem::replace(&mut self.scope, name);
         let in_try = mem::take(&mut self.in_try);
-        function.visit_children_with(self);
+        walk::walk_function(self, function, flags);
         self.scope = previous;
         self.in_try = in_try;
     }
 
-    fn site(&self, call: &CallExpr, v8: BytePos, jsc: BytePos) -> Site {
+    fn site(&self, call: &CallExpression<'_>, v8: u32, jsc: u32) -> Site {
         Site {
             v8,
             jsc,
-            tail: self.tail_calls.contains(&call.span.lo),
+            tail: self.tail_calls.contains(&call.span.start),
         }
     }
 }
 
-impl Visit for Loader {
-    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        self.within(Some(declaration.ident.sym.clone()), &declaration.function);
-    }
-
-    fn visit_function(&mut self, function: &Function) {
-        self.within(None, function);
+impl<'a> Visit<'a> for Loader<'a> {
+    /// Declared functions are named by their binding; expressions are anonymous unless a
+    /// variable names them.
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let name = function
+            .id
+            .as_ref()
+            .filter(|_| function.is_declaration())
+            .map(|id| id.symbol_id());
+        self.within(name, function, flags);
     }
 
     /// V8 names a function expression after the variable it initialises.
-    fn visit_var_declarator(&mut self, declarator: &VarDeclarator) {
-        if let Pat::Ident(name) = &declarator.name {
-            match declarator.init.as_deref() {
-                Some(Expr::Fn(function)) => {
-                    self.within(Some(name.id.sym.clone()), &function.function);
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let BindingPattern::BindingIdentifier(name) = &declarator.id {
+            match &declarator.init {
+                Some(Expression::FunctionExpression(function)) => {
+                    self.within(Some(name.symbol_id()), function, ScopeFlags::Function);
                     return;
                 }
-                Some(Expr::Lit(Lit::Num(number))) => {
-                    self.numbers.insert(name.id.sym.clone(), number.value);
+                Some(Expression::NumericLiteral(number)) => {
+                    self.numbers.insert(name.symbol_id(), number.value);
                 }
                 _ => {}
             }
         }
-        declarator.visit_children_with(self);
+        walk::walk_variable_declarator(self, declarator);
     }
 
-    fn visit_member_expr(&mut self, member: &MemberExpr) {
-        if ast::member_str(&member.prop) == Some("stack")
-            && let Expr::New(error) = &*member.obj
-            && let Expr::Ident(callee) = &*error.callee
-            && callee.sym == "Error"
-            && let Some(function) = self.scope.clone()
+    fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
+        if ast::member_str(member) == Some("stack")
+            && let Expression::NewExpression(error) = member.object()
+            && self.script.is_global(&error.callee, "Error")
+            && let Some(function) = self.scope
         {
             self.samples.push(FunctionSite {
                 function,
                 site: Site {
-                    v8: error.span.lo,
-                    jsc: callee.span.hi,
+                    v8: error.span.start,
+                    jsc: error.callee.span().end,
                     tail: false,
                 },
             });
         }
-        member.visit_children_with(self);
+        walk::walk_member_expression(self, member);
     }
 
     /// `found === void 0 ? report() : found()`: the call of a callback once it is defined.
-    fn visit_cond_expr(&mut self, conditional: &CondExpr) {
+    fn visit_conditional_expression(&mut self, conditional: &ConditionalExpression<'a>) {
         if self.timer_delay == Some(0.0)
-            && let Expr::Bin(test) = &*conditional.test
-            && test.op == BinaryOp::EqEqEq
-            && let Expr::Ident(tested) = &*test.left
-            && matches!(&*test.right, Expr::Unary(unary) if unary.op == UnaryOp::Void)
-            && let Expr::Call(call) = &*conditional.alt
-            && call.args.is_empty()
-            && let Callee::Expr(callee) = &call.callee
-            && let Expr::Ident(callee) = &**callee
-            && callee.sym == tested.sym
+            && let Expression::BinaryExpression(test) = &conditional.test
+            && test.operator == BinaryOperator::StrictEquality
+            && let Expression::Identifier(tested) = &test.left
+            && matches!(&test.right, Expression::UnaryExpression(unary)
+                if unary.operator == UnaryOperator::Void)
+            && let Expression::CallExpression(call) = &conditional.alternate
+            && call.arguments.is_empty()
+            && let Expression::Identifier(callee) = &call.callee
+            && self.script.binding(callee) == self.script.binding(tested)
         {
-            let site = self.site(call, callee.span.lo, callee.span.hi);
+            let site = self.site(call, callee.span.start, callee.span.end);
             self.onload_calls.push(site);
         }
-        conditional.visit_children_with(self);
+        walk::walk_conditional_expression(self, conditional);
     }
 
-    fn visit_call_expr(&mut self, call: &CallExpr) {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         let outer_delay = self.timer_delay;
-        if let Callee::Expr(callee) = &call.callee {
-            match &**callee {
-                Expr::Ident(callee) => {
-                    // `setTimeout(function () { ... }, delay)`: the callback runs from a timer.
-                    if callee.sym == "setTimeout"
-                        && let [callback, delay] = &call.args[..]
-                        && callback.expr.is_fn_expr()
-                    {
-                        self.timer_delay = ast::number(&delay.expr);
-                    }
-                    self.calls.push(Call {
-                        scope: self.scope.clone(),
-                        callee: callee.sym.clone(),
-                        site: self.site(call, callee.span.lo, callee.span.hi),
-                        first: call
-                            .args
-                            .first()
-                            .and_then(|argument| Some(argument.expr.as_ident()?.sym.clone())),
-                    });
+        match &call.callee {
+            Expression::Identifier(callee) => {
+                // `setTimeout(function () { ... }, delay)`: the callback runs from a timer.
+                if self.script.is_global(&call.callee, "setTimeout")
+                    && let [callback, delay] = &call.arguments[..]
+                    && matches!(
+                        callback.as_expression(),
+                        Some(Expression::FunctionExpression(_))
+                    )
+                {
+                    self.timer_delay = delay.as_expression().and_then(ast::number);
                 }
-                Expr::Member(member) => {
-                    if let MemberProp::Ident(property) = &member.prop
-                        && property.sym == IMPLICIT_RENDER
-                        && let Some(function) = self.scope.clone()
-                    {
-                        let site = self.site(call, property.span.lo, property.span.hi);
-                        self.implicit_calls.push(FunctionSite { function, site });
-                    }
-                    if ast::member_str(&member.prop) == Some("addEventListener")
-                        && let [event, listener, ..] = &call.args[..]
-                        && matches!(&*event.expr, Expr::Lit(Lit::Str(_)))
-                        && ast::static_str(&event.expr) == Some("DOMContentLoaded")
-                        && let Expr::Ident(listener) = &*listener.expr
-                    {
-                        self.ready.push(listener.sym.clone());
-                    }
+                self.calls.push(Call {
+                    scope: self.scope,
+                    callee: self.script.binding(callee),
+                    site: self.site(call, callee.span.start, callee.span.end),
+                    first: match call.arguments.first().and_then(Argument::as_expression) {
+                        Some(Expression::Identifier(first)) => Some(self.script.binding(first)),
+                        _ => None,
+                    },
+                });
+            }
+            callee => {
+                if let Expression::StaticMemberExpression(member) = callee
+                    && member.property.name == IMPLICIT_RENDER
+                    && let Some(function) = self.scope
+                {
+                    let property = member.property.span;
+                    let site = self.site(call, property.start, property.end);
+                    self.implicit_calls.push(FunctionSite { function, site });
                 }
-                _ => {}
+                if let Some(member) = callee.as_member_expression()
+                    && ast::member_str(member) == Some("addEventListener")
+                    && let [event, listener, ..] = &call.arguments[..]
+                    && let Some(event @ Expression::StringLiteral(_)) = event.as_expression()
+                    && ast::static_str(event) == Some("DOMContentLoaded")
+                    && let Some(Expression::Identifier(listener)) = listener.as_expression()
+                {
+                    self.ready.push(self.script.binding(listener));
+                }
             }
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
         self.timer_delay = outer_delay;
     }
 
     /// A directly returned call is in tail position unless an enclosing `try` requires work
     /// after it returns.
-    fn visit_return_stmt(&mut self, statement: &ReturnStmt) {
+    fn visit_return_statement(&mut self, statement: &ReturnStatement<'a>) {
         if !self.in_try
-            && let Some(Expr::Call(call)) = statement.arg.as_deref()
+            && let Some(Expression::CallExpression(call)) = &statement.argument
         {
-            self.tail_calls.insert(call.span.lo);
+            self.tail_calls.insert(call.span.start);
         }
-        statement.visit_children_with(self);
+        walk::walk_return_statement(self, statement);
     }
 
-    fn visit_try_stmt(&mut self, statement: &TryStmt) {
+    fn visit_try_statement(&mut self, statement: &TryStatement<'a>) {
         let outer = mem::replace(&mut self.in_try, true);
-        statement.block.visit_with(self);
+        self.visit_block_statement(&statement.block);
         self.in_try = outer;
-        statement.handler.visit_with(self);
-        statement.finalizer.visit_with(self);
+        if let Some(handler) = &statement.handler {
+            self.visit_catch_clause(handler);
+        }
+        if let Some(finalizer) = &statement.finalizer {
+            self.visit_block_statement(finalizer);
+        }
     }
 
-    fn visit_key_value_prop(&mut self, property: &KeyValueProp) {
-        if let PropName::Ident(key) = &property.key
-            && let Expr::Ident(value) = &*property.value
+    fn visit_object_property_kind(&mut self, property: &ObjectPropertyKind<'a>) {
+        if let Some(entry) = ast::key_value(property)
+            && !entry.computed
+            && let PropertyKey::StaticIdentifier(key) = &entry.key
+            && let Expression::Identifier(value) = &entry.value
         {
-            self.properties.insert(key.sym.clone(), value.sym.clone());
+            self.properties
+                .insert(key.name.as_str(), self.script.binding(value));
         }
-        property.visit_children_with(self);
+        walk::walk_object_property_kind(self, property);
     }
 }

@@ -14,6 +14,7 @@ use std::ops::Range;
 use rustc_hash::FxHashMap;
 
 use super::reference::REFERENCE;
+pub(crate) use crate::challenge::is_hex_name;
 use crate::js::{JsObject, JsValue};
 
 /// Session names and the reference names they stand for.
@@ -508,17 +509,6 @@ fn is_name(text: &str) -> bool {
             && text
                 .chars()
                 .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit()))
-}
-
-/// Whether `text` is a randomized name in the form newer builds use: `_` and 24 lowercase hex
-/// digits, such as `_2b78d2cde0fa83bfaec4edae`.
-pub(crate) fn is_hex_name(text: &str) -> bool {
-    text.strip_prefix('_').is_some_and(|hex| {
-        hex.len() == 24
-            && hex
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-    })
 }
 
 #[cfg(test)]

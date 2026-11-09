@@ -16,8 +16,8 @@ mod timing;
 mod widget;
 
 pub use channel::Stage;
-pub(crate) use sink::Discard;
 pub use sink::Sink;
+pub(crate) use sink::{Discard, SinkFailed};
 pub use widget::{Clearance, Outcome};
 pub(crate) use widget::{Expect, native, navigate, prepare, send_first_payload};
 

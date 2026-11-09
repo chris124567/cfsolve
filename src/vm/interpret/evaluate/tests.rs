@@ -1,23 +1,21 @@
 //! Compares slot plans with scoped plans by running every tested function both ways.
 
-use swc_core::atoms::Atom;
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
-use crate::js::ast;
-use crate::vm::interpret::plan::FunctionPlan;
+use crate::js::ast::{Binding, ParsedScript, Script};
+use crate::vm::disassemble;
+use crate::vm::interpret::plan::{FunctionPlan, Name, Routine};
 use crate::vm::interpret::run::Stop;
 use crate::vm::interpret::{Run, semantics};
 use crate::vm::output::{Effect, Position, Term};
 use crate::vm::session::{Layout, Session};
 use crate::vm::value::{Callable, Value};
-use crate::vm::{disassemble, extract};
 
 #[test]
 fn concrete_register_stack_keeps_its_exception_continuation() {
-    let parsed = ast::parse_iframe_javascript("function f(stack) { stack.push([42, 9, [], 0]); }")
+    let parsed = ParsedScript::parse("t", "function f(stack) { stack.push([42, 9, [], 0]); }")
         .expect("the source parses");
-    let mut session = Session::empty();
-    session.functions = extract::functions(&parsed.script.body);
+    let mut session = Session::empty(parsed.script());
     session.layout = Layout {
         pc: 240,
         key: 241,
@@ -31,7 +29,7 @@ fn concrete_register_stack_keeps_its_exception_continuation() {
     run.registers.insert(7, stack.clone());
     let function = Callable::Script {
         name: None,
-        function: session.functions[&Atom::from("f")],
+        function: session.declared("f"),
         scope: None,
     };
     let result = run.invoke(&function, Value::Undefined, vec![stack]);
@@ -56,15 +54,12 @@ fn compare(
     decisions: Vec<bool>,
     slots: bool,
 ) -> String {
-    // Leak the script text so arguments can be prepared before parsing it.
-    let parsed: &_ = Box::leak(Box::new(ast::parse_iframe_javascript(source).unwrap()));
-    let mut session = Session::empty();
-    session.functions = extract::functions(&parsed.script.body);
-    let function = session.functions.get(&Atom::from("f")).unwrap();
-    assert_eq!(FunctionPlan::compile(function).is_some(), slots, "{source}");
+    assert_eq!(plan_of(source).is_some(), slots, "{source}");
+    let mut session = Session::empty(parse(source));
+    let function = session.declared("f");
     session
         .bindings
-        .insert(Atom::from("outer"), Value::Number(17.0));
+        .insert(Binding::Global("outer"), Value::Number(17.0));
     let execute = |disabled| {
         session.compiled.disabled.set(disabled);
         let mut run = Run::method(&session);
@@ -89,7 +84,7 @@ fn compare(
         let mut globals: Vec<_> = run
             .globals
             .iter()
-            .map(|(name, value)| (name.to_string(), format!("{:?}", value.expr())))
+            .map(|(binding, value)| (session.script.name(*binding), format!("{:?}", value.expr())))
             .collect();
         globals.sort();
         format!(
@@ -100,6 +95,35 @@ fn compare(
     let outcome = execute(false);
     assert_eq!(outcome, execute(true), "{source}");
     outcome
+}
+
+/// Parses `source`, leaking it so values can be prepared before parsing.
+fn parse(source: &str) -> Script<'static> {
+    let parsed = ParsedScript::parse("t", source).expect("the source parses");
+    Box::leak(Box::new(parsed)).script()
+}
+
+/// The slot plan of the function `f` that `source` declares, if it has one.
+fn plan_of(source: &str) -> Option<FunctionPlan<'static>> {
+    let script = parse(source);
+    let function = Session::empty(script).declared("f");
+    FunctionPlan::compile(script, Routine::function(function).expect("`f` has a body"))
+}
+
+#[test]
+fn shadowed_nested_names_do_not_force_outer_locals_into_scopes() {
+    let source = "function f(x) { var n = 0, g = function(x) { return x + 1; }; for (; n < 4; n++) x += g(n); return x; }";
+    let plan = plan_of(source).expect("`f` has a slot plan");
+    assert!(matches!(plan.parameters[..], [Name::Local(..)]));
+    assert_eq!(plan.locals, 3, "x, n and g need only numbered slots");
+    compare(source, vec![Value::Number(2.0)], vec![], true);
+
+    let plan = plan_of("function f(x) { return function(y) { return x + y; }; }")
+        .expect("`f` has a slot plan");
+    assert!(
+        matches!(plan.parameters[..], [Name::Scoped(_)]),
+        "a true capture still needs a scope"
+    );
 }
 
 #[test]
@@ -169,24 +193,21 @@ fn branches_and_loops_match() {
 fn functions_declared_in_blocks_are_bound_on_entry() {
     // A function declared after a block's `return` is callable from the start of the block,
     // including one that reads the enclosing function's locals.
-    for (source, slots, result) in [
+    for (source, result) in [
         (
             "function f(a) { { return g(a) + 1; function g(x) { return x * 3; } } }",
-            true,
             "return Const(Number(7.0))",
         ),
         (
             "function f(a) { { var b = 4; return g(1); function g(x) { return a + b + x; } } }",
-            true,
             "return Const(Number(7.0))",
         ),
         (
             "function f(a) { try { return g(a); function g(x) { return x + 1; } } finally {} }",
-            true,
             "return Const(Number(3.0))",
         ),
     ] {
-        let outcome = compare(source, vec![Value::Number(2.0)], vec![], slots);
+        let outcome = compare(source, vec![Value::Number(2.0)], vec![], true);
         assert!(outcome.starts_with(result), "{source}: {outcome}");
     }
 }
@@ -280,26 +301,26 @@ fn numeric_operations_match_javascript_semantics() {
         f64::NEG_INFINITY,
     ];
     let operators = [
-        BinaryOp::Add,
-        BinaryOp::Sub,
-        BinaryOp::Mul,
-        BinaryOp::Div,
-        BinaryOp::Mod,
-        BinaryOp::Exp,
-        BinaryOp::BitAnd,
-        BinaryOp::BitOr,
-        BinaryOp::BitXor,
-        BinaryOp::LShift,
-        BinaryOp::RShift,
-        BinaryOp::ZeroFillRShift,
-        BinaryOp::EqEq,
-        BinaryOp::EqEqEq,
-        BinaryOp::NotEq,
-        BinaryOp::NotEqEq,
-        BinaryOp::Lt,
-        BinaryOp::LtEq,
-        BinaryOp::Gt,
-        BinaryOp::GtEq,
+        BinaryOperator::Addition,
+        BinaryOperator::Subtraction,
+        BinaryOperator::Multiplication,
+        BinaryOperator::Division,
+        BinaryOperator::Remainder,
+        BinaryOperator::Exponential,
+        BinaryOperator::BitwiseAnd,
+        BinaryOperator::BitwiseOR,
+        BinaryOperator::BitwiseXOR,
+        BinaryOperator::ShiftLeft,
+        BinaryOperator::ShiftRight,
+        BinaryOperator::ShiftRightZeroFill,
+        BinaryOperator::Equality,
+        BinaryOperator::StrictEquality,
+        BinaryOperator::Inequality,
+        BinaryOperator::StrictInequality,
+        BinaryOperator::LessThan,
+        BinaryOperator::LessEqualThan,
+        BinaryOperator::GreaterThan,
+        BinaryOperator::GreaterEqualThan,
     ];
     for operator in operators {
         for a in values {

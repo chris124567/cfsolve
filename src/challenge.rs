@@ -14,4 +14,5 @@ pub mod state;
 pub mod tally;
 
 pub use codec::decode_response;
+pub(crate) use source::is_hex_name;
 pub use source::{inline_javascript, is_post_path, ray};

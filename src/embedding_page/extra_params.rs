@@ -2,16 +2,17 @@
 //! configuration, elapsed times, loader resource timing, and the page summary.
 
 use anyhow::{Context, Result};
+use oxc::ast::ast::{CallExpression, Expression, ObjectPropertyKind};
+use oxc::ast_visit::{Visit, walk};
 use serde::{Deserialize, Serialize};
-use swc_core::ecma::ast::{CallExpr, Expr, KeyValueProp};
-use swc_core::ecma::visit::{Visit, VisitWith};
 use url::Url;
 
 use crate::challenge::reduced_timing::{Entry, ResourceTiming};
 use crate::embedding_page::page::{Layout, PageSignals, RenderedPage};
 use crate::embedding_page::render_sample::RenderSample;
 use crate::engine::Engine;
-use crate::js::{JsValue, ast, json};
+use crate::js::ast::{self, ParsedScript};
+use crate::js::{JsValue, json};
 use crate::resource_timing::{NEXT_HOP_PROTOCOL, Phases, ResourceMeasurement};
 use crate::{candidates, random_id};
 
@@ -95,16 +96,17 @@ impl ApiScript {
         timeline: &Timeline,
         engine: Engine,
     ) -> Result<Self> {
-        let parsed = ast::parse_javascript("the Turnstile loader", source)?;
+        let parsed = ParsedScript::parse("the Turnstile loader", source)?;
+        let script = parsed.script();
         let mut literals = Literals::default();
-        parsed.script.visit_with(&mut literals);
+        literals.visit_program(script.program);
         let build = candidates::at_most_one_distinct(literals.builds, "build hash")?
             .context("loader script has no api.js build hash; is this really api.js?")?;
         let variant =
             candidates::at_most_one_distinct(literals.routes, "challenge-platform route")?
                 .context("loader script names no challenge-platform route")?;
         let render_sample =
-            RenderSample::from_parsed(&parsed, stack_url(&url, &response, engine), engine)?;
+            RenderSample::from_script(script, stack_url(&url, &response, engine), engine)?;
         Ok(Self {
             url,
             build,
@@ -214,11 +216,12 @@ struct Literals {
     routes: Vec<String>,
 }
 
-impl Visit for Literals {
+impl<'a> Visit<'a> for Literals {
     /// `ch: "e694063b5082"`: the twelve-digit hexadecimal build hash, which the iframe compares
     /// with its compiled-in build.
-    fn visit_key_value_prop(&mut self, property: &KeyValueProp) {
-        if ast::key_str(&property.key) == Some("ch")
+    fn visit_object_property_kind(&mut self, property: &ObjectPropertyKind<'a>) {
+        if let Some(property) = ast::key_value(property)
+            && ast::key_str(&property.key, property.computed) == Some("ch")
             && let Some(value) = ast::static_str(&property.value)
             && value.len() == 12
             && value
@@ -227,23 +230,25 @@ impl Visit for Literals {
         {
             self.builds.push(value.to_owned());
         }
-        property.visit_children_with(self);
+        walk::walk_object_property_kind(self, property);
     }
 
     /// `f(..., "b", Reason.New, ...)`: the one-letter route beside the render reason when the
     /// loader builds a widget's first iframe URL.
-    fn visit_call_expr(&mut self, call: &CallExpr) {
-        for pair in call.args.windows(2) {
-            if let Expr::Member(reason) = &*pair[1].expr
-                && ast::member_str(&reason.prop) == Some("New")
-                && let Some(route) = ast::static_str(&pair[0].expr)
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
+        for pair in call.arguments.windows(2) {
+            if let Some(reason) = pair[1]
+                .as_expression()
+                .and_then(Expression::as_member_expression)
+                && ast::member_str(reason) == Some("New")
+                && let Some(route) = pair[0].as_expression().and_then(ast::static_str)
                 && route.len() == 1
                 && route.bytes().all(|byte| byte.is_ascii_lowercase())
             {
                 self.routes.push(route.to_owned());
             }
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 }
 
@@ -439,8 +444,8 @@ mod tests {
     fn finds_build_hashes_and_routes_only_where_the_loader_keeps_them() {
         let literals = |source: &str| {
             let mut literals = Literals::default();
-            let parsed = ast::parse_javascript("t", source).unwrap();
-            parsed.script.visit_with(&mut literals);
+            let parsed = ParsedScript::parse("t", source).unwrap();
+            literals.visit_program(parsed.script().program);
             literals
         };
         let hash = "e694063b5082";

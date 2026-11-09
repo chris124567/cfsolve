@@ -2,10 +2,12 @@
 //! client's fetch measurements to that format. Depending on the build, entries contain rounded-down
 //! phase durations or the original timestamps.
 
-use swc_core::ecma::ast::{AssignTarget, BinaryOp, BlockStmt, Expr, SimpleAssignTarget};
+use oxc::ast::ast::{AssignmentTarget, Expression, FunctionBody};
+use oxc::syntax::operator::BinaryOperator;
 
 use crate::challenge::expression::{self, BuiltObject, ObjectField};
-use crate::js::{JsObject, JsValue, ast, json};
+use crate::js::ast::{self, Binding, Script};
+use crate::js::{JsObject, JsValue, json};
 use crate::resource_timing::{LoadTiming, Phases, ResourceMeasurement};
 
 /// The resource timing property represented by an output field.
@@ -108,45 +110,54 @@ impl ResourceTiming {
 
 /// Finds the first resource summary object in `body`, using the resource name and locals
 /// holding floored measurements.
-pub(super) fn reduction(body: &BlockStmt) -> Option<Vec<(String, Measure)>> {
-    let mut measured: Vec<(&str, Measure)> = Vec::new();
+pub(super) fn reduction<'a>(
+    script: Script<'a>,
+    body: &FunctionBody<'a>,
+) -> Option<Vec<(String, Measure)>> {
+    let mut measured: Vec<(Binding, Measure)> = Vec::new();
     let mut built: Vec<BuiltObject> = Vec::new();
     for assignment in expression::assignments(body) {
-        if let AssignTarget::Simple(SimpleAssignTarget::Ident(local)) = &assignment.left
-            && let Some(measure) = floored(&assignment.right)
+        if let AssignmentTarget::AssignmentTargetIdentifier(local) = &assignment.left
+            && let Some(measure) = floored(script, &assignment.right)
         {
-            measured.push((&local.id.sym, measure));
+            measured.push((script.binding(local), measure));
         } else {
-            expression::track(&mut built, assignment);
+            expression::track(script, &mut built, assignment);
         }
     }
     built
         .iter()
-        .find_map(|object| reduced_fields(&object.fields, &measured))
+        .find_map(|object| reduced_fields(script, &object.fields, &measured))
 }
 
 /// Recognizes a reduced entry when it has enough fields, includes the resource name, and uses
 /// only properties of the entry itself or locals listed in `measured`.
-fn reduced_fields(
-    fields: &[ObjectField<'_>],
-    measured: &[(&str, Measure)],
+fn reduced_fields<'a>(
+    script: Script<'a>,
+    fields: &[ObjectField<'_, 'a>],
+    measured: &[(Binding<'a>, Measure)],
 ) -> Option<Vec<(String, Measure)>> {
     let mut reduced = Vec::with_capacity(fields.len());
     for field in fields {
         let measure = match field.value {
-            Expr::Member(member) => match ast::member_str(&member.prop)? {
-                "name" => Measure::Name,
-                "startTime" => Measure::Start,
-                "requestStart" => Measure::RequestStart,
-                "responseStart" => Measure::ResponseStart,
-                "responseEnd" => Measure::ResponseEnd,
-                "duration" => Measure::ExactDuration,
-                "transferSize" => Measure::Transfer,
-                "encodedBodySize" => Measure::Body,
-                _ => return None,
-            },
-            Expr::Ident(ident) => {
-                let (_, measure) = measured.iter().rfind(|(local, _)| *local == &*ident.sym)?;
+            Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+            | Expression::PrivateFieldExpression(_) => {
+                match ast::member_str(field.value.to_member_expression())? {
+                    "name" => Measure::Name,
+                    "startTime" => Measure::Start,
+                    "requestStart" => Measure::RequestStart,
+                    "responseStart" => Measure::ResponseStart,
+                    "responseEnd" => Measure::ResponseEnd,
+                    "duration" => Measure::ExactDuration,
+                    "transferSize" => Measure::Transfer,
+                    "encodedBodySize" => Measure::Body,
+                    _ => return None,
+                }
+            }
+            Expression::Identifier(ident) => {
+                let local = script.binding(ident);
+                let (_, measure) = measured.iter().rfind(|(measured, _)| *measured == local)?;
                 *measure
             }
             _ => return None,
@@ -158,17 +169,19 @@ fn reduced_fields(
 }
 
 /// `Math.floor(entry.a - entry.b)` or `Math.floor(entry.a)`.
-fn floored(expression: &Expr) -> Option<Measure> {
-    let call = expression.as_call()?;
-    let member = call.callee.as_expr()?.as_member()?;
-    if !ast::is_method_of(member, "Math", "floor") {
+fn floored(script: Script<'_>, expression: &Expression<'_>) -> Option<Measure> {
+    let Expression::CallExpression(call) = expression else {
+        return None;
+    };
+    let member = call.callee.as_member_expression()?;
+    if !script.is_method_of(member, "Math", "floor") {
         return None;
     }
-    fn attribute(expression: &Expr) -> Option<&str> {
-        ast::ident_property(expression.as_member()?)
+    fn attribute<'a>(expression: &Expression<'a>) -> Option<&'a str> {
+        ast::ident_property(expression.as_member_expression()?)
     }
-    match &*call.args.first()?.expr {
-        Expr::Bin(binary) if binary.op == BinaryOp::Sub => {
+    match call.arguments.first()?.as_expression()? {
+        Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Subtraction => {
             match (attribute(&binary.left)?, attribute(&binary.right)?) {
                 ("responseEnd", "responseStart") => Some(Measure::Response),
                 ("responseStart", "requestStart") => Some(Measure::Request),
@@ -186,7 +199,10 @@ fn floored(expression: &Expr) -> Option<Measure> {
 
 #[cfg(test)]
 mod tests {
+    use oxc::ast::ast::Statement;
+
     use super::*;
+    use crate::js::ast::ParsedScript;
 
     /// Uses a 137 ms navigation that iOS Safari reported as 124 ms receiving the response and
     /// zero time waiting for it.
@@ -225,19 +241,18 @@ mod tests {
     /// durations.
     #[test]
     fn summaries_may_copy_the_entrys_timestamps() {
-        let parsed = ast::parse_javascript(
+        let parsed = ParsedScript::parse(
             "t.js",
             "function f(e) { var r; r = { a: e.name, b: e.startTime, c: e.requestStart, \
              d: e.responseStart, g: e.responseEnd, h: e.duration, i: e.transferSize, \
              j: e.encodedBodySize }; list.push(r); }",
         )
         .unwrap();
-        let function = parsed.script.body[0]
-            .as_decl()
-            .unwrap()
-            .as_fn_decl()
-            .unwrap();
-        let fields = reduction(function.function.body.as_ref().unwrap()).unwrap();
+        let script = parsed.script();
+        let Statement::FunctionDeclaration(function) = &script.program.body[0] else {
+            panic!("not a function declaration");
+        };
+        let fields = reduction(script, function.body.as_ref().unwrap()).unwrap();
         let measures: Vec<Measure> = fields.iter().map(|(_, measure)| *measure).collect();
         assert_eq!(
             measures,

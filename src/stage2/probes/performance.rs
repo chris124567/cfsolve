@@ -5,8 +5,8 @@ use std::convert::Infallible;
 use std::ops::ControlFlow;
 
 use anyhow::{Result, bail};
+use oxc::syntax::operator::{BinaryOperator, UnaryOperator};
 use serde::{Deserialize, Serialize};
-use swc_core::ecma::ast::{BinaryOp, UnaryOp};
 
 use crate::engine::Engine;
 use crate::js::{JsObject, JsValue, json};
@@ -376,13 +376,17 @@ fn marked(columns: &[RowWrite]) -> Option<(&str, &[RowWrite])> {
 /// negations.
 fn equality(condition: &Term, holds: bool) -> Option<(&Term, &Term)> {
     match condition {
-        Term::Unary(UnaryOp::Bang, inner) => equality(inner, !holds),
-        Term::Binary(BinaryOp::EqEqEq | BinaryOp::EqEq, left, right) if holds => {
+        Term::Unary(UnaryOperator::LogicalNot, inner) => equality(inner, !holds),
+        Term::Binary(BinaryOperator::StrictEquality | BinaryOperator::Equality, left, right)
+            if holds =>
+        {
             Some((left, right))
         }
-        Term::Binary(BinaryOp::NotEqEq | BinaryOp::NotEq, left, right) if !holds => {
-            Some((left, right))
-        }
+        Term::Binary(
+            BinaryOperator::StrictInequality | BinaryOperator::Inequality,
+            left,
+            right,
+        ) if !holds => Some((left, right)),
         _ => None,
     }
 }
@@ -414,11 +418,11 @@ fn evaluate(frame: &Frame<Held>, term: &Term) -> Option<Known<Held>> {
             (None, Some(Known::Literal(JsValue::String(name)))) => Known::Ext(Held::Field(name)),
             _ => return None,
         },
-        Term::Binary(BinaryOp::Add, left, _) => match frame.resolve(left)? {
+        Term::Binary(BinaryOperator::Addition, left, _) => match frame.resolve(left)? {
             Known::Literal(JsValue::String(prefix)) => Known::Ext(Held::Prefixed(prefix)),
             _ => return None,
         },
-        Term::Binary(BinaryOp::Sub, left, right) => {
+        Term::Binary(BinaryOperator::Subtraction, left, right) => {
             match (frame.resolve(left)?, frame.resolve(right)?) {
                 (Known::Ext(Held::Property(end)), Known::Ext(Held::Property(start)))
                     if end == "responseEnd" && start == "requestStart" =>

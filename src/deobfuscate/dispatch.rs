@@ -25,105 +25,56 @@
 
 use std::iter;
 
-use swc_core::ecma::ast::{
-    BinaryOp, CallExpr, Callee, Expr, ExprOrSpread, FnDecl, Function, Id, Lit, Program, Stmt,
-    UnaryOp,
-};
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::allocator::{CloneIn, GetAllocator, Vec as ArenaVec};
+use oxc::ast::ast::{Argument, Expression, Function, Program, Statement};
+use oxc::ast_visit::{VisitMut, walk_mut};
+use oxc::span::Span;
+use oxc::syntax::operator::{BinaryOperator, UnaryOperator};
+use oxc_ecmascript::side_effects::MayHaveSideEffects;
 
-use super::analysis::{Analysis, Globals, effects, names};
-use super::{HashMap, helper_objects};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::{HashMap, ast};
 
-/// Dispatcher patterns enabled for a pass.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Reach {
-    /// Applied calls and operations selected by the first argument.
-    Decoding,
-    /// Also includes direct calls and selection by any numeric argument.
-    All,
+/// Inlines applications and operations selected by the first numeric argument, preserving
+/// direct-call frames.
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    inline(program, analysis, /* all= */ false)
 }
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    inline(program, analysis, Reach::Decoding)
+/// Also inlines direct target calls and numeric selectors in later argument positions.
+pub(super) fn run_all<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    inline(program, analysis, /* all= */ true)
 }
 
-pub(super) fn run_all(program: &mut Program, analysis: &mut Analysis) -> bool {
-    inline(program, analysis, Reach::All)
-}
-
-fn inline(program: &mut Program, analysis: &mut Analysis, reach: Reach) -> bool {
-    let globals = analysis.globals;
-    let bindings = analysis.bindings(program);
-    let mut functions = Functions::default();
-    program.visit_with(&mut functions);
-    // The declaration or assignment that defines the function is its only write, so every call
-    // reaches this function.
-    functions.0.retain(|id, _| bindings.is_written_once(id));
-    if functions.0.is_empty() {
-        return false;
-    }
-    let mut inline = InlineDispatchers {
-        functions: &functions.0,
-        globals,
-        reach,
+fn inline<'a>(program: &mut Program<'a>, analysis: &Analysis<'a>, all: bool) -> bool {
+    let functions = ast::functions(program, analysis, &|function| {
+        let body = function.body.as_ref();
+        body.is_some_and(|body| may_select(&body.statements))
+    });
+    let mut inline = Inline {
+        analysis,
+        functions: &functions,
+        all,
         changed: false,
     };
-    program.visit_mut_with(&mut inline);
+    inline.visit_program(program);
     inline.changed
 }
 
-/// Functions with only identifier parameters.
-#[derive(Default)]
-struct Functions(HashMap<Id, Candidate>);
-
-struct Candidate {
-    params: Vec<Id>,
-    body: Vec<Stmt>,
-}
-
-impl Candidate {
-    fn try_new(function: &Function) -> Option<Self> {
-        let params = names::parameter_ids(&function.params)?;
-        let body = &function.body.as_ref()?.stmts;
-        (!params.is_empty() && !function.is_async && !function.is_generator && may_select(body))
-            .then(|| Self {
-                params,
-                body: body.clone(),
-            })
-    }
-}
-
-impl Visit for Functions {
-    fn visit_expr(&mut self, expression: &Expr) {
-        if let Some((id, Expr::Fn(function))) = ast::assignment(expression)
-            && let Some(candidate) = Candidate::try_new(&function.function)
-        {
-            self.0.insert(id, candidate);
-        }
-        expression.visit_children_with(self);
-    }
-
-    fn visit_fn_decl(&mut self, declaration: &FnDecl) {
-        if let Some(candidate) = Candidate::try_new(&declaration.function) {
-            self.0.insert(declaration.ident.to_id(), candidate);
-        }
-        declaration.visit_children_with(self);
-    }
-}
-
-/// Checks whether some selector could reach `return value` through [`Path::run`]. Avoids
-/// cloning large unrelated functions, such as VM helpers.
-fn may_select<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> bool {
+/// Rejects unrelated function bodies before taking an arena snapshot. A supported path must
+/// reach a return through blocks, conditionals, or switches without executing other statements.
+fn may_select<'b, 'a: 'b>(statements: impl IntoIterator<Item = &'b Statement<'a>>) -> bool {
     for statement in statements {
         let selects = match statement {
-            Stmt::Return(returned) => return returned.arg.is_some(),
-            Stmt::Block(block) => may_select(&block.stmts),
-            Stmt::Empty(_) => false,
-            Stmt::If(conditional) => {
-                may_select([&*conditional.cons]) || may_select(conditional.alt.as_deref())
+            Statement::ReturnStatement(statement) => return statement.argument.is_some(),
+            Statement::BlockStatement(block) => may_select(&block.body),
+            Statement::EmptyStatement(_) => false,
+            Statement::IfStatement(branch) => {
+                may_select([&branch.consequent]) || may_select(branch.alternate.iter())
             }
-            Stmt::Switch(switch) => switch.cases.iter().any(|case| may_select(&case.cons)),
+            Statement::SwitchStatement(switch) => {
+                switch.cases.iter().any(|case| may_select(&case.consequent))
+            }
             _ => return false,
         };
         if selects {
@@ -133,51 +84,89 @@ fn may_select<'a>(statements: impl IntoIterator<Item = &'a Stmt>) -> bool {
     false
 }
 
-/// Follows a function body for known numeric parameter values.
-struct Path {
+/// Follows a helper body using only the numeric parameter values known at this call.
+struct Path<'b, 'a> {
     values: HashMap<Id, f64>,
+    analysis: &'b Analysis<'a>,
 }
 
-impl Path {
-    /// Returns `Some(Some(value))` for a return with a value, `Some(None)` for normal
-    /// completion, and `None` for a path it cannot analyze.
-    fn run<'body>(
+impl<'a> Path<'_, 'a> {
+    fn number(&self, expression: &Expression<'a>) -> Option<f64> {
+        ast::fold_number(expression, &|leaf| {
+            let id = self.analysis.expression_id(leaf)?;
+            self.values.get(&id).copied()
+        })
+    }
+
+    fn truthy(&self, expression: &Expression<'a>) -> Option<bool> {
+        match expression.get_inner_expression() {
+            Expression::BooleanLiteral(literal) => Some(literal.value),
+            Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => {
+                Some(!self.truthy(&unary.argument)?)
+            }
+            Expression::BinaryExpression(binary) => {
+                let left = self.number(&binary.left)?;
+                let right = self.number(&binary.right)?;
+                Some(match binary.operator {
+                    BinaryOperator::Equality | BinaryOperator::StrictEquality => left == right,
+                    BinaryOperator::Inequality | BinaryOperator::StrictInequality => left != right,
+                    BinaryOperator::LessThan => left < right,
+                    BinaryOperator::LessEqualThan => left <= right,
+                    BinaryOperator::GreaterThan => left > right,
+                    BinaryOperator::GreaterEqualThan => left >= right,
+                    _ => return None,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns `Some(Some(value))` for a reached value return, `Some(None)` for normal completion,
+    /// and `None` for an unsupported path. Switch selection follows fallthrough until a return;
+    /// paths with a `break` are left to other rewrites.
+    fn run<'c>(
         &self,
-        statements: impl IntoIterator<Item = &'body Stmt>,
-    ) -> Option<Option<&'body Expr>> {
+        statements: impl IntoIterator<Item = &'c Statement<'a>>,
+    ) -> Option<Option<&'c Expression<'a>>>
+    where
+        'a: 'c,
+    {
         for statement in statements {
             let returned = match statement {
-                Stmt::Return(returned) => return Some(Some(returned.arg.as_deref()?)),
-                Stmt::Block(block) => self.run(&block.stmts)?,
-                Stmt::Empty(_) => None,
-                Stmt::If(conditional) => match self.truthy(&conditional.test)? {
-                    true => self.run([&*conditional.cons])?,
-                    false => self.run(conditional.alt.as_deref())?,
-                },
-                Stmt::Switch(switch) => {
+                Statement::ReturnStatement(statement) => {
+                    return Some(Some(statement.argument.as_ref()?));
+                }
+                Statement::BlockStatement(block) => self.run(&block.body)?,
+                Statement::EmptyStatement(_) => None,
+                Statement::IfStatement(branch) => {
+                    if self.truthy(&branch.test)? {
+                        self.run([&branch.consequent])?
+                    } else {
+                        self.run(branch.alternate.iter())?
+                    }
+                }
+                Statement::SwitchStatement(switch) => {
                     let value = self.number(&switch.discriminant)?;
-                    let mut matching = None;
+                    let mut matched = None;
                     let mut default = None;
                     for (index, case) in switch.cases.iter().enumerate() {
-                        let Some(test) = &case.test else {
-                            default.get_or_insert(index);
-                            continue;
-                        };
-                        if self.number(test)? == value {
-                            matching.get_or_insert(index);
+                        if let Some(test) = &case.test {
+                            if self.number(test)? == value {
+                                matched.get_or_insert(index);
+                            }
+                        } else {
+                            default = Some(index)
                         }
                     }
-                    let Some(start) = matching.or(default) else {
+                    let Some(start) = matched.or(default) else {
                         continue;
                     };
-                    // Fall through from the matching case until a return.
-                    let body: Vec<&Stmt> = switch.cases[start..]
-                        .iter()
-                        .flat_map(|case| &case.cons)
-                        .collect();
+                    let cases = switch.cases[start..].iter();
+                    let body: Vec<&Statement<'a>> =
+                        cases.flat_map(|case| &case.consequent).collect();
                     if body
                         .iter()
-                        .any(|statement| matches!(statement, Stmt::Break(_)))
+                        .any(|statement| matches!(statement, Statement::BreakStatement(_)))
                     {
                         return None;
                     }
@@ -191,203 +180,157 @@ impl Path {
         }
         Some(None)
     }
+}
 
-    fn truthy(&self, expression: &Expr) -> Option<bool> {
-        match expression {
-            Expr::Paren(inner) => self.truthy(&inner.expr),
-            Expr::Unary(unary) if unary.op == UnaryOp::Bang => Some(!self.truthy(&unary.arg)?),
-            Expr::Lit(Lit::Bool(value)) => Some(value.value),
-            Expr::Bin(binary) => {
-                let (left, right) = (self.number(&binary.left)?, self.number(&binary.right)?);
-                match binary.op {
-                    BinaryOp::EqEqEq | BinaryOp::EqEq => Some(left == right),
-                    BinaryOp::NotEqEq | BinaryOp::NotEq => Some(left != right),
-                    BinaryOp::Lt => Some(left < right),
-                    BinaryOp::LtEq => Some(left <= right),
-                    BinaryOp::Gt => Some(left > right),
-                    BinaryOp::GtEq => Some(left >= right),
-                    _ => None,
-                }
-            }
-            _ => None,
+/// Accepts unary and binary operations whose leaves pass `leaf`, excluding `delete`.
+fn operation(expression: &Expression<'_>, leaf: &impl Fn(&Expression<'_>) -> bool) -> bool {
+    match expression.get_inner_expression() {
+        Expression::UnaryExpression(unary) => {
+            unary.operator != UnaryOperator::Delete && operation(&unary.argument, leaf)
         }
-    }
-
-    fn number(&self, expression: &Expr) -> Option<f64> {
-        ast::fold_number(expression, &|leaf| {
-            self.values.get(&leaf.as_ident()?.to_id()).copied()
-        })
-    }
-}
-
-/// Returns parameter positions for the target and arguments of a call such as `target(a, b)`. Each
-/// must refer to a parameter.
-fn parameter_call(expression: &Expr, params: &[Id]) -> Option<Vec<usize>> {
-    let call = expression.as_call()?;
-    let arguments = call
-        .args
-        .iter()
-        .map(|arg| arg.spread.is_none().then_some(&*arg.expr));
-    iter::once(Some(&**call.callee.as_expr()?))
-        .chain(arguments)
-        .map(|expression| parameter_position(expression?, params))
-        .collect()
-}
-
-/// Returns the index in `params` of the parameter named by `expression`.
-fn parameter_position(expression: &Expr, params: &[Id]) -> Option<usize> {
-    let id = expression.as_ident()?.to_id();
-    params.iter().position(|param| *param == id)
-}
-
-/// The parameter positions of `target` and `args` in `Reflect.apply(target, undefined, args)`.
-struct ReflectApply {
-    target: usize,
-    arguments: usize,
-}
-
-fn reflect_apply(expression: &Expr, params: &[Id], globals: Globals) -> Option<ReflectApply> {
-    if let Some((reflect, [function, this, arguments])) = ast::method_call(expression, "apply")
-        && reflect
-            .as_ident()
-            .is_some_and(|id| globals.is(id, "Reflect"))
-        && [function, this, arguments]
-            .iter()
-            .all(|arg| arg.spread.is_none())
-        && match &*this.expr {
-            Expr::Ident(id) => globals.is(id, "undefined"),
-            Expr::Unary(unary) => {
-                unary.op == UnaryOp::Void && !effects::may_have_effects(&unary.arg, globals)
-            }
-            _ => false,
+        Expression::BinaryExpression(binary) => {
+            operation(&binary.left, leaf) && operation(&binary.right, leaf)
         }
-    {
-        Some(ReflectApply {
-            target: parameter_position(&function.expr, params)?,
-            arguments: parameter_position(&arguments.expr, params)?,
-        })
-    } else {
-        None
-    }
-}
-
-/// Operators other than `delete` combining leaves that `leaf` accepts.
-fn is_operation(expression: &Expr, leaf: &impl Fn(&Expr) -> bool) -> bool {
-    match expression {
-        Expr::Paren(inner) => is_operation(&inner.expr, leaf),
-        Expr::Unary(unary) => unary.op != UnaryOp::Delete && is_operation(&unary.arg, leaf),
-        Expr::Bin(binary) => is_operation(&binary.left, leaf) && is_operation(&binary.right, leaf),
+        Expression::LogicalExpression(logical) => {
+            operation(&logical.left, leaf) && operation(&logical.right, leaf)
+        }
         expression => leaf(expression),
     }
 }
 
-struct InlineDispatchers<'functions> {
-    functions: &'functions HashMap<Id, Candidate>,
-    globals: Globals,
-    reach: Reach,
+struct Inline<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    functions: &'b HashMap<Id, &'a Function<'a>>,
+    all: bool,
     changed: bool,
 }
 
-impl InlineDispatchers<'_> {
-    fn replacement(&self, callee: &Id, args: &[ExprOrSpread]) -> Option<Expr> {
-        let candidate = self.functions.get(callee)?;
-        if args.iter().any(|arg| arg.spread.is_some()) {
+impl<'a> Inline<'_, 'a> {
+    /// Selects the reached return without evaluating unknown code, then checks its forwarding form.
+    /// Direct calls must preserve argument order and omit only numeric selectors. `Reflect.apply`
+    /// requires global `Reflect` and an effect-free undefined receiver. Repeated or reordered
+    /// operator operands must themselves be effect-free.
+    fn replacement(
+        &self,
+        id: Id,
+        arguments: &[Argument<'a>],
+        span: Span,
+    ) -> Option<Expression<'a>> {
+        let analysis = self.analysis;
+        let function = *self.functions.get(&id)?;
+        if function.r#async || function.generator {
             return None;
         }
-        let number = |arg: &ExprOrSpread| match &*arg.expr {
-            Expr::Lit(Lit::Num(number)) => Some(number.value),
-            _ => None,
+        let parameters = ast::parameters(function)?;
+        let arguments: Vec<&Expression<'a>> = arguments
+            .iter()
+            .map(Argument::as_expression)
+            .collect::<Option<_>>()?;
+        ast::number(arguments.first()?)?;
+        let count = if self.all { arguments.len() } else { 1 };
+        let known = parameters.iter().zip(arguments.iter().take(count));
+        let values = known
+            .filter_map(|(&id, argument)| Some((id, ast::number(argument)?)))
+            .collect();
+        let path = Path { values, analysis };
+        let returned = path.run(&function.body.as_ref()?.statements)??;
+        let position = |expression: Option<&Expression<'a>>| {
+            let id = analysis.expression_id(expression?)?;
+            parameters.iter().position(|parameter| *parameter == id)
         };
-        number(args.first()?)?;
-        let selectors = match self.reach {
-            Reach::Decoding => 1,
-            Reach::All => args.len(),
-        };
-        // Returns the selected expression only if choosing it requires constant selector
-        // comparisons with no other evaluation.
-        let path = Path {
-            values: candidate
-                .params
-                .iter()
-                .zip(&args[..selectors])
-                .filter_map(|(param, arg)| Some((param.clone(), number(arg)?)))
-                .collect(),
-        };
-        let returned = path.run(&candidate.body)??;
-        if self.reach == Reach::All
-            && let Some(positions) = parameter_call(returned, &candidate.params)
-            && args.len() == candidate.params.len()
-            && positions.is_sorted_by(|before, after| before < after)
-            && (0..args.len())
-                .all(|index| positions.contains(&index) || number(&args[index]).is_some())
-            && let [target, passed @ ..] = &positions[..]
-            && args[*target].expr.is_ident()
+        if self.all
+            && let Expression::CallExpression(call) = returned
+            && let Some(positions) = iter::once(Some(&call.callee))
+                .chain(call.arguments.iter().map(Argument::as_expression))
+                .map(&position)
+                .collect::<Option<Vec<usize>>>()
+            && arguments.len() == parameters.len()
+            && positions.is_sorted_by(|left, right| left < right)
+            && (0..arguments.len())
+                .all(|index| positions.contains(&index) || ast::number(arguments[index]).is_some())
+            && let [target, passed @ ..] = positions.as_slice()
+            && matches!(arguments[*target], Expression::Identifier(_))
         {
-            return Some(Expr::Call(CallExpr {
-                callee: Callee::Expr(args[*target].expr.clone()),
-                args: passed.iter().map(|&index| args[index].clone()).collect(),
-                ..Default::default()
-            }));
+            let passed = passed.iter().map(|&index| self.argument(arguments[index]));
+            let passed = ArenaVec::from_iter_in(passed, &analysis.ast);
+            return Some(self.call(span, arguments[*target], passed));
         }
-        if let Some(apply) = reflect_apply(returned, &candidate.params, self.globals)
-            && let Some(target) = args.get(apply.target)
-            && target.expr.is_ident()
-            && let Expr::Array(applied) = &*args.get(apply.arguments)?.expr
-            && let Some(applied) = applied
-                .elems
-                .iter()
-                .map(|element| element.clone().filter(|element| element.spread.is_none()))
-                .collect::<Option<Vec<_>>>()
+        if let Some((reflect, [function, this, applied])) = ast::method_call(returned, "apply")
+            && let Expression::Identifier(reflect) = reflect
+            && analysis.is_global(reflect, "Reflect")
+            && let Some(this) = this.as_expression()
+            && analysis.is_undefined(this)
         {
-            return Some(Expr::Call(CallExpr {
-                callee: Callee::Expr(target.expr.clone()),
-                args: applied,
-                ..Default::default()
-            }));
+            let target = position(function.as_expression())?;
+            let applied = position(applied.as_expression())?;
+            let (Expression::Identifier(_), Expression::ArrayExpression(array)) =
+                (arguments.get(target)?, arguments.get(applied)?)
+            else {
+                return None;
+            };
+            let elements = array.elements.iter();
+            let passed = elements
+                .map(|element| Some(self.argument(element.as_expression()?)))
+                .collect::<Option<Vec<_>>>()?;
+            let passed = ArenaVec::from_iter_in(passed, &analysis.ast);
+            return Some(self.call(span, arguments[target], passed));
         }
-        // The operation may repeat or reorder arguments. Allow only literals and bindings whose
-        // reads have no effects. Unknown globals could throw or invoke getters.
-        let is_parameter_or_number = |leaf: &Expr| match leaf {
-            Expr::Ident(id) => candidate.params.contains(&id.to_id()),
-            leaf => matches!(leaf, Expr::Lit(Lit::Num(_))),
+        let forwards = |expression: &Expression<'_>| {
+            let id = analysis.expression_id(expression);
+            id.is_some_and(|id| parameters.contains(&id))
+                || matches!(expression, Expression::NumericLiteral(_))
         };
-        let is_pure = |leaf: &Expr| match leaf {
-            Expr::Ident(_) => !effects::may_have_effects(leaf, self.globals),
-            leaf => matches!(leaf, Expr::Lit(Lit::Num(_) | Lit::Str(_) | Lit::Bool(_))),
+        let effect_free = |expression: &Expression<'_>| {
+            expression.is_literal()
+                || matches!(expression, Expression::Identifier(_))
+                    && !expression.may_have_side_effects(analysis)
         };
-        if args.len() == candidate.params.len()
-            && is_operation(returned, &is_parameter_or_number)
-            && args.iter().all(|arg| is_operation(&arg.expr, &is_pure))
-        {
-            let values: HashMap<Id, &Expr> = candidate
-                .params
+        if arguments.len() == parameters.len()
+            && operation(returned, &forwards)
+            && arguments
                 .iter()
-                .cloned()
-                .zip(args.iter().map(|arg| &*arg.expr))
-                .collect();
-            // The operation calls nothing, so no parameter needs detaching.
-            Some(helper_objects::replace_parameters(returned, values))
-        } else {
-            None
+                .all(|argument| operation(argument, &effect_free))
+        {
+            let values = parameters.into_iter().zip(arguments).collect();
+            return Some(ast::replace_parameters(returned, &values, analysis));
         }
+        None
+    }
+
+    fn argument(&self, expression: &Expression<'a>) -> Argument<'a> {
+        Argument::from(expression.clone_in_with_semantic_ids(self.analysis.allocator()))
+    }
+
+    fn call(
+        &self,
+        span: Span,
+        callee: &Expression<'a>,
+        arguments: ArenaVec<'a, Argument<'a>>,
+    ) -> Expression<'a> {
+        let callee = callee.clone_in_with_semantic_ids(self.analysis.allocator());
+        Expression::new_call_expression(span, callee, None, arguments, false, &self.analysis.ast)
     }
 }
 
-impl VisitMut for InlineDispatchers<'_> {
-    fn visit_mut_expr(&mut self, expression: &mut Expr) {
-        expression.visit_mut_children_with(self);
-        if let Some((callee, args)) = ast::direct_call(expression)
-            && let Some(replacement) = self.replacement(&callee.to_id(), args)
+impl<'a> VisitMut<'a> for Inline<'_, 'a> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+        if let Some((callee, arguments)) = ast::direct_call(expression)
+            && let Some(id) = self.analysis.id(callee)
+            && let Some(value) = self.replacement(id, arguments, callee.span)
         {
-            *expression = replacement;
-            self.changed = true;
+            *expression = value;
+            self.changed = true
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::deobfuscate::testing;
+    use oxc::allocator::Allocator;
+    use oxc::ast::ast::Statement;
+
+    use crate::deobfuscate::{pipeline, testing};
 
     const APPLY: &str = "var b; b = function (n, m, r) {
         switch (3832 ^ n) {
@@ -402,7 +345,7 @@ mod tests {
 
     #[test]
     fn applies_the_target_only_for_provable_applications() {
-        let inline = |source: &str| testing::rewrite(source, super::run, /* fix= */ true);
+        let inline = |source: &str| testing::rewrite(source, super::run);
         let output = inline(&format!(
             "{APPLY} f(b(971996, encode, [x, 1]), b(428000, g, []));"
         ));
@@ -422,7 +365,7 @@ mod tests {
 
     #[test]
     fn calls_targets_selected_by_several_selectors_only_in_argument_order() {
-        let inline = |source: &str| testing::rewrite(source, super::run_all, /* fix= */ true);
+        let inline = |source: &str| testing::rewrite(source, super::run_all);
         let dispatchers = "function c(n, m, f, x, y) {
                 switch (n ^ 5) { case 1: switch (3 ^ m) { case 1: return f(x, y); } return; }
             }
@@ -430,7 +373,7 @@ mod tests {
         let source = format!("{dispatchers} g(c(4, 2, encode, a(), b));");
         let output = inline(&source);
         assert!(output.contains("g(encode(a(), b))"), "{output}");
-        let decoding = testing::rewrite(&source, super::run, /* fix= */ true);
+        let decoding = testing::rewrite(&source, super::run);
         assert!(decoding.contains("g(c(4, 2,"), "{decoding}");
         for call in [
             "c(4, 2, o.encode, a, b)",
@@ -445,11 +388,11 @@ mod tests {
 
     #[test]
     fn inlines_selected_operations_through_switches_if_chains_and_xor_keys() {
-        let inline = |source: &str| testing::rewrite(source, super::run, /* fix= */ true);
+        let inline = |source: &str| testing::rewrite(source, super::run);
         let output = inline(&format!(
             "{OPERATOR} function g(a, b) {{ f(w(1, 630, 622), w(2, a, b + 1), w(9, 7, 2)); }}"
         ));
-        testing::assert_contains(&output, &["f(630 - 622, (b + 1) * a, 7 % 2)"], &[]);
+        testing::assert_contains(&output, &["f(630 - 622, (b + 1) * a, 7 % 2)"]);
         let output = inline(
             "t = function (V, c, X) {
                 if (!(V !== 0)) { return c + X; } else { if (!(2 === V)) { return c % X; } else { return X * c; } }
@@ -457,7 +400,7 @@ mod tests {
             function q(J, r, n) { switch (2774 ^ J) { case 0: return r | n; default: return r & n; } }
             function g(a, b) { f(t(0, a, b), t(2, a, b), t(5, a, b), q(2774, a, b), q(2775, a, b)); }",
         );
-        testing::assert_contains(&output, &["f(a + b, b * a, a % b, a | b, a & b)"], &[]);
+        testing::assert_contains(&output, &["f(a + b, b * a, a % b, a | b, a & b)"]);
         // Arguments with effects and unknown selectors stay.
         for call in ["w(1, g(), 2)", "w(n, 1, 2)", "w(1, 2)", "w(1, missing, 2)"] {
             let output = inline(&format!("{OPERATOR} f({call});"));
@@ -467,17 +410,14 @@ mod tests {
 
     #[test]
     fn only_bodies_that_can_select_a_return_are_candidates() {
-        use swc_core::ecma::ast::{Decl, Stmt};
-
         let selects = |body: &str| {
-            let script =
-                crate::js::ast::parse_javascript("a test", &format!("function f(n) {{ {body} }}"))
-                    .unwrap()
-                    .script;
-            let Some(Stmt::Decl(Decl::Fn(function))) = script.body.first() else {
-                panic!("not a function declaration: {body}");
+            let allocator = Allocator::default();
+            let source = format!("function f(n) {{ {body} }}");
+            let (program, _) = pipeline::parse(&allocator, &source).unwrap();
+            let Statement::FunctionDeclaration(function) = &program.body[0] else {
+                panic!("not a function declaration")
             };
-            super::may_select(&function.function.body.as_ref().unwrap().stmts)
+            super::may_select(&function.body.as_ref().unwrap().statements)
         };
         for body in [
             "return 1;",

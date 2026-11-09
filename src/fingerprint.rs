@@ -78,8 +78,13 @@ impl Transport {
         })
     }
 
-    /// Creates a client with this transport, optionally using `proxy`.
-    pub fn client(&self, proxy: Option<&str>) -> Result<BrowserClient> {
+    /// Creates a client with this transport, optionally using `proxy` and trusting only the PEM
+    /// certificate `trusted_root`.
+    pub fn client(
+        &self,
+        proxy: Option<&str>,
+        trusted_root: Option<&[u8]>,
+    ) -> Result<BrowserClient> {
         BrowserClient::try_new(
             self.profile,
             self.platform,
@@ -88,6 +93,7 @@ impl Transport {
             self.requests.clone(),
             self.engine,
             proxy,
+            trusted_root,
         )
     }
 }

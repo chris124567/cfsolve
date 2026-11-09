@@ -2,30 +2,35 @@
 //! hashes, objects built in a block, and expressions used to construct options and payloads.
 
 use anyhow::{Context, Result, bail, ensure};
-use swc_core::ecma::ast::{
-    AssignExpr, AssignTarget, BinExpr, BinaryOp, BlockStmt, Expr, Lit, SimpleAssignTarget, Stmt,
-    UnaryOp,
+use oxc::ast::ast::{
+    ArrayExpressionElement, AssignmentExpression, AssignmentTarget, BinaryExpression, Expression,
+    FunctionBody, MemberExpression, Statement,
 };
+use oxc::syntax::operator::{BinaryOperator, LogicalOperator, UnaryOperator};
 
-use crate::js::{self, JsValue, Options, Window, ast};
+use crate::js::ast::{self, Binding, Script};
+use crate::js::{self, JsValue, Options, Window};
 
 /// Reads the build hash from `"0…0" + <number>.toString(16)`. The zero literal sets the
 /// hexadecimal width. Requires an integer literal that fits without truncation; accepts any
 /// numeric base and ignores surrounding parentheses.
 #[must_use]
-pub(crate) fn padded_build(sum: &BinExpr) -> Option<String> {
+pub(crate) fn padded_build(sum: &BinaryExpression<'_>) -> Option<String> {
     let zeros = ast::static_str(&sum.left)?;
-    let call = sum.right.unwrap_parens().as_call()?;
-    let member = call.callee.as_expr()?.unwrap_parens().as_member()?;
-    let (Expr::Lit(Lit::Num(number)), [radix]) = (member.obj.unwrap_parens(), &call.args[..])
+    let Expression::CallExpression(call) = sum.right.without_parentheses() else {
+        return None;
+    };
+    let member = call.callee.without_parentheses().as_member_expression()?;
+    let (Expression::NumericLiteral(number), [radix]) =
+        (member.object().without_parentheses(), &call.arguments[..])
     else {
         return None;
     };
-    let padded =
-        sum.op == BinaryOp::Add && !zeros.is_empty() && zeros.bytes().all(|byte| byte == b'0');
-    let hexadecimal = ast::member_str(&member.prop) == Some("toString")
-        && radix.spread.is_none()
-        && ast::index_literal(&radix.expr) == Some(16);
+    let padded = sum.operator == BinaryOperator::Addition
+        && !zeros.is_empty()
+        && zeros.bytes().all(|byte| byte == b'0');
+    let hexadecimal = ast::member_str(member) == Some("toString")
+        && radix.as_expression().and_then(ast::index_literal) == Some(16);
     let (number, width) = (number.value, zeros.len());
     // For padding wider than sixteen hex digits, the `u64` range limits the value.
     let limit = 16f64.powi(i32::try_from(width).ok()?).min(2f64.powi(64));
@@ -33,153 +38,187 @@ pub(crate) fn padded_build(sum: &BinExpr) -> Option<String> {
         .then(|| format!("{:0width$x}", number as u64))
 }
 
-/// Resolves a static expression using known options (see [`evaluate`]). Unknown options have no
-/// static value.
+/// Resolves a static expression in `script` using known options (see [`evaluate`]). Unknown
+/// options have no static value.
 #[must_use]
-pub(crate) fn static_value(expression: &Expr, options: &Options) -> Option<JsValue> {
-    evaluate(expression, options, &Window::new()).ok()?
+pub(crate) fn static_value(
+    script: Script<'_>,
+    expression: &Expression<'_>,
+    options: &Options,
+) -> Option<JsValue> {
+    evaluate(script, expression, options, &Window::new()).ok()?
 }
 
 /// The `_cf_chl_opt` property read by `<global>._cf_chl_opt.<name>`.
 #[must_use]
-pub(crate) fn option_key(expression: &Expr) -> Option<&str> {
-    let member = expression.as_member()?;
-    ast::member_str(&member.prop).filter(|_| is_options(&member.obj))
+pub(crate) fn option_key<'a>(expression: &Expression<'a>) -> Option<&'a str> {
+    options_member(expression.as_member_expression()?)
 }
 
 /// The option assigned by `_cf_chl_opt.<name> = ...`.
 #[must_use]
-pub(crate) fn option_assignment(target: &AssignTarget) -> Option<&str> {
-    let member = target.as_simple()?.as_member()?;
-    ast::member_str(&member.prop).filter(|_| is_options(&member.obj))
+pub(crate) fn option_assignment<'a>(target: &AssignmentTarget<'a>) -> Option<&'a str> {
+    options_member(target.as_member_expression()?)
+}
+
+/// The option `member` names, if it is a property of `_cf_chl_opt`.
+fn options_member<'a>(member: &MemberExpression<'a>) -> Option<&'a str> {
+    ast::member_str(member).filter(|_| is_options(member.object()))
 }
 
 /// Returns the assignment contained in an expression statement.
-pub(crate) fn assignment(statement: &Stmt) -> Option<&AssignExpr> {
-    statement.as_expr()?.expr.as_assign()
+pub(crate) fn assignment<'b, 'a>(
+    statement: &'b Statement<'a>,
+) -> Option<&'b AssignmentExpression<'a>> {
+    match statement {
+        Statement::ExpressionStatement(statement) => match &statement.expression {
+            Expression::AssignmentExpression(assignment) => Some(assignment),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Finds standalone assignment statements in `body`.
-pub(crate) fn assignments(body: &BlockStmt) -> impl Iterator<Item = &AssignExpr> {
-    body.stmts.iter().filter_map(assignment)
+pub(crate) fn assignments<'b, 'a>(
+    body: &'b FunctionBody<'a>,
+) -> impl Iterator<Item = &'b AssignmentExpression<'a>> {
+    body.statements.iter().filter_map(assignment)
 }
 
 /// An object held by a local variable in a block.
-pub(crate) struct BuiltObject<'body> {
-    pub local: &'body str,
-    pub fields: Vec<ObjectField<'body>>,
+pub(crate) struct BuiltObject<'b, 'a> {
+    pub local: Binding<'a>,
+    pub fields: Vec<ObjectField<'b, 'a>>,
 }
 
 /// One field of an object, as `key: value` or `<local>.<key> = <value>`.
-pub(crate) struct ObjectField<'body> {
-    pub key: &'body str,
-    pub value: &'body Expr,
+pub(crate) struct ObjectField<'b, 'a> {
+    pub key: &'a str,
+    pub value: &'b Expression<'a>,
 }
 
 /// Records an object assigned to a local, or a property write to one, in `built`. Returns
 /// whether it matched. The deobfuscator may emit a literal, or an empty object followed by
 /// property writes.
-pub(crate) fn track<'body>(
-    built: &mut Vec<BuiltObject<'body>>,
-    assignment: &'body AssignExpr,
+pub(crate) fn track<'b, 'a>(
+    script: Script<'a>,
+    built: &mut Vec<BuiltObject<'b, 'a>>,
+    assignment: &'b AssignmentExpression<'a>,
 ) -> bool {
-    let value = &*assignment.right;
-    match assignment.left.as_simple() {
-        Some(SimpleAssignTarget::Ident(local)) => {
-            let Some(fields) = object_fields(value) else {
-                return false;
-            };
-            built.push(BuiltObject {
-                local: &local.id.sym,
-                fields,
-            });
-        }
-        Some(SimpleAssignTarget::Member(member)) => {
-            let Expr::Ident(object) = &*member.obj else {
-                return false;
-            };
-            let target = built
-                .iter_mut()
-                .rfind(|target| target.local == &*object.sym);
-            let (Some(key), Some(target)) = (ast::member_str(&member.prop), target) else {
-                return false;
-            };
-            match target.fields.iter_mut().find(|field| field.key == key) {
-                Some(field) => field.value = value,
-                None => target.fields.push(ObjectField { key, value }),
-            }
-        }
-        _ => return false,
+    let value = &assignment.right;
+    if let AssignmentTarget::AssignmentTargetIdentifier(local) = &assignment.left {
+        let Some(fields) = object_fields(value) else {
+            return false;
+        };
+        built.push(BuiltObject {
+            local: script.binding(local),
+            fields,
+        });
+        return true;
+    }
+    let Some(member) = assignment.left.as_member_expression() else {
+        return false;
+    };
+    let Expression::Identifier(object) = member.object() else {
+        return false;
+    };
+    let object = script.binding(object);
+    let target = built.iter_mut().rfind(|target| target.local == object);
+    let (Some(key), Some(target)) = (ast::member_str(member), target) else {
+        return false;
+    };
+    match target.fields.iter_mut().find(|field| field.key == key) {
+        Some(field) => field.value = value,
+        None => target.fields.push(ObjectField { key, value }),
     }
     true
 }
 
 /// The fields of an object literal whose keys are all names.
-pub(crate) fn object_fields(expression: &Expr) -> Option<Vec<ObjectField<'_>>> {
-    let fields = expression.as_object()?.props.iter().map(|property| {
+pub(crate) fn object_fields<'b, 'a>(
+    expression: &'b Expression<'a>,
+) -> Option<Vec<ObjectField<'b, 'a>>> {
+    let Expression::ObjectExpression(object) = expression else {
+        return None;
+    };
+    let fields = object.properties.iter().map(|property| {
         let property = ast::key_value(property)?;
         Some(ObjectField {
-            key: ast::key_str(&property.key)?,
+            key: ast::key_str(&property.key, property.computed)?,
             value: &property.value,
         })
     });
     fields.collect()
 }
 
-/// Evaluates expressions used to build options and payloads. Supports literals, `undefined`,
-/// arrays, objects, `!`, `||`, `+`, `-`, `===`, `!==`, and `JSON.stringify`. Reads options from
-/// `<global>._cf_chl_opt.<key>` and globals from `<global>.<key>`, including getters called
-/// without arguments.
+/// Evaluates expressions in `script` used to build options and payloads. Supports literals,
+/// `undefined`, arrays, objects, `!`, `||`, `+`, `-`, `===`, `!==`, and `JSON.stringify`. Reads
+/// options from `<global>._cf_chl_opt.<key>` and globals from `<global>.<key>`, including getters
+/// called without arguments.
 ///
 /// Objects keep static properties and omit callbacks, matching `JSON.stringify`. `None`
 /// represents `undefined`. Unsupported expressions return errors.
 pub(crate) fn evaluate(
-    expression: &Expr,
+    script: Script<'_>,
+    expression: &Expression<'_>,
     options: &Options,
     globals: &Window,
 ) -> Result<Option<JsValue>> {
-    let evaluate = |expression: &Expr| evaluate(expression, options, globals);
+    let evaluate = |expression: &Expression<'_>| evaluate(script, expression, options, globals);
     Ok(match expression {
-        Expr::Paren(paren) => evaluate(&paren.expr)?,
-        Expr::Lit(Lit::Str(_)) | Expr::Tpl(_) => Some(JsValue::from(
+        Expression::ParenthesizedExpression(paren) => evaluate(&paren.expression)?,
+        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Some(JsValue::from(
             ast::static_str(expression).context("unsupported template or string literal")?,
         )),
-        Expr::Lit(Lit::Num(number)) => Some(JsValue::Number(number.value)),
-        Expr::Lit(Lit::Bool(value)) => Some(JsValue::Bool(value.value)),
-        Expr::Lit(Lit::Null(_)) => Some(JsValue::Null),
-        Expr::Ident(ident) if ident.sym == "undefined" => None,
+        Expression::NumericLiteral(number) => Some(JsValue::Number(number.value)),
+        Expression::BooleanLiteral(value) => Some(JsValue::Bool(value.value)),
+        Expression::NullLiteral(_) => Some(JsValue::Null),
+        Expression::Identifier(_) if script.is_global(expression, "undefined") => None,
         // `JSON.stringify` writes an undefined element as `null`.
-        Expr::Array(array) => {
-            let mut elements = Vec::with_capacity(array.elems.len());
-            for element in &array.elems {
-                let element = element.as_ref().context("unsupported array hole")?;
-                ensure!(element.spread.is_none(), "unsupported spread element");
-                elements.push(evaluate(&element.expr)?.unwrap_or(JsValue::Null));
+        Expression::ArrayExpression(array) => {
+            let mut elements = Vec::with_capacity(array.elements.len());
+            for element in &array.elements {
+                let element = match element {
+                    ArrayExpressionElement::Elision(_) => bail!("unsupported array hole"),
+                    ArrayExpressionElement::SpreadElement(_) => bail!("unsupported spread element"),
+                    element => element.to_expression(),
+                };
+                elements.push(evaluate(element)?.unwrap_or(JsValue::Null));
             }
             Some(JsValue::Array(elements))
         }
-        Expr::Object(object) => Some(JsValue::Object(
+        Expression::ObjectExpression(object) => Some(JsValue::Object(
             ast::key_values(object)
                 .filter_map(|property| {
                     let value = evaluate(&property.value).ok()??;
-                    Some((ast::key_str(&property.key)?.to_owned(), value))
+                    Some((
+                        ast::key_str(&property.key, property.computed)?.to_owned(),
+                        value,
+                    ))
                 })
                 .collect(),
         )),
         // `!x` is always a boolean; an unset option is `undefined`, so falsy.
-        Expr::Unary(unary) if unary.op == UnaryOp::Bang => Some(JsValue::Bool(
-            !evaluate(&unary.arg)?.as_ref().is_some_and(js::truthy),
-        )),
-        Expr::Bin(binary) => {
-            let left = evaluate(&binary.left)?;
-            match binary.op {
+        Expression::UnaryExpression(unary) if unary.operator == UnaryOperator::LogicalNot => Some(
+            JsValue::Bool(!evaluate(&unary.argument)?.as_ref().is_some_and(js::truthy)),
+        ),
+        Expression::LogicalExpression(logical) => {
+            let left = evaluate(&logical.left)?;
+            match logical.operator {
                 // The right-hand side runs only when the left is falsy.
-                BinaryOp::LogicalOr if left.as_ref().is_some_and(js::truthy) => left,
-                BinaryOp::LogicalOr => evaluate(&binary.right)?,
-                BinaryOp::Sub => Some(JsValue::Number(
+                LogicalOperator::Or if left.as_ref().is_some_and(js::truthy) => left,
+                LogicalOperator::Or => evaluate(&logical.right)?,
+                operator => bail!("unsupported operator {}", operator.as_str()),
+            }
+        }
+        Expression::BinaryExpression(binary) => {
+            let left = evaluate(&binary.left)?;
+            match binary.operator {
+                BinaryOperator::Subtraction => Some(JsValue::Number(
                     js::number(left.as_ref()) - js::number(evaluate(&binary.right)?.as_ref()),
                 )),
-                BinaryOp::Add => {
+                BinaryOperator::Addition => {
                     let right = evaluate(&binary.right)?;
                     // Strings, arrays, and objects trigger string concatenation; other values
                     // use numeric addition.
@@ -196,7 +235,7 @@ pub(crate) fn evaluate(
                         JsValue::Number(js::number(left) + js::number(right))
                     })
                 }
-                BinaryOp::EqEqEq | BinaryOp::NotEqEq => {
+                BinaryOperator::StrictEquality | BinaryOperator::StrictInequality => {
                     let [left, right] = [left, evaluate(&binary.right)?]
                         .map(|value| value.unwrap_or(JsValue::Undefined));
                     // `JsValue` equality implements `===` for primitive values. Copies of
@@ -208,17 +247,20 @@ pub(crate) fn evaluate(
                         "unsupported identity comparison of an object"
                     );
                     Some(JsValue::Bool(
-                        (left == right) == (binary.op == BinaryOp::EqEqEq),
+                        (left == right) == (binary.operator == BinaryOperator::StrictEquality),
                     ))
                 }
-                operator => bail!("unsupported operator {operator}"),
+                operator => bail!("unsupported operator {}", operator.as_str()),
             }
         }
-        Expr::Member(member) => {
-            let key = ast::member_str(&member.prop).context("unsupported computed property")?;
-            match &*member.obj {
+        Expression::StaticMemberExpression(_)
+        | Expression::ComputedMemberExpression(_)
+        | Expression::PrivateFieldExpression(_) => {
+            let member = expression.to_member_expression();
+            let key = ast::member_str(member).context("unsupported computed property")?;
+            match member.object() {
                 object if is_options(object) => options.get(key).cloned(),
-                Expr::Ident(_) => globals.get(key).cloned(),
+                Expression::Identifier(_) => globals.get(key).cloned(),
                 object => match evaluate(object)? {
                     Some(JsValue::Object(object)) => object.get(key).cloned(),
                     None | Some(JsValue::Undefined) => bail!("reads {key} of undefined"),
@@ -226,25 +268,28 @@ pub(crate) fn evaluate(
                 },
             }
         }
-        Expr::Call(call) => {
+        Expression::CallExpression(call) => {
             let member = call
                 .callee
-                .as_expr()
-                .and_then(|callee| callee.as_member())
+                .as_member_expression()
                 .context("unsupported call")?;
-            if ast::is_method_of(member, "JSON", "stringify") {
-                let [argument] = &call.args[..] else {
+            if script.is_method_of(member, "JSON", "stringify") {
+                let [argument] = &call.arguments[..] else {
                     bail!("unsupported JSON.stringify arguments");
                 };
-                ensure!(argument.spread.is_none(), "unsupported spread argument");
+                let argument = argument
+                    .as_expression()
+                    .context("unsupported spread argument")?;
                 // `JSON.stringify(undefined)` is itself `undefined`.
-                evaluate(&argument.expr)?
+                evaluate(argument)?
                     .and_then(|value| value.stringify())
                     .map(JsValue::String)
-            } else if matches!(&*member.obj, Expr::Ident(_)) && call.args.is_empty() {
+            } else if matches!(member.object(), Expression::Identifier(_))
+                && call.arguments.is_empty()
+            {
                 // Use the getter's collected value instead of running the call.
                 globals
-                    .get(ast::member_str(&member.prop).context("unsupported computed getter")?)
+                    .get(ast::member_str(member).context("unsupported computed getter")?)
                     .cloned()
             } else {
                 bail!("unsupported call")
@@ -256,9 +301,8 @@ pub(crate) fn evaluate(
 
 /// Whether an expression is the `_cf_chl_opt` object itself, rather than one of its properties.
 #[must_use]
-pub(crate) fn is_options(expression: &Expr) -> bool {
-    matches!(
-        expression,
-        Expr::Member(member) if ast::member_str(&member.prop) == Some("_cf_chl_opt")
-    )
+pub(crate) fn is_options(expression: &Expression<'_>) -> bool {
+    expression
+        .as_member_expression()
+        .is_some_and(|member| ast::member_str(member) == Some("_cf_chl_opt"))
 }

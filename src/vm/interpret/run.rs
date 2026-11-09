@@ -7,13 +7,13 @@ use std::hash::Hash;
 use std::mem;
 use std::rc::Rc;
 
-use swc_core::atoms::Atom;
-use swc_core::ecma::ast::{BinaryOp, UnaryOp};
+use oxc::syntax::operator::{BinaryOperator, UnaryOperator};
 
 use super::builtin;
 use super::copies::{self, Copies, Fork};
 use super::explore::Invocation;
 use super::frozen::{self, Frozen};
+use crate::js::ast::{Binding, Script};
 use crate::vm::output::{Constant, Effect, Exit, Path, Position, Term};
 use crate::vm::session::Session;
 use crate::vm::value::{Callable, Env, Scope, Value};
@@ -44,8 +44,8 @@ pub(super) type Evaluation<'ast, T> = Result<T, Box<Stop<'ast>>>;
 pub(super) enum Flow<'ast> {
     Normal,
     Return(Value<'ast>),
-    Break(Option<Atom>),
-    Continue(Option<Atom>),
+    Break(Option<&'ast str>),
+    Continue(Option<&'ast str>),
 }
 
 pub(crate) struct Run<'ast, 'session> {
@@ -61,10 +61,10 @@ pub(crate) struct Run<'ast, 'session> {
     /// Instance fields this run has read or written.
     pub(super) fields: HashMap<String, Value<'ast>>,
     /// Session bindings this run has read or written.
-    pub(super) globals: HashMap<Atom, Value<'ast>>,
-    /// Names unavailable after interrupted setup, with their errors. Setup copies the
+    pub(super) globals: HashMap<Binding<'ast>, Value<'ast>>,
+    /// Bindings unavailable after interrupted setup, with their errors. Setup copies the
     /// session's map when it changes it.
-    pub(super) unavailable: Cow<'session, HashMap<Atom, String>>,
+    pub(super) unavailable: Cow<'session, HashMap<Binding<'ast>, String>>,
     /// Copies isolate session objects; absent while building the session.
     copies: Option<Copies<'ast>>,
     pub(super) frames: Vec<Frame<'ast>>,
@@ -150,22 +150,22 @@ struct Polarity<'term> {
 
 #[derive(PartialEq)]
 enum Base<'term> {
-    Binary(BinaryOp, &'term Term, &'term Term),
+    Binary(BinaryOperator, &'term Term, &'term Term),
     Other(&'term Term),
 }
 
 impl<'term> Polarity<'term> {
     fn of(mut term: &'term Term) -> Self {
         let mut negated = false;
-        while let Term::Unary(UnaryOp::Bang, inner) = term {
+        while let Term::Unary(UnaryOperator::LogicalNot, inner) = term {
             term = inner;
             negated = !negated;
         }
         let base = match term {
             Term::Binary(operator, left, right) => {
                 let (operator, inequality) = match operator {
-                    BinaryOp::NotEqEq => (BinaryOp::EqEqEq, true),
-                    BinaryOp::NotEq => (BinaryOp::EqEq, true),
+                    BinaryOperator::StrictInequality => (BinaryOperator::StrictEquality, true),
+                    BinaryOperator::Inequality => (BinaryOperator::Equality, true),
                     operator => (*operator, false),
                 };
                 negated ^= inequality;
@@ -214,21 +214,75 @@ pub(super) struct Checkpoint {
 enum Undo<'ast> {
     Register(u8, Option<Value<'ast>>),
     Field(String, Option<Value<'ast>>),
-    Global(Atom, Option<Value<'ast>>),
+    Global(Binding<'ast>, Option<Value<'ast>>),
 }
 
 /// Active call receiver and local scope.
 pub(super) struct Frame<'ast> {
     pub(super) this: Value<'ast>,
-    pub(super) scope: Scope<'ast>,
+    pub(super) scope: CallScope<'ast>,
+}
+
+/// A call's own scope. Most slot-plan calls never store a variable in it, so it is created
+/// on first use. Until then, the call sees exactly the variables of the scope it would enclose.
+pub(super) enum CallScope<'ast> {
+    Own(Scope<'ast>),
+    /// Not yet created; it would enclose this scope.
+    Deferred(Option<Scope<'ast>>),
+}
+
+impl<'ast> CallScope<'ast> {
+    fn fork(&self, fork: &mut Fork<'_, 'ast>) -> Self {
+        match self {
+            Self::Own(scope) => Self::Own(fork.scope(scope)),
+            Self::Deferred(outer) => Self::Deferred(outer.as_ref().map(|outer| fork.scope(outer))),
+        }
+    }
 }
 
 impl<'ast> Frame<'ast> {
     pub(super) fn new(this: Value<'ast>) -> Self {
         Self {
             this,
-            scope: Env::scope(HashMap::default(), None),
+            scope: CallScope::Deferred(None),
         }
+    }
+
+    /// The call's own scope, creating it if needed.
+    pub(super) fn own_scope(&mut self) -> &Scope<'ast> {
+        if let CallScope::Deferred(outer) = &mut self.scope {
+            self.scope = CallScope::Own(Env::scope(HashMap::default(), outer.take()));
+        }
+        let CallScope::Own(scope) = &self.scope else {
+            unreachable!("the scope was just created");
+        };
+        scope
+    }
+
+    /// The scope enclosing the call's own variables, if the call has any.
+    fn visible(&self) -> Option<&Scope<'ast>> {
+        match &self.scope {
+            CallScope::Own(scope) => Some(scope),
+            CallScope::Deferred(outer) => outer.as_ref(),
+        }
+    }
+
+    pub(super) fn find(&self, binding: Binding<'ast>) -> Option<Value<'ast>> {
+        Env::find(self.visible()?, binding)
+    }
+
+    /// Assigns `binding` in the nearest scope containing it, as [`Env::assign`] does.
+    pub(super) fn assign(&self, binding: Binding<'ast>, value: Value<'ast>) -> Option<Value<'ast>> {
+        match self.visible() {
+            Some(scope) => Env::assign(scope, binding, value),
+            None => Some(value),
+        }
+    }
+
+    /// Whether the call itself declares `binding`.
+    pub(super) fn declares(&self, binding: Binding<'ast>) -> bool {
+        matches!(&self.scope, CallScope::Own(scope)
+            if scope.borrow().variables.contains_key(&binding))
     }
 }
 
@@ -321,6 +375,11 @@ impl<'ast, 'session> Run<'ast, 'session> {
         run
     }
 
+    /// The script whose code the run interprets.
+    pub(in crate::vm) fn source(&self) -> Script<'ast> {
+        self.session.script
+    }
+
     /// The path this run took, or why the handler rejected its operands.
     pub(super) fn finish(mut self, outcome: Evaluation<'ast, Value<'ast>>) -> Result<Path, String> {
         self.session.spare.replace(mem::take(&mut self.spare));
@@ -407,7 +466,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
     /// Records that an expression equals a constant after a true strict equality test or a false
     /// strict inequality test.
     fn learn(&mut self, mut condition: &Term, mut holds: bool) {
-        while let Term::Unary(UnaryOp::Bang, inner) = condition {
+        while let Term::Unary(UnaryOperator::LogicalNot, inner) = condition {
             condition = inner;
             holds = !holds;
         }
@@ -415,8 +474,8 @@ impl<'ast, 'session> Run<'ast, 'session> {
             return;
         };
         let equal = match operator {
-            BinaryOp::EqEqEq => holds,
-            BinaryOp::NotEqEq => !holds,
+            BinaryOperator::StrictEquality => holds,
+            BinaryOperator::StrictInequality => !holds,
             _ => return,
         };
         if equal
@@ -451,44 +510,54 @@ impl<'ast, 'session> Run<'ast, 'session> {
         self.frames.last().expect("code runs inside a frame")
     }
 
-    /// Declares `name` in the active call's scope.
-    pub(super) fn declare(&mut self, name: Atom, value: Value<'ast>) {
-        self.frame()
-            .scope
-            .borrow_mut()
-            .variables
-            .insert(name, value);
+    pub(super) fn frame_mut(&mut self) -> &mut Frame<'ast> {
+        self.frames.last_mut().expect("code runs inside a frame")
     }
 
-    pub(super) fn lookup(&mut self, name: &Atom) -> Evaluation<'ast, Value<'ast>> {
-        if let Some(value) = Env::find(&self.frame().scope, name) {
+    /// Declares `binding` in the active call's scope.
+    pub(super) fn declare(&mut self, binding: Binding<'ast>, value: Value<'ast>) {
+        self.frame_mut()
+            .own_scope()
+            .borrow_mut()
+            .variables
+            .insert(binding, value);
+    }
+
+    /// Reads `binding` from the scopes, then from session bindings and functions declared
+    /// beside the class. A binding none of them hold, such as a parameter of a function
+    /// enclosing the VM, reads as the global of its name, as an unresolved reference does.
+    pub(super) fn lookup(&mut self, binding: Binding<'ast>) -> Evaluation<'ast, Value<'ast>> {
+        if let Some(value) = self.frame().find(binding) {
             return Ok(value);
         }
-        if let Some(value) = self.globals.get(name) {
+        if let Some(value) = self.globals.get(&binding) {
             return Ok(value.clone());
         }
-        if let Some(reason) = self.unavailable.get(name) {
+        let name = self.session.script.name(binding);
+        if let Some(reason) = self.unavailable.get(&binding) {
             return Err(Stop::unsupported(&format!(
                 "{name}, whose setup stopped: {reason}"
             )));
         }
-        if let Some(value) = self.session.bindings.get(name) {
+        if let Some(value) = self.session.bindings.get(&binding) {
             let value = self.isolate(value);
-            self.set_global(name.clone(), value.clone());
+            self.set_global(binding, value.clone());
             return Ok(value);
         }
-        if let Some(function) = self.session.functions.get(name) {
+        if let Binding::Symbol(symbol) = binding
+            && let Some(&function) = self.session.functions.get(&symbol)
+        {
             let mut values = self.session.function_values.borrow_mut();
-            let value = values.entry(name.clone()).or_insert_with(|| {
+            let value = values.entry(symbol).or_insert_with(|| {
                 Value::function(Callable::Script {
-                    name: Some(name.clone()),
+                    name: Some(name),
                     function,
                     scope: None,
                 })
             });
             return Ok(value.clone());
         }
-        Ok(match &**name {
+        Ok(match name {
             "undefined" => Value::Undefined,
             "NaN" => Value::Number(f64::NAN),
             "Infinity" => Value::Number(f64::INFINITY),
@@ -497,15 +566,17 @@ impl<'ast, 'session> Run<'ast, 'session> {
         })
     }
 
-    pub(super) fn assign_name(&mut self, name: &Atom, value: Value<'ast>) {
-        let Some(value) = Env::assign(&self.frame().scope, name, value) else {
+    /// Assigns `binding` in the nearest scope holding it, or else the session binding. Otherwise
+    /// declares it in the active call's scope.
+    pub(super) fn assign(&mut self, binding: Binding<'ast>, value: Value<'ast>) {
+        let Some(value) = self.frame().assign(binding, value) else {
             return;
         };
-        if self.globals.contains_key(name) || self.session.bindings.contains_key(name) {
-            self.set_global(name.clone(), value);
+        if self.globals.contains_key(&binding) || self.session.bindings.contains_key(&binding) {
+            self.set_global(binding, value);
             return;
         }
-        self.declare(name.clone(), value);
+        self.declare(binding, value);
     }
 
     /// Returns an instance field from the current run or the constructor's initial value.
@@ -538,9 +609,9 @@ impl<'ast, 'session> Run<'ast, 'session> {
         }
     }
 
-    fn set_global(&mut self, name: Atom, value: Value<'ast>) {
-        let old = self.globals.insert(name.clone(), value);
-        self.journal.record(Undo::Global(name, old));
+    fn set_global(&mut self, binding: Binding<'ast>, value: Value<'ast>) {
+        let old = self.globals.insert(binding, value);
+        self.journal.record(Undo::Global(binding, old));
     }
 
     /// Starts a speculative attempt. [`Run::restore`] rolls it back; [`Run::release`] commits
@@ -597,7 +668,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
 
     /// Returns the scope that a newly created function would capture.
     pub(super) fn closure_scope(&mut self) -> Scope<'ast> {
-        let scope = self.frame().scope.clone();
+        let scope = self.frame_mut().own_scope().clone();
         if !self
             .closed
             .last()
@@ -683,7 +754,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
                 .map(|(term, value)| (term.clone(), fork.value(value)))
                 .collect(),
             this: fork.value(&frame.this),
-            scope: fork.scope(&frame.scope),
+            scope: frame.scope.fork(&mut fork),
             locals: locals
                 .iter()
                 .map(|local| local.as_ref().map(|value| fork.value(value)))
@@ -723,7 +794,7 @@ impl<'ast, 'session> Run<'ast, 'session> {
             .collect();
         run.frames.push(Frame {
             this: fork.value(&snapshot.this),
-            scope: fork.scope(&snapshot.scope),
+            scope: snapshot.scope.fork(&mut fork),
         });
         let locals = snapshot
             .locals
@@ -745,7 +816,7 @@ pub(super) struct Snapshot<'ast> {
     registers: HashMap<u8, Value<'ast>>,
     tags: HashMap<u8, Value<'ast>>,
     fields: HashMap<String, Value<'ast>>,
-    globals: HashMap<Atom, Value<'ast>>,
+    globals: HashMap<Binding<'ast>, Value<'ast>>,
     copies: Option<Copies<'ast>>,
     closed: Vec<Scope<'ast>>,
     effects: Vec<Effect>,
@@ -753,7 +824,7 @@ pub(super) struct Snapshot<'ast> {
     conditions: Vec<(Term, bool)>,
     facts: Vec<(Term, Value<'ast>)>,
     this: Value<'ast>,
-    scope: Scope<'ast>,
+    scope: CallScope<'ast>,
     locals: Vec<Option<Value<'ast>>>,
     /// Every scope the snapshot holds, cleared when it is dropped to break cycles.
     copied: Vec<Scope<'ast>>,

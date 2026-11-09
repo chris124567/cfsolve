@@ -18,160 +18,138 @@
 //! Leave the loop unchanged if anything else reads the state or if a jump exits a case before
 //! its final `break`.
 
-use swc_core::ecma::ast::{
-    ArrowExpr, AssignOp, BinaryOp, BreakStmt, ContinueStmt, Expr, Function, Id, Program, Stmt,
-    SwitchStmt, WhileStmt,
-};
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::allocator::{CloneIn, GetAllocator, Vec as ArenaVec};
+use oxc::ast::ast::{Expression, Program, Statement};
+use oxc::ast_visit::{VisitMut, walk_mut};
+use oxc::span::GetSpan;
+use oxc::syntax::operator::{AssignmentOperator, BinaryOperator};
 
-use super::HashSet;
-use super::analysis::{Analysis, Bindings};
-use crate::js::ast;
+use super::analysis::{Analysis, Id};
+use super::{HashSet, ast};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
     let mut unroll = Unroll {
-        bindings: analysis.bindings(program),
+        analysis,
         changed: false,
     };
-    program.visit_mut_with(&mut unroll);
+    unroll.visit_program(program);
     unroll.changed
 }
 
-struct Unroll<'bindings> {
-    bindings: &'bindings Bindings,
-    changed: bool,
-}
-
-/// Returns the value assigned to `state` by `expression`, including chained assignments such as `x
-/// = state = 1`.
-fn assigned(expression: &Expr, state: &Id) -> Option<f64> {
-    let assignment = expression
-        .as_assign()
-        .filter(|assignment| assignment.op == AssignOp::Assign)?;
-    match assignment.left.as_ident() {
-        Some(left) if left.to_id() == *state => ast::number(&assignment.right),
-        _ => assigned(&assignment.right, state),
+/// Returns the constant that `expression` assigns to `id`, possibly through a chain such as
+/// `k = state = 2`.
+fn initial_state(expression: &Expression<'_>, id: Id, analysis: &Analysis<'_>) -> Option<f64> {
+    let Expression::AssignmentExpression(assignment) = expression.get_inner_expression() else {
+        return None;
+    };
+    if assignment.operator != AssignmentOperator::Assign {
+        return None;
+    }
+    if analysis.target_id(&assignment.left) == Some(id) {
+        ast::number(&assignment.right)
+    } else {
+        initial_state(&assignment.right, id, analysis)
     }
 }
 
-impl Unroll<'_> {
-    /// Returns the statements executed by `while (state !== exit) switch (state) { ... }`, in
-    /// execution order, starting with the state set by `initial`.
-    fn unrolled(&self, initial: &Stmt, machine: &Stmt) -> Option<Vec<Stmt>> {
-        let Stmt::While(WhileStmt { test, body, .. }) = machine else {
+struct Unroll<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    changed: bool,
+}
+
+impl<'a> Unroll<'_, 'a> {
+    /// Returns the case bodies that `machine` runs after `initial` sets its state.
+    fn unroll(
+        &self,
+        initial: &Statement<'a>,
+        machine: &Statement<'a>,
+    ) -> Option<ArenaVec<'a, Statement<'a>>> {
+        let analysis = self.analysis;
+        let Statement::WhileStatement(machine) = machine else {
             return None;
         };
-        let test = test.unwrap_parens().as_bin()?;
-        if !matches!(test.op, BinaryOp::NotEqEq | BinaryOp::NotEq) {
+        let Expression::BinaryExpression(test) = machine.test.get_inner_expression() else {
+            return None;
+        };
+        if !matches!(
+            test.operator,
+            BinaryOperator::Inequality | BinaryOperator::StrictInequality
+        ) {
             return None;
         }
-        let (state, exit) = match (test.left.as_ident(), test.right.as_ident()) {
-            (Some(state), None) => (state.to_id(), ast::number(&test.right)?),
-            (None, Some(state)) => (state.to_id(), ast::number(&test.left)?),
-            _ => return None,
+        let (id, exit) = match analysis.expression_id(&test.left) {
+            Some(id) => (id, ast::number(&test.right)?),
+            None => (
+                analysis.expression_id(&test.right)?,
+                ast::number(&test.left)?,
+            ),
         };
-        let switch = match body.as_ref() {
-            Stmt::Switch(switch) => switch,
-            Stmt::Block(block) => match &block.stmts[..] {
-                [Stmt::Switch(switch)] => switch,
+        let switch = match &machine.body {
+            Statement::SwitchStatement(switch) => switch,
+            Statement::BlockStatement(block) => match block.body.as_slice() {
+                [Statement::SwitchStatement(switch)] => switch,
                 _ => return None,
             },
             _ => return None,
         };
-        // Only the loop test and the switch read the state.
-        if switch.discriminant.unwrap_parens().as_ident()?.to_id() != state
-            || self.bindings.references(&state) != 2
+        if analysis.expression_id(&switch.discriminant) != Some(id)
+            || analysis.bindings.references(&id) != 2
         {
             return None;
         }
-        let mut current = assigned(&initial.as_expr()?.expr, &state)?;
-        let labels = switch
+        let Statement::ExpressionStatement(initial) = initial else {
+            return None;
+        };
+        let mut state = initial_state(&initial.expression, id, analysis)?;
+        let labels: Vec<f64> = switch
             .cases
             .iter()
-            .map(|case| ast::number(case.test.as_deref()?))
-            .collect::<Option<Vec<f64>>>()?;
-        let mut statements = vec![];
+            .map(|case| ast::number(case.test.as_ref()?))
+            .collect::<Option<_>>()?;
         let mut seen = HashSet::default();
-        while current != exit {
-            let index = labels.iter().position(|&label| label == current)?;
+        let mut unrolled = ArenaVec::new_in(analysis);
+        while state != exit {
+            let index = labels.iter().position(|&label| label == state)?;
             if !seen.insert(index) {
                 return None;
             }
             let [
                 body @ ..,
-                Stmt::Expr(transition),
-                Stmt::Break(BreakStmt { label: None, .. }),
-            ] = &switch.cases[index].cons[..]
+                Statement::ExpressionStatement(transition),
+                Statement::BreakStatement(jump),
+            ] = switch.cases[index].consequent.as_slice()
             else {
                 return None;
             };
-            let (target, next) = ast::assignment(&transition.expr)?;
-            if target != state || escapes(body) {
+            if jump.label.is_some() || ast::escapes(body, ast::LabeledContinue::Any) {
                 return None;
             }
-            current = ast::number(next)?;
-            statements.extend(body.iter().cloned());
+            let (target, next) = analysis.assignment(&transition.expression)?;
+            if target != id {
+                return None;
+            }
+            state = ast::number(next)?;
+            let allocator = analysis.allocator();
+            unrolled.extend(
+                body.iter()
+                    .map(|statement| statement.clone_in_with_semantic_ids(allocator)),
+            );
         }
-        Some(statements)
+        Some(unrolled)
     }
 }
 
-impl VisitMut for Unroll<'_> {
-    fn visit_mut_stmts(&mut self, statements: &mut Vec<Stmt>) {
-        statements.visit_mut_children_with(self);
+impl<'a> VisitMut<'a> for Unroll<'_, 'a> {
+    fn visit_statements(&mut self, statements: &mut ArenaVec<'a, Statement<'a>>) {
+        walk_mut::walk_statements(self, statements);
         for index in 1..statements.len() {
-            if let Some(unrolled) = self.unrolled(&statements[index - 1], &statements[index]) {
-                statements[index] = ast::block(unrolled);
+            if let Some(unrolled) = self.unroll(&statements[index - 1], &statements[index]) {
+                let span = statements[index].span();
+                statements[index] = Statement::new_block_statement(span, unrolled, self.analysis);
                 self.changed = true;
             }
         }
     }
-}
-
-/// Checks for a `break` or `continue` targeting an enclosing loop or switch.
-pub(super) fn escapes(body: &[Stmt]) -> bool {
-    let mut jumps = Jumps::default();
-    body.visit_with(&mut jumps);
-    jumps.escapes
-}
-
-/// Finds unlabeled jumps not caught by a nested loop or switch.
-#[derive(Default)]
-struct Jumps {
-    loops: usize,
-    switches: usize,
-    escapes: bool,
-}
-
-impl Visit for Jumps {
-    fn visit_stmt(&mut self, statement: &Stmt) {
-        let depth = usize::from(matches!(
-            statement,
-            Stmt::For(_) | Stmt::ForIn(_) | Stmt::ForOf(_) | Stmt::While(_) | Stmt::DoWhile(_)
-        ));
-        self.loops += depth;
-        statement.visit_children_with(self);
-        self.loops -= depth;
-    }
-
-    fn visit_break_stmt(&mut self, jump: &BreakStmt) {
-        self.escapes |= jump.label.is_none() && self.loops == 0 && self.switches == 0;
-    }
-
-    fn visit_continue_stmt(&mut self, jump: &ContinueStmt) {
-        self.escapes |= jump.label.is_none() && self.loops == 0;
-    }
-
-    fn visit_switch_stmt(&mut self, switch: &SwitchStmt) {
-        self.switches += 1;
-        switch.visit_children_with(self);
-        self.switches -= 1;
-    }
-
-    // Jumps cannot leave a function.
-    fn visit_function(&mut self, _: &Function) {}
-
-    fn visit_arrow_expr(&mut self, _: &ArrowExpr) {}
 }
 
 #[cfg(test)]
@@ -180,7 +158,7 @@ mod tests {
 
     #[test]
     fn unrolls_constant_transitions_from_the_initial_state() {
-        let transform = |source: &str| testing::rewrite(source, super::run, /* fix= */ true);
+        let transform = |source: &str| testing::rewrite(source, super::run);
         let machine = |cases: &str, after: &str| {
             format!(
                 "function f() {{ var s, k; k = s = 2; while (-1 !== s) switch (s) {{ {cases} }} {after} }}"
@@ -193,7 +171,7 @@ mod tests {
              case 3: dead(); s = 0; break;",
             "",
         ));
-        testing::assert_contains(&output, &[], &["k = s = 2; { a(); for(;;)"]);
+        testing::assert_contains(&output, &["k = s = 2; { a(); for(;;)"]);
         testing::assert_lacks(&output, &["switch", "dead", "s = 1", "s = -1"]);
         for kept in [
             // Reject cycles, missing cases, early breaks, continues, and extra reads of the state.

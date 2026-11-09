@@ -37,7 +37,10 @@ Options:
                      --solve.
   --proxy <url>      Send every request through an http://, https://,
                      socks5:// or socks5h:// proxy. Credentials go in the
-                     URL: socks5h://user:password@host:port.";
+                     URL: socks5h://user:password@host:port.
+  --trust-ca <cert.pem>
+                     Trust this certificate instead of the built-in roots,
+                     such as capture-proxy's CA, to record the session.";
 
 /// Session settings from the command line.
 #[derive(Debug)]
@@ -46,6 +49,7 @@ pub struct SessionArgs {
     pub directory: PathBuf,
     pub fingerprint: PathBuf,
     pub proxy: Option<String>,
+    pub trust_ca: Option<PathBuf>,
 }
 
 /// The page or iframe that starts a session, and how far the session goes.
@@ -67,7 +71,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Ses
     let mut arguments = arguments.into_iter();
     let (mut page, mut fingerprint, mut proxy) = (None, None, None);
     let (mut sitekey, mut action, mut cdata) = (None, None, None);
-    let (mut solve, mut blank) = (None, None);
+    let (mut solve, mut blank, mut trust_ca) = (None, None, None);
     let mut positional = Vec::new();
     while let Some(argument) = arguments.next() {
         let Some(name) = argument
@@ -91,6 +95,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Ses
             "--action" => once(&mut action, name, text(&mut arguments, name)?)?,
             "--cdata" => once(&mut cdata, name, text(&mut arguments, name)?)?,
             "--proxy" => once(&mut proxy, name, proxy_url(&value(&mut arguments, name)?)?)?,
+            "--trust-ca" => once(&mut trust_ca, name, value(&mut arguments, name)?.into())?,
             _ => bail!("unknown option {name}\n\n{USAGE}"),
         }
     }
@@ -147,6 +152,7 @@ pub fn parse(arguments: impl IntoIterator<Item = OsString>) -> Result<Option<Ses
         directory: directory.into(),
         fingerprint: fingerprint.into(),
         proxy,
+        trust_ca,
     }))
 }
 

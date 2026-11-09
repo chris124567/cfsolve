@@ -34,7 +34,7 @@ use super::sessions::{self, Iframe, Post, Sessions};
 use super::traffic::{Connection, Traffic};
 use super::upstream::{self, Stream, UpstreamProxy};
 use crate::http::{self, BrowserClient, Proxied};
-use crate::js::ast;
+use crate::js::ast::ParsedScript;
 use crate::{challenge, deobfuscate};
 
 const ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -431,9 +431,9 @@ impl CaptureProxy {
         let encoding = header_value(&upstream.headers, header::CONTENT_ENCODING);
         let html = String::from_utf8(http::decode_body(&upstream.body, &encoding).ok()?).ok()?;
         let scanned = challenge::inline_javascript(&html).and_then(|javascript| {
-            let parsed = ast::parse_javascript("iframe.js", &javascript)?;
-            let strings = deobfuscate::inline_strings(&parsed.script);
-            let alphabet = sessions::scan_alphabet(&parsed.script, &strings)?;
+            let parsed = ParsedScript::parse("iframe.js", &javascript)?;
+            let strings = deobfuscate::inline_strings(&javascript)?;
+            let alphabet = sessions::scan_alphabet(parsed.script().program, &strings)?;
             let swapped = rsa::swap_modulus(&html, &strings, &self.sessions.proxy_key.modulus)?;
             anyhow::Ok((alphabet, swapped))
         });

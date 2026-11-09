@@ -12,14 +12,16 @@
 use std::time::Instant;
 use std::{env, fs};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use cfsolve::script::Source;
-use swc_core::common::{FileName, SourceMap, Spanned};
-use swc_core::ecma::ast::{Class, ClassMember, Decl, Expr, Function, Lit, PropName, Stmt};
-use swc_core::ecma::parser::{Parser, StringInput, Syntax};
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::allocator::Allocator;
+use oxc::ast::ast::{Class, ClassElement, Function, PropertyKey, Statement};
+use oxc::ast_visit::{Visit, walk};
+use oxc::parser::Parser;
+use oxc::semantic::ScopeFlags;
+use oxc::span::{SourceType, Span};
 
 fn main() -> Result<()> {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -99,48 +101,45 @@ fn snapshot(path: &str, program: &str, names: Option<&str>) -> Result<()> {
 /// an immediately invoked expression with nothing else of the script.
 fn fixture(path: &str) -> Result<()> {
     let source = fs::read_to_string(path)?;
-    let source_map = SourceMap::default();
-    let file = source_map.new_source_file(FileName::Custom(path.into()).into(), source.clone());
-    let script = Parser::new(Syntax::default(), StringInput::from(&*file), None)
-        .parse_script()
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let allocator = Allocator::default();
+    let parsed = Parser::new(&allocator, &source, SourceType::script()).parse();
+    ensure!(
+        parsed.diagnostics.is_empty(),
+        "cannot parse {path}: {:?}",
+        parsed.diagnostics
+    );
     let mut finder = Finder(None);
-    script.visit_with(&mut finder);
-    let function = finder.0.context("no VM class in the script")?;
-    let span = function.span();
-    let start = file.start_pos.0;
-    let text = &source[(span.lo.0 - start) as usize..(span.hi.0 - start) as usize];
-    println!("({text})();");
+    finder.visit_program(&parsed.program);
+    let span = finder.0.context("no VM class in the script")?;
+    println!("({})();", span.source_text(&source));
     Ok(())
 }
 
-struct Finder(Option<Function>);
+/// Finds the span of the last function, in source order, whose body declares a class with a
+/// `run` method.
+struct Finder(Option<Span>);
 
-impl Visit for Finder {
-    fn visit_function(&mut self, function: &Function) {
+impl<'a> Visit<'a> for Finder {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
         if let Some(body) = &function.body
-            && body.stmts.iter().any(|statement| match statement {
-                Stmt::Decl(Decl::Class(declaration)) => has_run(&declaration.class),
-                _ => false,
-            })
+            && body.statements.iter().any(
+                |statement| matches!(statement, Statement::ClassDeclaration(class) if has_run(class)),
+            )
         {
-            self.0 = Some(function.clone());
+            self.0 = Some(function.span);
         }
-        function.visit_children_with(self);
+        walk::walk_function(self, function, flags);
     }
 }
 
-fn has_run(class: &Class) -> bool {
-    class.body.iter().any(|member| {
-        let ClassMember::Method(method) = member else {
+fn has_run(class: &Class<'_>) -> bool {
+    class.body.body.iter().any(|element| {
+        let ClassElement::MethodDefinition(method) = element else {
             return false;
         };
         match &method.key {
-            PropName::Ident(name) => &*name.sym == "run",
-            PropName::Str(name) => name.value == *"run",
-            PropName::Computed(computed) => {
-                matches!(&*computed.expr, Expr::Lit(Lit::Str(name)) if name.value == *"run")
-            }
+            PropertyKey::StaticIdentifier(name) if !method.computed => name.name == "run",
+            PropertyKey::StringLiteral(name) => name.value == "run",
             _ => false,
         }
     })

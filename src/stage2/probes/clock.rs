@@ -11,8 +11,6 @@ pub(crate) const PAIRS: usize = 5000;
 
 /// The smallest positive difference between paired `readings`, capped at one millisecond.
 pub(crate) fn collect(readings: &[[f64; 2]]) -> Result<JsObject> {
-    use swc_ecma_utils::number::ToJsString;
-
     ensure!(
         readings.len() >= PAIRS,
         "clock probe needs {PAIRS} pairs of readings"
@@ -29,7 +27,7 @@ pub(crate) fn collect(readings: &[[f64; 2]]) -> Result<JsObject> {
     }
     Ok(JsObject::from_iter([(
         reference::SHARED_RESULT.to_owned(),
-        JsValue::String(minimum.to_js_string()),
+        JsValue::String(ryu_js::Buffer::new().format(minimum).to_owned()),
     )]))
 }
 

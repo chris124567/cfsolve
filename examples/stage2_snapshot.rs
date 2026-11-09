@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::{env, fs};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use cfsolve::challenge::program::PreparedSession;
@@ -85,7 +85,7 @@ fn main() -> Result<()> {
                 "forwarded": state.forwarded,
             })
         }),
-        Err(error) => Err(anyhow::anyhow!("{error:#}")),
+        Err(error) => Err(anyhow!("{error:#}")),
     };
     snapshot.insert("first_payload".into(), record(first_payload));
     let installed = session.map(|session| {

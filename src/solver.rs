@@ -20,6 +20,8 @@ use crate::session::{self, Clearance, Discard, Expect, Outcome, Sink};
 pub struct Options {
     /// An `http://`, `https://`, `socks5://`, or `socks5h://` proxy for every request.
     pub proxy: Option<String>,
+    /// A PEM certificate to trust instead of the built-in roots, such as a recording proxy's CA.
+    pub trusted_root: Option<Vec<u8>>,
     /// Destination for artifacts and progress messages. Both are discarded if absent.
     pub sink: Option<Arc<dyn Sink>>,
 }
@@ -203,7 +205,7 @@ impl Browser {
 
     fn client(&self, options: &Options) -> Result<BrowserClient, Error> {
         self.transport
-            .client(options.proxy.as_deref())
+            .client(options.proxy.as_deref(), options.trusted_root.as_deref())
             .map_err(Error::Config)
     }
 }

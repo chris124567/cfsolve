@@ -8,13 +8,18 @@
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
-use swc_core::ecma::ast::{AssignExpr, BinExpr, BinaryOp, CallExpr, Callee, Expr, MemberExpr};
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast::ast::{
+    AssignmentExpression, BinaryExpression, CallExpression, Expression, MemberExpression,
+};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::{ScopeFlags, SymbolId};
+use oxc::syntax::operator::BinaryOperator;
 use url::Url;
 
 use crate::candidates;
 use crate::challenge::{expression, source};
-use crate::js::{JsValue, Options, ast};
+use crate::js::ast::{self, ParsedScript, Script};
+use crate::js::{JsValue, Options};
 use crate::script::Source;
 
 /// The orchestrator is served from this path prefix of the challenge page's origin.
@@ -47,8 +52,9 @@ impl ChallengePage {
         let Ok(inline) = source::inline_javascript(html) else {
             return Ok(None);
         };
-        let parsed = ast::parse_javascript("challenge page", &inline)?;
-        let literals = ast::string_literals(&parsed.script);
+        let parsed = ParsedScript::parse("challenge page", &inline)?;
+        let script = parsed.script();
+        let literals = ast::string_literals(|literals| literals.visit_program(script.program));
         let Some(orchestrator) = candidates::at_most_one_distinct(
             literals.iter().filter(|text| {
                 text.starts_with("/cdn-cgi/challenge-platform/") && text.contains(ORCHESTRATOR)
@@ -63,7 +69,7 @@ impl ChallengePage {
             "loading address",
         )?
         .context("challenge page shows no loading address")?;
-        let answered = source::bootstrap_options(&parsed)
+        let answered = source::bootstrap_options(script)
             .get(ANSWERED)
             .and_then(JsValue::as_str)
             .map(|address| url.join(address))
@@ -90,57 +96,65 @@ impl ChallengePage {
 /// it. These checks are all false on a top-level challenge page.
 #[must_use]
 pub(crate) fn frame_options(source: &Source, options: &Options) -> Options {
-    let script = &source.parsed().script;
-    let readers = ast::in_declared_functions(script, |function| {
-        reads_top(&*function.function).then(|| function.ident.sym.to_string())
+    let script = source.script();
+    let readers = script.in_declared_functions(|function| {
+        let mut read = TopRead(false);
+        read.visit_function(function, ScopeFlags::Function);
+        function
+            .id
+            .as_ref()
+            .filter(|_| read.0)
+            .map(|id| id.symbol_id())
     });
     let mut framing = Framing {
+        script,
         readers: &readers,
         options,
         found: Options::new(),
     };
-    script.visit_with(&mut framing);
+    framing.visit_program(script.program);
     framing.found
 }
 
 /// Whether a node reads a `top` property.
-fn reads_top(node: &impl VisitWith<TopRead>) -> bool {
-    let mut read = TopRead(false);
-    node.visit_with(&mut read);
-    read.0
-}
-
 struct TopRead(bool);
 
-impl Visit for TopRead {
-    fn visit_member_expr(&mut self, member: &MemberExpr) {
-        self.0 |= ast::member_str(&member.prop) == Some("top");
-        member.visit_children_with(self);
+impl<'a> Visit<'a> for TopRead {
+    fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
+        self.0 |= ast::member_str(member) == Some("top");
+        walk::walk_member_expression(self, member);
     }
 }
 
 /// Assigns `false` to unset options whose value reads `top` or calls a declared function that
 /// does.
-struct Framing<'known> {
-    readers: &'known [String],
+struct Framing<'known, 'a> {
+    script: Script<'a>,
+    readers: &'known [SymbolId],
     options: &'known Options,
     found: Options,
 }
 
-impl Visit for Framing<'_> {
-    fn visit_assign_expr(&mut self, assignment: &AssignExpr) {
+impl<'a> Visit<'a> for Framing<'_, 'a> {
+    fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
         if let Some(option) = expression::option_assignment(&assignment.left)
             && !self.options.contains_key(option)
         {
-            let value = assignment.right.unwrap_parens();
+            let value = assignment.right.without_parentheses();
             let calls_reader = ast::direct_call(value).is_some_and(|(name, arguments)| {
-                arguments.is_empty() && self.readers.iter().any(|reader| *reader == *name.sym)
+                arguments.is_empty()
+                    && self
+                        .script
+                        .symbol(name)
+                        .is_some_and(|reader| self.readers.contains(&reader))
             });
-            if calls_reader || reads_top(value) {
+            let mut read = TopRead(false);
+            read.visit_expression(value);
+            if calls_reader || read.0 {
                 self.found.insert(option.to_owned(), JsValue::Bool(false));
             }
         }
-        assignment.visit_children_with(self);
+        walk::walk_assignment_expression(self, assignment);
     }
 }
 
@@ -153,7 +167,7 @@ pub(crate) fn loader_url(source: &Source, options: &Options) -> Result<Url> {
         paths: Vec::new(),
         hosts: BTreeSet::new(),
     };
-    source.parsed().script.visit_with(&mut found);
+    found.visit_program(source.script().program);
     let build = candidates::exactly_one(found.builds, "loader build")?;
     let host = candidates::exactly_one(found.hosts, "loader host")?;
     let paths: BTreeSet<String> = found
@@ -182,9 +196,9 @@ struct Loader<'options> {
 
 impl Loader<'_> {
     /// Returns the operands of a `+` chain from left to right.
-    fn operands<'e>(expression: &'e Expr, out: &mut Vec<&'e Expr>) {
-        match expression.unwrap_parens() {
-            Expr::Bin(binary) if binary.op == BinaryOp::Add => {
+    fn operands<'e, 'a>(expression: &'e Expression<'a>, out: &mut Vec<&'e Expression<'a>>) {
+        match expression.without_parentheses() {
+            Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
                 Self::operands(&binary.left, out);
                 Self::operands(&binary.right, out);
             }
@@ -192,7 +206,7 @@ impl Loader<'_> {
         }
     }
 
-    fn option(&self, operand: &Expr) -> Option<String> {
+    fn option(&self, operand: &Expression<'_>) -> Option<String> {
         self.options
             .get(expression::option_key(operand)?)?
             .as_str()
@@ -200,22 +214,21 @@ impl Loader<'_> {
     }
 }
 
-impl Visit for Loader<'_> {
-    fn visit_call_expr(&mut self, call: &CallExpr) {
+impl<'a> Visit<'a> for Loader<'_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         // `(zeros + number.toString(16)).slice(-width)`.
-        if let Callee::Expr(callee) = &call.callee
-            && let Expr::Member(slice) = callee.unwrap_parens()
-            && ast::member_str(&slice.prop) == Some("slice")
-            && let Expr::Bin(sum) = slice.obj.unwrap_parens()
+        if let Some(slice) = call.callee.without_parentheses().as_member_expression()
+            && ast::member_str(slice) == Some("slice")
+            && let Expression::BinaryExpression(sum) = slice.object().without_parentheses()
             && let Some(build) = expression::padded_build(sum)
         {
             self.builds.insert(build);
         }
-        call.visit_children_with(self);
+        walk::walk_call_expression(self, call);
     }
 
-    fn visit_bin_expr(&mut self, binary: &BinExpr) {
-        if binary.op == BinaryOp::Add {
+    fn visit_binary_expression(&mut self, binary: &BinaryExpression<'a>) {
+        if binary.operator == BinaryOperator::Addition {
             let mut operands = Vec::new();
             Self::operands(&binary.left, &mut operands);
             Self::operands(&binary.right, &mut operands);
@@ -228,7 +241,7 @@ impl Visit for Loader<'_> {
                     .iter()
                     .map(|operand| match (ast::static_str(operand), operand) {
                         (Some(text), _) => Some(Some(text.to_owned())),
-                        (None, Expr::Ident(_)) => Some(None),
+                        (None, Expression::Identifier(_)) => Some(None),
                         (None, _) => self.option(operand).map(Some),
                     })
                     .collect();
@@ -246,7 +259,7 @@ impl Visit for Loader<'_> {
                 self.hosts.insert(host);
             }
         }
-        binary.visit_children_with(self);
+        walk::walk_binary_expression(self, binary);
     }
 }
 

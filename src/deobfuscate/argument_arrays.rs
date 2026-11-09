@@ -5,100 +5,97 @@
 //! ```
 //!
 //! Requires a single array assignment and reads at constant indices only (see
-//! [`Properties`](super::analysis::Properties)). Elements must be literals or bindings
-//! unchanged by assignments or `arguments`. Excludes globals because repeated reads could throw
-//! or invoke getters.
+//! [`Properties::only_indexed`]). Elements must be literals or bindings unchanged by assignments
+//! or `arguments`. Excludes globals because repeated reads could throw or invoke getters.
 
-use swc_core::ecma::ast::{ArrayLit, Expr, Id, Program};
-use swc_core::ecma::visit::{Visit, VisitMut, VisitMutWith, VisitWith};
+use oxc::allocator::{CloneIn, GetAllocator};
+use oxc::ast::ast::{ArrayExpressionElement, Expression, Program};
+use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
+use oxc::span::GetSpanMut;
 
-use super::analysis::{self, Analysis, Globals, effects};
-use super::{HashMap, removal};
-use crate::js::ast;
+use super::analysis::properties::Properties;
+use super::analysis::{Analysis, Id};
+use super::{HashMap, ast, removal};
 
-pub(super) fn run(program: &mut Program, analysis: &mut Analysis) -> bool {
-    let globals = analysis.globals;
-    let (bindings, properties) = analysis.properties(program);
-    let mut packed = Packed::default();
-    program.visit_with(&mut packed);
-    // An element reads the same value wherever the array is indexed.
-    let is_fixed = |element: &Expr| match element {
-        Expr::Ident(identifier) => {
-            bindings.write_count(&identifier.to_id()) == 0
-                && !bindings.is_mapped_parameter(&identifier.to_id())
-                && !effects::may_have_effects(element, globals)
-        }
-        _ => true,
+pub(super) fn run<'a>(program: &mut Program<'a>, analysis: &mut Analysis<'a>) -> bool {
+    let properties = Properties::collect(program, analysis);
+    let mut packed = Packed {
+        analysis,
+        arrays: HashMap::default(),
     };
-    packed.0.retain(|id, elements| {
-        bindings.is_written_once(id)
-            && properties.binding(id).is_only_indexed()
-            && elements.iter().all(is_fixed)
+    packed.visit_program(program);
+    let mut arrays = packed.arrays;
+    arrays.retain(|&id, _| {
+        analysis.bindings.is_written_once(&id) && properties.only_indexed(id, analysis)
     });
-    if packed.0.is_empty() {
+    if arrays.is_empty() {
         return false;
     }
-    let mut unpack = UnpackArguments {
-        arrays: &packed.0,
-        globals,
+    let mut unpack = Unpack {
+        analysis,
+        arrays: &arrays,
         changed: false,
     };
-    program.visit_mut_with(&mut unpack);
-    let changed = unpack.changed;
-    let removed = removal::remove_definitions(program, &packed.0.into_keys().collect());
-    changed || removed
+    unpack.visit_program(program);
+    removal::remove_definitions(program, analysis, &arrays.keys().copied().collect())
+        || unpack.changed
 }
 
-/// Bindings assigned an array of identifiers and literals, with its elements.
-#[derive(Default)]
-struct Packed(HashMap<Id, Vec<Expr>>);
+/// Collects the elements of arrays assigned to bindings.
+struct Packed<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    arrays: HashMap<Id, Vec<Expression<'a>>>,
+}
 
-impl Visit for Packed {
-    fn visit_expr(&mut self, expression: &Expr) {
-        if let Some((target, Expr::Array(array))) = ast::assignment(expression)
-            && let Some(elements) = packed_elements(array)
-        {
-            self.0.insert(target, elements);
-        }
-        expression.visit_children_with(self);
+impl<'a> Packed<'_, 'a> {
+    fn element(&self, element: &ArrayExpressionElement<'a>) -> Option<Expression<'a>> {
+        let element = element.as_expression()?;
+        let fixed = match element {
+            Expression::Identifier(identifier) => self
+                .analysis
+                .id(identifier)
+                .is_some_and(|id| self.analysis.bindings.is_never_written(&id)),
+            element => element.is_literal(),
+        };
+        fixed.then(|| element.clone_in_with_semantic_ids(self.analysis.allocator()))
     }
 }
 
-/// Returns array elements only if all are identifiers or literals, with no holes or spreads.
-fn packed_elements(array: &ArrayLit) -> Option<Vec<Expr>> {
-    array
-        .elems
-        .iter()
-        .map(|element| {
-            let element = element
-                .as_ref()
-                .filter(|element| element.spread.is_none())?;
-            matches!(*element.expr, Expr::Ident(_) | Expr::Lit(_)).then(|| *element.expr.clone())
-        })
-        .collect()
+impl<'a> Visit<'a> for Packed<'_, 'a> {
+    fn visit_expression(&mut self, expression: &Expression<'a>) {
+        if let Some((id, Expression::ArrayExpression(array))) = self.analysis.assignment(expression)
+        {
+            let elements = array.elements.iter().map(|element| self.element(element));
+            if let Some(elements) = elements.collect() {
+                self.arrays.insert(id, elements);
+            }
+        }
+        walk::walk_expression(self, expression)
+    }
 }
 
-struct UnpackArguments<'arrays> {
-    arrays: &'arrays HashMap<Id, Vec<Expr>>,
-    globals: Globals,
+struct Unpack<'b, 'a> {
+    analysis: &'b Analysis<'a>,
+    arrays: &'b HashMap<Id, Vec<Expression<'a>>>,
     changed: bool,
 }
 
-impl VisitMut for UnpackArguments<'_> {
-    fn visit_mut_expr(&mut self, expression: &mut Expr) {
-        expression.visit_mut_children_with(self);
-        if let Expr::Member(member) = expression
-            && let Some(array) = member.obj.as_ident()
-            && let Some(index) = analysis::constant_index(&member.prop)
-            && let Some(elements) = self.arrays.get(&array.to_id())
+impl<'a> VisitMut<'a> for Unpack<'_, 'a> {
+    fn visit_expression(&mut self, expression: &mut Expression<'a>) {
+        walk_mut::walk_expression(self, expression);
+        if let Expression::ComputedMemberExpression(member) = expression
+            && let Some(id) = self.analysis.expression_id(&member.object)
+            && let Some(array) = self.arrays.get(&id)
+            && let Some(index) = ast::index(&member.expression)
         {
+            let span = member.span;
+            let mut value = match array.get(index) {
+                Some(element) => element.clone_in_with_semantic_ids(self.analysis.allocator()),
+                None => Expression::new_identifier(span, "undefined", &self.analysis.ast),
+            };
+            *value.span_mut() = span;
+            *expression = value;
             self.changed = true;
-            // Out-of-bounds array reads produce `undefined`. Give the replacement the original
-            // read's source position, which JavaScript engines use in call stack traces.
-            *expression = elements
-                .get(index)
-                .map(|element| element.clone().with_span(member.span))
-                .unwrap_or_else(|| Expr::Ident(self.globals.reference("undefined", member.span)));
         }
     }
 }
@@ -109,7 +106,7 @@ mod tests {
 
     #[test]
     fn unpacks_arrays_that_neither_change_nor_escape() {
-        let unpack = |source: &str| testing::rewrite(source, super::run, /* fix= */ false);
+        let unpack = |source: &str| testing::rewrite(source, super::run);
         let output = unpack(
             "g = function (a, b) { var f; f = [a, b, 3]; return f[1] ^ f[0] + f[2] + f[5]; };",
         );

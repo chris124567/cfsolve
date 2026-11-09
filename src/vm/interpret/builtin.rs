@@ -3,8 +3,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use swc_ecma_utils::number::JsNumber;
-
 use super::access::Key;
 use super::run::{Evaluation, Run, Stop};
 use super::semantics;
@@ -246,9 +244,7 @@ impl<'ast> Run<'ast, '_> {
             Builtin::Pow => {
                 let values = numbers()?;
                 let value = |index: usize| values.get(index).copied().unwrap_or(f64::NAN);
-                Ok(Value::Number(
-                    *JsNumber::from(value(0)).pow(value(1).into()),
-                ))
+                Ok(Value::Number(semantics::exponentiate(value(0), value(1))))
             }
             Builtin::Floor => {
                 let value = numbers()?.first().copied().unwrap_or(f64::NAN);
@@ -573,10 +569,11 @@ const STATIC_FUNCTIONS: &[&str] = &[
 
 #[cfg(test)]
 mod tests {
-    use swc_core::ecma::ast::BinaryOp;
+    use oxc::syntax::operator::BinaryOperator;
 
     use super::super::{Run, semantics};
     use super::*;
+    use crate::js::ast::ParsedScript;
     use crate::vm::session::Session;
 
     fn number(value: Evaluation<'_, Value<'_>>) -> f64 {
@@ -588,7 +585,8 @@ mod tests {
 
     #[test]
     fn math_follows_javascript() {
-        let session = Session::empty();
+        let parsed = ParsedScript::parse("t", "").expect("an empty script parses");
+        let session = Session::empty(parsed.script());
         let mut run = Run::method(&session);
         let mut call = |builtin, arguments: &[f64]| {
             let arguments = arguments.iter().copied().map(Value::Number).collect();
@@ -607,7 +605,8 @@ mod tests {
     /// removal.
     #[test]
     fn a_set_keeps_each_member_once() {
-        let session = Session::empty();
+        let parsed = ParsedScript::parse("t", "").expect("an empty script parses");
+        let session = Session::empty(parsed.script());
         let mut run = Run::method(&session);
         let source = [1.0, 1.0, f64::NAN, f64::NAN, 0.0, -0.0].map(Value::Number);
         let mut source = source.to_vec();
@@ -676,7 +675,8 @@ mod tests {
     /// `charCodeAt` operate on code units, and a string with a lone surrogate prints as units.
     #[test]
     fn strings_are_code_units() {
-        let session = Session::empty();
+        let parsed = ParsedScript::parse("t", "").expect("an empty script parses");
+        let session = Session::empty(parsed.script());
         let mut run = Run::method(&session);
         let mut call = |builtin: Builtin, this, arguments| {
             let Ok(value) = run.builtin(builtin, this, arguments) else {
@@ -707,7 +707,7 @@ mod tests {
         });
         let sum = halves
             .into_iter()
-            .reduce(|left, right| semantics::binary_value(BinaryOp::Add, left, right))
+            .reduce(|left, right| semantics::binary_value(BinaryOperator::Addition, left, right))
             .expect("there are four halves");
         for string in [joined, sum] {
             let text = semantics::text(&string).and_then(|text| text.text());

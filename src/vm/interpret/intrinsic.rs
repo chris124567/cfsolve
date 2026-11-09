@@ -1,23 +1,28 @@
-//! Native versions of pure functions the script defines, such as the BLAKE3 compression its
-//! string decryption runs. A script function is replaced only after it returns the native
-//! result on test inputs. Calls with arguments a native version does not accept are
-//! interpreted.
+//! Native versions of script functions. Register bookkeeping is recognized structurally;
+//! BLAKE3 compression must also agree on test inputs. Calls outside each native version's
+//! supported arguments are interpreted.
 
 use std::ptr;
 
-use swc_core::ecma::ast::{Function, Lit};
-use swc_core::ecma::visit::{Visit, VisitWith};
+use oxc::ast::ast::{Function, NumericLiteral, ObjectProperty};
+use oxc::ast_visit::{Visit, walk};
+use oxc::semantic::ScopeFlags;
 
 use super::copies::Copies;
+use super::mix32::Mix32;
+use super::register_helpers::{self, Helper};
 use super::run::Run;
 use crate::js;
-use crate::vm::HashMap;
 use crate::vm::session::Session;
 use crate::vm::value::{Callable, Value};
+use crate::vm::{HashMap, extract};
 
 /// A native function equivalent to a script function.
 #[derive(Clone, Copy)]
 pub(crate) enum Intrinsic {
+    /// Bookkeeping on the interpreter's unmasked register file.
+    Register(Helper),
+    Mix32(Mix32),
     /// `compress(cv, block, counter, length, flags)`: overwrites the 8 words of `cv` with the
     /// BLAKE3 compression of the 16-word `block`.
     Blake3Compress,
@@ -27,57 +32,107 @@ pub(crate) enum Intrinsic {
 pub(crate) type Intrinsics = HashMap<usize, Intrinsic>;
 
 /// The address identifying `function` in [`Intrinsics`].
-pub(super) fn address(function: &Function) -> usize {
+pub(super) fn address(function: &Function<'_>) -> usize {
     ptr::from_ref(function).addr()
 }
 
-/// Finds the script functions `session` can run natively. Tests functions that take five
-/// parameters and mention the BLAKE3 initialization vector.
+/// Finds register helpers and mixers, and validates BLAKE3 candidates taking five parameters
+/// and mentioning its initialization vector's first word, which some builds store complemented.
 pub(crate) fn intrinsics(session: &Session<'_>) -> Intrinsics {
-    session
-        .functions
-        .values()
-        .filter(|function| function.params.len() == 5 && mentions(function, IV[0]))
-        .filter(|function| compresses_like_native(session, function))
-        .map(|function| (address(function), Intrinsic::Blake3Compress))
-        .collect()
+    let mut intrinsics = Intrinsics::default();
+    let script = session.script;
+    for function in session.functions.values() {
+        let intrinsic = if let Some(helper) = register_helpers::recognize(script, function) {
+            Intrinsic::Register(helper)
+        } else if let Some(mixer) = Mix32::recognize(script, function) {
+            Intrinsic::Mix32(mixer)
+        } else if extract::parameter_count(&function.params) == 5
+            // `~IV[0]` is written as the negation of `IV[0] + 1`.
+            && (mentions(function, f64::from(IV[0]))
+                || mentions(function, f64::from(IV[0]) + 1.0))
+            && compresses_like_native(session, function)
+        {
+            Intrinsic::Blake3Compress
+        } else {
+            continue;
+        };
+        intrinsics.insert(address(function), intrinsic);
+    }
+    intrinsics
 }
 
 impl Intrinsic {
-    /// Runs the native version. Returns `None` if the arguments are outside what it reproduces
+    /// Runs a register helper or mixer natively. Returns `None` for BLAKE3 compression, which
+    /// [`blake3_compress`] runs, and for arguments outside what the native version reproduces
     /// exactly, leaving the call to the interpreter.
-    pub(super) fn call<'ast>(self, arguments: &[Value<'ast>]) -> Option<Value<'ast>> {
-        match self {
-            Self::Blake3Compress => {
-                let [
-                    Value::Array(cv),
-                    Value::Array(block),
-                    counter,
-                    length,
-                    flags,
-                ] = arguments
-                else {
+    pub(super) fn call<'ast>(
+        self,
+        run: &mut Run<'ast, '_>,
+        arguments: &[Value<'ast>],
+    ) -> Option<Value<'ast>> {
+        let register = match self {
+            Self::Mix32(mixer) => {
+                let Some(Value::Number(number)) = arguments.first() else {
                     return None;
                 };
-                let output = {
-                    let (cv, block) = (cv.borrow(), block.borrow());
-                    compress(
-                        &words(cv.get(..8)?)?,
-                        &words(block.get(..16)?)?,
-                        Counter::of(counter.as_number()?),
-                        js::int32(length.as_number()?) as u32,
-                        js::int32(flags.as_number()?) as u32,
-                    )
-                };
-                let mut cv = cv.borrow_mut();
-                for (slot, word) in cv.iter_mut().zip(output) {
-                    // The script stores the results of `^`, which are signed.
-                    *slot = Value::Number(f64::from(word as i32));
-                }
-                Some(Value::Undefined)
+                return Some(Value::Number(mixer.call(*number)));
             }
+            Self::Register(Helper::Number) => {
+                return arguments
+                    .first()
+                    .filter(|value| matches!(value, Value::Number(_)))
+                    .cloned();
+            }
+            Self::Register(Helper::Mask) => {
+                return matches!(arguments.first(), Some(Value::Registers))
+                    .then_some(Value::Undefined);
+            }
+            Self::Register(Helper::Pc) => run.session.layout.pc,
+            Self::Register(Helper::Key) => run.session.layout.key,
+            Self::Blake3Compress => return None,
+        };
+        let [Value::Registers, value @ Value::Number(number), ..] = arguments else {
+            return None;
+        };
+        // Both setter branches store exactly this value for signed integers other than -0.
+        if *number != f64::from(js::int32(*number)) || (*number == 0.0 && number.is_sign_negative())
+        {
+            return None;
         }
+        run.set_register(register, value.clone());
+        Some(value.clone())
     }
+}
+
+/// Runs [`Intrinsic::Blake3Compress`]. Returns `None` if the arguments are outside what it
+/// reproduces exactly, leaving the call to the interpreter.
+pub(super) fn blake3_compress<'ast>(arguments: &[Value<'ast>]) -> Option<Value<'ast>> {
+    let [
+        Value::Array(cv),
+        Value::Array(block),
+        counter,
+        length,
+        flags,
+    ] = arguments
+    else {
+        return None;
+    };
+    let output = {
+        let (cv, block) = (cv.borrow(), block.borrow());
+        compress(
+            &words(cv.get(..8)?)?,
+            &words(block.get(..16)?)?,
+            Counter::of(counter.as_number()?),
+            js::int32(length.as_number()?) as u32,
+            js::int32(flags.as_number()?) as u32,
+        )
+    };
+    let mut cv = cv.borrow_mut();
+    for (slot, word) in cv.iter_mut().zip(output) {
+        // The script stores the results of `^`, which are signed.
+        *slot = Value::Number(f64::from(word as i32));
+    }
+    Some(Value::Undefined)
 }
 
 impl Value<'_> {
@@ -92,7 +147,7 @@ impl Value<'_> {
 /// Converts state or message words. The script first adds three words before truncating, which
 /// matches wrapping addition only while the sum is exact, so larger or fractional words are
 /// rejected.
-fn words<const N: usize>(values: &[Value<'_>]) -> Option<[u32; N]> {
+pub(super) fn words<const N: usize>(values: &[Value<'_>]) -> Option<[u32; N]> {
     let mut words = [0; N];
     for (word, value) in words.iter_mut().zip(values) {
         let number = value.as_number()?;
@@ -107,13 +162,13 @@ fn words<const N: usize>(values: &[Value<'_>]) -> Option<[u32; N]> {
 /// A block counter split as the script splits it: `counter | 0` and
 /// `counter / 4294967296 | 0`.
 #[derive(Clone, Copy)]
-struct Counter {
+pub(super) struct Counter {
     low: u32,
     high: u32,
 }
 
 impl Counter {
-    fn of(counter: f64) -> Self {
+    pub(super) fn of(counter: f64) -> Self {
         Self {
             low: js::int32(counter) as u32,
             high: js::int32(counter / 4_294_967_296.0) as u32,
@@ -136,7 +191,7 @@ const IV: [u32; 8] = [
 const PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
 /// The BLAKE3 compression function, truncated to the chaining value.
-fn compress(
+pub(super) fn compress(
     cv: &[u32; 8],
     block: &[u32; 16],
     counter: Counter,
@@ -177,32 +232,41 @@ fn mix(state: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
 }
 
 /// Whether `function` contains the numeric literal `number`.
-fn mentions(function: &Function, number: u32) -> bool {
+fn mentions(function: &Function<'_>, number: f64) -> bool {
     struct Finder {
         number: f64,
         found: bool,
     }
 
-    impl Visit for Finder {
-        fn visit_lit(&mut self, literal: &Lit) {
-            self.found |= matches!(literal, Lit::Num(found) if found.value == self.number);
+    impl<'a> Visit<'a> for Finder {
+        fn visit_numeric_literal(&mut self, literal: &NumericLiteral<'a>) {
+            self.found |= literal.value == self.number;
+        }
+
+        /// A numeric key names a property; only computed keys hold values.
+        fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+            if property.computed {
+                walk::walk_object_property(self, property);
+            } else {
+                self.visit_expression(&property.value);
+            }
         }
     }
 
     let mut finder = Finder {
-        number: f64::from(number),
+        number,
         found: false,
     };
-    function.visit_with(&mut finder);
+    finder.visit_function(function, ScopeFlags::Function);
     finder.found
 }
 
-/// Whether interpreting `function` gives the result of [`Intrinsic::Blake3Compress`] on every
+/// Whether interpreting `function` gives the result of [`blake3_compress`] on every
 /// test input, returning nothing and recording no effects.
-fn compresses_like_native<'ast>(session: &Session<'ast>, function: &'ast Function) -> bool {
+fn compresses_like_native<'ast>(session: &Session<'ast>, function: &'ast Function<'ast>) -> bool {
     TEST_INPUTS.iter().all(|input| {
         let native = input.arguments();
-        if Intrinsic::Blake3Compress.call(&native).is_none() {
+        if blake3_compress(&native).is_none() {
             return false;
         }
         // Clones share the arrays, so `interpreted` shows what the script wrote.
@@ -345,6 +409,6 @@ mod tests {
     fn rejects_inexact_words() {
         let mut arguments = TEST_INPUTS[0].arguments();
         arguments[1] = Value::array(vec![Value::Number(0.5); 16]);
-        assert!(Intrinsic::Blake3Compress.call(&arguments).is_none());
+        assert!(blake3_compress(&arguments).is_none());
     }
 }

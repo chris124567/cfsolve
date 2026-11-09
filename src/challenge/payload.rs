@@ -1,16 +1,17 @@
 //! Builds the plaintext first challenge payload by evaluating the template's field expressions
 //! against session options and the script's namespace.
 
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, ensure};
+use oxc::ast::ast::{Expression, Statement};
+use oxc::syntax::operator::BinaryOperator;
 use regex::Regex;
-use swc_core::ecma::ast::{BinaryOp, Expr};
-use swc_core::ecma::codegen;
 
 use crate::challenge::expression;
 use crate::challenge::state::{Difference, Getter, ScriptState};
-use crate::js::{JsValue, Options, Payload, Window, ast, json};
+use crate::js::ast::{self, ParsedScript, Script};
+use crate::js::{JsValue, Options, Payload, Window, json};
 use crate::random_id;
 
 /// The global selector log serialized in the payload. Starts empty.
@@ -128,14 +129,16 @@ fn split_page_urls(stack: &str, origin: &str) -> JsValue {
     json!([parts, urls])
 }
 
+/// A payload template field. The expression is parsed from its source text on its own, so the
+/// field outlives the script it came from; the text is the expression exactly as written there.
 #[derive(Debug, Clone)]
 pub struct Field {
     pub name: String,
-    pub expression: Expr,
     /// The expression's original source text.
     pub text: String,
     /// Static value before the session runs, if known.
     pub bootstrap_value: Option<JsValue>,
+    parsed: Arc<ParsedScript>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,11 +149,44 @@ enum Shape {
 }
 
 impl Field {
+    /// Parses the field expression `text`. Every identifier in it is unresolved, so locals of the
+    /// script it came from read as globals.
+    pub(crate) fn parse(
+        name: String,
+        text: String,
+        bootstrap_value: Option<JsValue>,
+    ) -> Result<Self> {
+        // Parentheses make leading braces parse as an object literal.
+        let parsed = ParsedScript::parse("payload field", &format!("({text})"))?;
+        ensure!(
+            matches!(
+                parsed.script().program.body.as_slice(),
+                [Statement::ExpressionStatement(_)]
+            ),
+            "payload field {name} is not one expression: {text}"
+        );
+        Ok(Self {
+            name,
+            text,
+            bootstrap_value,
+            parsed: Arc::new(parsed),
+        })
+    }
+
+    /// The field's script and its expression, without surrounding parentheses.
+    fn expression(&self) -> (Script<'_>, &Expression<'_>) {
+        let script = self.parsed.script();
+        let [Statement::ExpressionStatement(statement)] = script.program.body.as_slice() else {
+            unreachable!("a field holds one expression, checked when it was parsed");
+        };
+        (script, statement.expression.without_parentheses())
+    }
+
     /// Returns the option reported by this field, whether read directly or through a namespace
     /// getter.
     #[must_use]
     pub(crate) fn option<'a>(&'a self, script: &'a ScriptState) -> Option<&'a str> {
-        expression::option_key(&self.expression).or_else(|| match self.global()? {
+        expression::option_key(self.expression().1).or_else(|| match self.global()? {
             (name, Shape::Called) => script
                 .getters
                 .get(name)
@@ -162,24 +198,36 @@ impl Field {
     /// Returns the two options subtracted by this field, if it reports a time difference.
     #[must_use]
     pub(crate) fn difference(&self) -> Option<Difference> {
-        match &self.expression {
-            Expr::Bin(binary) if binary.op == BinaryOp::Sub => Some(Difference {
-                later: expression::option_key(&binary.left)?.to_owned(),
-                earlier: expression::option_key(&binary.right)?.to_owned(),
-            }),
+        match self.expression().1 {
+            Expression::BinaryExpression(binary)
+                if binary.operator == BinaryOperator::Subtraction =>
+            {
+                Some(Difference {
+                    later: expression::option_key(&binary.left)?.to_owned(),
+                    earlier: expression::option_key(&binary.right)?.to_owned(),
+                })
+            }
             _ => None,
         }
     }
 
     /// The namespace property this field reads, if any.
     fn global(&self) -> Option<(&str, Shape)> {
-        fn global(expression: &Expr) -> Option<&str> {
-            ast::ident_property(expression.as_member()?)
+        fn global<'a>(expression: &Expression<'a>) -> Option<&'a str> {
+            ast::ident_property(expression.as_member_expression()?)
         }
-        match &self.expression {
-            Expr::Call(call) => match &**call.callee.as_expr()? {
-                Expr::Member(member) if ast::is_method_of(member, "JSON", "stringify") => {
-                    Some((global(&call.args.first()?.expr)?, Shape::Stringified))
+        let (script, expression) = self.expression();
+        match expression {
+            Expression::CallExpression(call) => match &call.callee {
+                callee
+                    if callee
+                        .as_member_expression()
+                        .is_some_and(|member| script.is_method_of(member, "JSON", "stringify")) =>
+                {
+                    Some((
+                        global(call.arguments.first()?.as_expression()?)?,
+                        Shape::Stringified,
+                    ))
                 }
                 callee => Some((global(callee)?, Shape::Called)),
             },
@@ -199,14 +247,9 @@ pub(crate) fn differences(fields: &[Field]) -> Vec<Difference> {
 pub(crate) fn build(fields: &[Field], options: &Options, globals: &Window) -> Result<Payload> {
     let mut payload = Payload::new();
     for field in fields {
-        let value =
-            expression::evaluate(&field.expression, options, globals).with_context(|| {
-                format!(
-                    "evaluating payload field {}: {}",
-                    field.name,
-                    codegen::to_code(&field.expression)
-                )
-            })?;
+        let (script, expression) = field.expression();
+        let value = expression::evaluate(script, expression, options, globals)
+            .with_context(|| format!("evaluating payload field {}: {}", field.name, field.text))?;
         if let Some(value) = value {
             payload.insert(field.name.clone(), value);
         }
@@ -296,12 +339,7 @@ mod tests {
     }
 
     fn field(name: &str, text: &str) -> Field {
-        Field {
-            name: name.into(),
-            expression: ast::parse_expression("t", text).unwrap(),
-            text: text.into(),
-            bootstrap_value: None,
-        }
+        Field::parse(name.into(), text.into(), None).unwrap()
     }
 
     /// Checks JavaScript evaluation and omission of `undefined` fields during JSON

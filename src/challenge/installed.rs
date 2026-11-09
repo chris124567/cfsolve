@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use anyhow::Result;
-use swc_core::ecma::ast::BinaryOp;
+use oxc::syntax::operator::BinaryOperator;
 
 use crate::js::{JsObject, JsValue, Options, Window, json};
 use crate::listing::fold::{Frame, Known};
@@ -147,10 +147,10 @@ fn evaluate(frame: &Frame<Held>, value: &Term) -> Option<Known<Held>> {
             };
             Known::Ext(Held::Built(frame.resolve(argument)?.text()?.to_owned()))
         }
-        Term::Binary(BinaryOp::Add, left, right) => {
+        Term::Binary(BinaryOperator::Addition, left, right) => {
             Known::Literal(json!(number(frame, left)? + number(frame, right)?))
         }
-        Term::Binary(BinaryOp::Mul, left, right) => {
+        Term::Binary(BinaryOperator::Multiplication, left, right) => {
             Known::Literal(json!(number(frame, left)? * number(frame, right)?))
         }
         value => frame.resolve(value)?,
@@ -289,12 +289,19 @@ mod tests {
         set(3, method("charCodeAt", vec![number(1.0)]));
         set(
             4,
-            Term::Binary(BinaryOp::Mul, Box::new(number(256.0)), register(2)),
+            Term::Binary(
+                BinaryOperator::Multiplication,
+                Box::new(number(256.0)),
+                register(2),
+            ),
         );
-        set(4, Term::Binary(BinaryOp::Add, register(4), register(3)));
         set(
             4,
-            Term::Binary(BinaryOp::Add, register(4), Box::new(number(2.0))),
+            Term::Binary(BinaryOperator::Addition, register(4), register(3)),
+        );
+        set(
+            4,
+            Term::Binary(BinaryOperator::Addition, register(4), Box::new(number(2.0))),
         );
         set(5, method("slice", vec![number(2.0), Term::Reg(4)]));
         assert_eq!(frame.register(5).and_then(Known::text), Some("abc"));

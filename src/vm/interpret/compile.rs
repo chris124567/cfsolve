@@ -1,23 +1,27 @@
-//! Compiles slot plans into closures. Compiled code takes the same steps as
-//! [`super::evaluate`] takes over a plan, in the same order and through the same [`Run`]
-//! methods, but resolves each node's kind and operands once, when the plan is compiled.
+//! Compiles plans into closures, which resolve each node's kind and operands once, when the
+//! plan is compiled.
 //!
-//! A few common shapes run more directly: assignments to locals in statement position skip
-//! the result they would discard, and arithmetic reads program bytes at local indexes, as in
-//! `program[pc++]`, without building values.
+//! A few common shapes in slot plans run more directly: assignments to locals in statement
+//! position skip the result they would discard, and arithmetic reads program bytes at local
+//! indexes, as in `program[pc++]`, without building values.
 
 use std::cell::RefCell;
+use std::mem;
 use std::rc::Rc;
 
-use swc_core::ecma::ast::{BinaryOp, UpdateOp};
+use oxc::syntax::operator::{BinaryOperator, UpdateOperator};
 
 use super::access::{self, Key};
-use super::evaluate::{self, Locals, Location, MAXIMUM_ITERATIONS};
+use super::evaluate::{self, Locals, Location};
 use super::plan::{Case, Declaration, Expression, Name, Property, Statement, Target};
 use super::run::{Evaluation, Flow, Run, Stop};
 use super::semantics;
 use crate::vm::convert;
 use crate::vm::value::Value;
+
+/// Maximum handler loop count. Valid constants require fewer iterations; exceeding it indicates
+/// invalid instruction bytes.
+const MAXIMUM_ITERATIONS: usize = 1 << 16;
 
 /// Compiled code producing `T`.
 type Compiled<'ast, T> = Box<
@@ -30,8 +34,7 @@ pub(super) type Code<'ast> = Compiled<'ast, Flow<'ast>>;
 /// A compiled expression.
 type Compute<'ast> = Compiled<'ast, Value<'ast>>;
 
-/// A compiled operand of arithmetic, as [`Run::number`] evaluates it: a number, or the value
-/// of a nonnumeric operand.
+/// A compiled operand of arithmetic: a number, or the value of a nonnumeric operand.
 type Numeric<'ast> = Compiled<'ast, Result<f64, Value<'ast>>>;
 
 /// Compiles a function body or block.
@@ -39,7 +42,7 @@ pub(super) fn statements<'ast>(statements: &[Statement<'ast>]) -> Vec<Code<'ast>
     statements.iter().map(statement).collect()
 }
 
-/// Runs statements in order until one jumps, as `Run::execute_all` does.
+/// Runs statements in order until one jumps.
 pub(super) fn run_all<'ast>(
     code: &[Code<'ast>],
     run: &mut Run<'ast, '_>,
@@ -54,7 +57,7 @@ pub(super) fn run_all<'ast>(
     Ok(Flow::Normal)
 }
 
-fn statement<'ast>(statement: &Statement<'ast>) -> Code<'ast> {
+pub(super) fn statement<'ast>(statement: &Statement<'ast>) -> Code<'ast> {
     match statement {
         Statement::Switch(discriminant, cases) => switch(discriminant, cases),
         Statement::Empty => code(|_, _| Ok(Flow::Normal)),
@@ -71,14 +74,25 @@ fn statement<'ast>(statement: &Statement<'ast>) -> Code<'ast> {
             let handler = handler.as_deref().map(statements);
             let finalizer = finalizer.as_deref().map(statements);
             code(move |run, locals| {
-                run.attempt(
-                    block.as_slice(),
-                    parameter,
-                    handler.as_deref(),
-                    finalizer.as_deref(),
-                    locals,
-                    |run, code, locals| run_all(code, run, locals),
-                )
+                let mut outcome = run_all(&block, run, locals);
+                if let Some(handler) = &handler
+                    && let Err(stop) = &mut outcome
+                    && let Stop::Throw(exception) = &mut **stop
+                {
+                    let exception = mem::replace(exception, Value::Undefined);
+                    if let Some(parameter) = parameter {
+                        run.bind(parameter, exception, locals);
+                    }
+                    outcome = run_all(handler, run, locals);
+                }
+                // A jump from `finally` overrides the previous completion of the block.
+                if let Some(finalizer) = &finalizer {
+                    match run_all(finalizer, run, locals)? {
+                        Flow::Normal => {}
+                        flow => return Ok(flow),
+                    }
+                }
+                outcome
             })
         }
         Statement::Block(block) => {
@@ -107,15 +121,15 @@ fn statement<'ast>(statement: &Statement<'ast>) -> Code<'ast> {
             code(move |run, locals| Err(Stop::throw(expression(run, locals)?)))
         }
         Statement::Break(label) => {
-            let label = label.cloned();
-            code(move |_, _| Ok(Flow::Break(label.clone())))
+            let label = *label;
+            code(move |_, _| Ok(Flow::Break(label)))
         }
         Statement::Continue(label) => {
-            let label = label.cloned();
-            code(move |_, _| Ok(Flow::Continue(label.clone())))
+            let label = *label;
+            code(move |_, _| Ok(Flow::Continue(label)))
         }
         Statement::Label(label, body) => {
-            let label = (*label).clone();
+            let label = *label;
             let body = self::statement(body);
             code(move |run, locals| {
                 Ok(match body(run, locals)? {
@@ -136,8 +150,7 @@ fn statement<'ast>(statement: &Statement<'ast>) -> Code<'ast> {
             let test = test.as_ref().map(compute);
             let update = update.as_ref().map(compute);
             let body = self::statement(body);
-            let body_first = *body_first;
-            let label = label.cloned();
+            let (body_first, label) = (*body_first, *label);
             code(move |run, locals| {
                 if let Some(init) = &init {
                     init(run, locals)?;
@@ -153,7 +166,7 @@ fn statement<'ast>(statement: &Statement<'ast>) -> Code<'ast> {
                     first = false;
                     match body(run, locals)? {
                         Flow::Normal | Flow::Continue(None) => {}
-                        Flow::Continue(Some(target)) if Some(&target) == label.as_ref() => {}
+                        Flow::Continue(Some(target)) if Some(target) == label => {}
                         Flow::Break(None) => return Ok(Flow::Normal),
                         flow => return Ok(flow),
                     }
@@ -193,7 +206,14 @@ fn declare<'ast>(declarations: &[Declaration<'ast>]) -> Code<'ast> {
         for (name, init, keeps) in &declarations {
             let value = match init {
                 Some(init) => init(run, locals)?,
-                None if *keeps && run.declared(*name, locals) => continue,
+                None if *keeps
+                    && match *name {
+                        Name::Local(slot, _) => locals[slot].is_some(),
+                        Name::Scoped(binding) => run.frame().declares(binding),
+                    } =>
+                {
+                    continue;
+                }
                 None => Value::Undefined,
             };
             run.bind(*name, value, locals);
@@ -300,7 +320,7 @@ impl<'ast> Arguments<'ast> {
         Self(arguments.iter().map(compute).collect())
     }
 
-    /// Evaluates the arguments into a reused buffer, as `Run::arguments` does.
+    /// Evaluates the arguments into a reused buffer.
     fn values(
         &self,
         run: &mut Run<'ast, '_>,
@@ -314,7 +334,7 @@ impl<'ast> Arguments<'ast> {
     }
 }
 
-fn compute<'ast>(expression: &Expression<'ast>) -> Compute<'ast> {
+pub(super) fn compute<'ast>(expression: &Expression<'ast>) -> Compute<'ast> {
     match expression {
         Expression::Constant(value) => {
             let value = value.clone();
@@ -328,9 +348,9 @@ fn compute<'ast>(expression: &Expression<'ast>) -> Compute<'ast> {
                 None => run.lookup(name),
             })
         }
-        Expression::Name(Name::Global(name)) => {
-            let name = *name;
-            code(move |run, _| run.lookup(name))
+        Expression::Name(Name::Scoped(binding)) => {
+            let binding = *binding;
+            code(move |run, _| run.lookup(binding))
         }
         Expression::This => code(|run, _| Ok(run.frame().this.clone())),
         Expression::Binary(operator, left, right) => {
@@ -356,18 +376,32 @@ fn compute<'ast>(expression: &Expression<'ast>) -> Compute<'ast> {
             })
         }
         Expression::Assign(target, operator, right) => assignment(target, *operator, right),
+        Expression::LogicalAssign(target) => {
+            let target = Located::new(target);
+            code(move |run, locals| {
+                target.locate(run, locals)?;
+                Err(Stop::unsupported("a logical assignment"))
+            })
+        }
         Expression::Update {
             target,
             operator,
             prefix,
         } => update(target, *operator, *prefix),
         Expression::Call(callee, arguments) => call(callee, arguments),
+        // `&&`, `||`, or `??`, evaluating the right side only when needed.
         Expression::Logical {
             operator,
             left,
             right,
             pure,
-        } => logical(*operator, left, right, *pure),
+        } => {
+            let (operator, pure, left, right) = (*operator, *pure, compute(left), compute(right));
+            code(move |run, locals| {
+                let left = left(run, locals)?;
+                run.short_circuit(operator, left, pure, locals, &right)
+            })
+        }
         Expression::Sequence(expressions) => {
             let expressions: Vec<_> = expressions.iter().map(compute).collect();
             code(move |run, locals| {
@@ -432,8 +466,8 @@ fn compute<'ast>(expression: &Expression<'ast>) -> Compute<'ast> {
             })
         }
         Expression::Function(name, function) => {
-            let (name, function) = (name.cloned(), *function);
-            code(move |run, _| Ok(run.function_value(name.clone(), function)))
+            let (name, function) = (*name, *function);
+            code(move |run, _| Ok(run.function_value(name, function)))
         }
         Expression::Arrow(arrow) => {
             let arrow = *arrow;
@@ -453,10 +487,8 @@ fn call<'ast>(callee: &Expression<'ast>, arguments: &[Expression<'ast>]) -> Comp
             let (object, property) = (compute(object), Keyed::new(property));
             code(move |run, locals| {
                 let object = object(run, locals)?;
-                let callee = {
-                    let key = property.key(run, locals)?;
-                    run.get(&object, &key)?
-                };
+                let key = property.key(run, locals)?;
+                let callee = run.get(&object, &key)?;
                 let arguments = arguments.values(run, locals)?;
                 run.apply(callee, object, arguments)
             })
@@ -474,7 +506,7 @@ fn call<'ast>(callee: &Expression<'ast>, arguments: &[Expression<'ast>]) -> Comp
 
 fn assignment<'ast>(
     target: &Target<'ast>,
-    operator: Option<BinaryOp>,
+    operator: Option<BinaryOperator>,
     right: &Expression<'ast>,
 ) -> Compute<'ast> {
     let (target, right) = (Located::new(target), compute(right));
@@ -487,12 +519,12 @@ fn assignment<'ast>(
         }),
         Some(operator) => code(move |run, locals| {
             let location = target.locate(run, locals)?;
-            run.compound(location, operator, locals, |run, locals| right(run, locals))
+            run.compound(location, operator, locals, &right)
         }),
     }
 }
 
-fn update<'ast>(target: &Target<'ast>, operator: UpdateOp, prefix: bool) -> Compute<'ast> {
+fn update<'ast>(target: &Target<'ast>, operator: UpdateOperator, prefix: bool) -> Compute<'ast> {
     let target = Located::new(target);
     code(move |run, locals| {
         // A counter: the local is read and written in place.
@@ -506,24 +538,9 @@ fn update<'ast>(target: &Target<'ast>, operator: UpdateOp, prefix: bool) -> Comp
     })
 }
 
-/// `&&`, `||`, or `??`, evaluating the right side only when needed.
-fn logical<'ast>(
-    operator: BinaryOp,
-    left: &Expression<'ast>,
-    right: &Expression<'ast>,
-    pure: bool,
-) -> Compute<'ast> {
-    let (left, right) = (compute(left), compute(right));
-    code(move |run, locals| {
-        let left = left(run, locals)?;
-        run.short_circuit(operator, left, pure, locals, |run, locals| {
-            right(run, locals)
-        })
-    })
-}
-
-/// Numeric evaluation, as [`Run::number`] does: arithmetic without wrapping intermediate
-/// results, switching to general evaluation where an operand is nonnumeric.
+/// Evaluates numeric arithmetic without wrapping intermediate results. If an operand is
+/// nonnumeric, switches to general evaluation for that operator and its enclosing operators,
+/// reusing evaluated operands, and returns that general result in `Err`.
 fn number<'ast>(expression: &Expression<'ast>) -> Numeric<'ast> {
     let Expression::Arithmetic {
         operator,
