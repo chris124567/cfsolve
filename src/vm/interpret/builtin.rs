@@ -74,9 +74,6 @@ builtins! {
     /// Typed arrays are modeled as empty objects because the script only uses them to cache values
     /// it can recompute.
     Int32Array => "Int32Array",
-    /// The register file's `read` and `write` methods (see [`crate::vm::registers`]).
-    RegisterRead => "registers.read",
-    RegisterWrite => "registers.write",
 }
 
 impl<'ast> Run<'ast, '_> {
@@ -314,16 +311,6 @@ impl<'ast> Run<'ast, '_> {
             }
             Builtin::Symbol => Ok(Value::Symbol(Rc::new(()))),
             Builtin::Int32Array => Ok(Value::Object(Rc::default())),
-            Builtin::RegisterRead => {
-                let register = self.register(&Key::from(argument(0)))?;
-                Ok(self.register_value(register))
-            }
-            Builtin::RegisterWrite => {
-                let register = self.register(&Key::from(argument(0)))?;
-                let value = argument(1);
-                self.write_register(register, value.clone());
-                Ok(value)
-            }
             Builtin::Set => match argument(0) {
                 Value::Undefined | Value::Null => Ok(Value::Set(Rc::default())),
                 Value::Array(elements) => {

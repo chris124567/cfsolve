@@ -11,7 +11,6 @@ use anyhow::{Context, Result, bail, ensure};
 use indexmap::IndexMap;
 use url::Url;
 
-use crate::candidates;
 use crate::js::{JsObject, JsValue, Options, Payload, Window, json};
 use crate::listing::fold::DECODER_CELL;
 use crate::listing::query::Store;
@@ -22,6 +21,7 @@ use crate::stage2::payload::{
 };
 use crate::stage2::queries;
 use crate::vm::{Constant, Effect, Listing, Term};
+use crate::{candidates, challenge};
 
 /// Widget parameters passed to `turnstile.render`, excluding callbacks.
 const RENDER_PARAMETERS: [&str; 8] = [
@@ -322,7 +322,7 @@ impl Reader<'_> {
         })
     }
 
-    /// Recovers outcome fields from callbacks. Expiry writes `"expired"` and clears the token;
+    /// Recovers outcome fields from callbacks. Expiry writes its status and clears the token;
     /// success writes the token. Both call shared finishing functions.
     fn outcome(&self, callbacks: &BTreeMap<String, u32>, started: &str) -> Result<SettledFields> {
         let entry = |name: &str| {
@@ -334,9 +334,16 @@ impl Reader<'_> {
         let expired: Vec<&Store> = self
             .stores_in(self.index.function_at(entry("expired-callback")?))
             .collect();
+        // The status is `"expired"`, or in builds with hex names, one of those names.
         let status = expired
             .iter()
-            .find(|store| self.origin(store.pc, &store.value) == Some(literal(json!("expired"))))
+            .find(|store| {
+                matches!(
+                    self.origin(store.pc, &store.value),
+                    Some(Expression::Literal { value: JsValue::String(text) })
+                        if text == "expired" || challenge::is_hex_name(&text)
+                )
+            })
             .context("expiry callback writes no status")?
             .key
             .clone();

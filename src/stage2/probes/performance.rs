@@ -11,11 +11,12 @@ use serde::{Deserialize, Serialize};
 use crate::engine::Engine;
 use crate::js::{JsObject, JsValue, json};
 use crate::listing::fold::{self, Frame, Known};
+use crate::listing::query;
 use crate::resource_timing::{LoadTiming, NEXT_HOP_PROTOCOL};
 use crate::stage2::analysis::recognize::ProbeView;
 use crate::stage2::records::ProbePlan;
 use crate::stage2::registry::Operation;
-use crate::vm::{Effect, Exit, Listing, Term, dataflow};
+use crate::vm::{Effect, Exit, Instruction, Listing, Term, dataflow};
 
 /// How the probe writes the row of one entry type.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -184,6 +185,8 @@ enum Held {
     Duration,
     /// A property of another object, such as the record holding the output list.
     Field(String),
+    /// A property of such a property, such as `performance.mark` read from the global object.
+    Member(String),
     /// A string starting with this text.
     Prefixed(String),
 }
@@ -218,7 +221,31 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
             });
         }
     }
-    let starts = entries.into_iter().map(|pc| (pc, Frame::default()));
+    // Some builds read a property name from a register that an earlier block of the same
+    // function loaded. Registers every assignment in a function's own code sets to the same
+    // string hold it wherever that function reads them.
+    let fixed = |entry: u32| {
+        let mut assigned: BTreeMap<u8, Option<String>> = BTreeMap::new();
+        let assign = |_, instruction: &Instruction, pending: &mut Vec<u32>| {
+            pending.extend(instruction.exits());
+            for effect in instruction.effects() {
+                if let Effect::Set(register, value) = effect {
+                    let text = value.string().map(str::to_owned);
+                    let known = assigned.entry(*register).or_insert_with(|| text.clone());
+                    if *known != text {
+                        *known = None;
+                    }
+                }
+            }
+        };
+        query::walk(listing, entry, |_| true, assign);
+        let fixed: BTreeMap<u8, String> = assigned
+            .into_iter()
+            .filter_map(|(register, text)| Some((register, text?)))
+            .collect();
+        Frame::seeded(&fixed)
+    };
+    let starts = entries.into_iter().map(|pc| (pc, fixed(pc)));
     let ControlFlow::Continue(incoming) = dataflow::forward(listing, starts, |pc, path, frame| {
         frame.begin();
         let runs = fold::feasible(path, |term| frame.resolve(term));
@@ -256,9 +283,16 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
                 }
             }
             frame.follow(pc, &path.effects, evaluate, |frame, effect| {
-                // The probe creates its mark with `performance.mark(prefix + ray)`.
-                if let Some((Term::Get(_, key), [Term::Reg(argument)])) = effect.call()
-                    && is_text(frame, key, "mark")
+                // The probe creates its mark with `performance.mark(prefix + ray)`. Some builds
+                // load the method well before calling it with its receiver.
+                if let Some((callee, [Term::Reg(argument)])) = effect.call()
+                    && match callee {
+                        Term::Get(_, key) => is_text(frame, key, "mark"),
+                        callee => matches!(
+                            frame.resolve(callee),
+                            Some(Known::Ext(Held::Member(name))) if name == "mark"
+                        ),
+                    }
                     && let Some(Known::Ext(Held::Prefixed(prefix))) = frame.register(*argument)
                 {
                     mark_prefix = Some(prefix.clone());
@@ -416,6 +450,9 @@ fn evaluate(frame: &Frame<Held>, term: &Term) -> Option<Known<Held>> {
                 Known::Ext(Held::Property(name))
             }
             (None, Some(Known::Literal(JsValue::String(name)))) => Known::Ext(Held::Field(name)),
+            (Some(Known::Ext(Held::Field(_))), Some(Known::Literal(JsValue::String(name)))) => {
+                Known::Ext(Held::Member(name))
+            }
             _ => return None,
         },
         Term::Binary(BinaryOperator::Addition, left, _) => match frame.resolve(left)? {

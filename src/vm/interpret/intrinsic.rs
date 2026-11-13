@@ -8,6 +8,7 @@ use oxc::ast::ast::{Function, NumericLiteral, ObjectProperty};
 use oxc::ast_visit::{Visit, walk};
 use oxc::semantic::ScopeFlags;
 
+use super::access::Key;
 use super::copies::Copies;
 use super::mix32::Mix32;
 use super::register_helpers::{self, Helper};
@@ -36,13 +37,16 @@ pub(super) fn address(function: &Function<'_>) -> usize {
     ptr::from_ref(function).addr()
 }
 
-/// Finds register helpers and mixers, and validates BLAKE3 candidates taking five parameters
-/// and mentioning its initialization vector's first word, which some builds store complemented.
+/// Finds register accessors, register helpers, and mixers, and validates BLAKE3 candidates
+/// taking five parameters and mentioning its initialization vector's first word, which some
+/// builds store complemented.
 pub(crate) fn intrinsics(session: &Session<'_>) -> Intrinsics {
     let mut intrinsics = Intrinsics::default();
     let script = session.script;
     for function in session.functions.values() {
-        let intrinsic = if let Some(helper) = register_helpers::recognize(script, function) {
+        let intrinsic = if let Some(helper) =
+            register_helpers::recognize(script, session.accessors, function)
+        {
             Intrinsic::Register(helper)
         } else if let Some(mixer) = Mix32::recognize(script, function) {
             Intrinsic::Mix32(mixer)
@@ -86,6 +90,21 @@ impl Intrinsic {
             Self::Register(Helper::Mask) => {
                 return matches!(arguments.first(), Some(Value::Registers))
                     .then_some(Value::Undefined);
+            }
+            Self::Register(Helper::Read) => {
+                let [Value::Registers, index] = arguments else {
+                    return None;
+                };
+                let register = run.register(&Key::from(index.clone())).ok()?;
+                return Some(run.register_value(register));
+            }
+            Self::Register(Helper::Write) => {
+                let [Value::Registers, index, value] = arguments else {
+                    return None;
+                };
+                let register = run.register(&Key::from(index.clone())).ok()?;
+                run.write_register(register, value.clone());
+                return Some(Value::Undefined);
             }
             Self::Register(Helper::Pc) => run.session.layout.pc,
             Self::Register(Helper::Key) => run.session.layout.key,

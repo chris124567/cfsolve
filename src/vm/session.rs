@@ -17,7 +17,7 @@ use oxc::ast::ast::{
 use oxc::semantic::SymbolId;
 use oxc::syntax::operator::BinaryOperator;
 
-use super::extract::{self, RunMethod};
+use super::extract::{self, Accessors, RunFunction};
 use super::interpret::{self, Branching, Frozen, Intrinsics, Plans, Run, Spare, StringDecoder};
 use super::machine::Definition;
 use super::output::{Constant, Position, Term};
@@ -52,6 +52,8 @@ pub(crate) struct Session<'ast> {
     pub initial: Vec<(u8, Value<'ast>)>,
     /// Function used to decrypt string records stored in registers.
     pub record_decoder: Option<&'ast Function<'ast>>,
+    /// The register file's reader and writer, which the run function calls.
+    pub accessors: Option<Accessors<'ast>>,
     /// Script functions run natively.
     pub intrinsics: Intrinsics,
     /// The record decoder, run natively, if it has the recognized shape.
@@ -90,17 +92,19 @@ impl<'ast> Session<'ast> {
             ref prelude,
             ref functions,
             ref run,
+            entry,
             ..
         } = definition;
         let constructor = extract::constructor(class)?;
         let handlers = extract::handlers(script, functions, &run.dispatch)?;
-        let record_decoder = extract::record_decoder(script, body)
+        let record_decoder = extract::record_decoder(script, run.accessors.read)
             .and_then(|symbol| functions.get(&symbol).copied());
         let mut session = Self {
             functions: functions.clone(),
             handlers,
-            entry: extract::entry(body)?,
+            entry,
             record_decoder,
+            accessors: Some(run.accessors),
             ..Self::unevaluated(script, constructor)
         };
         (session.bindings, session.unavailable) =
@@ -137,6 +141,7 @@ impl<'ast> Session<'ast> {
             symbol_fields: Vec::new(),
             initial: Vec::new(),
             record_decoder: None,
+            accessors: None,
             intrinsics: Intrinsics::default(),
             string_decoder: None,
             fields: HashMap::default(),
@@ -434,7 +439,7 @@ fn concrete<'a>(mut fields: HashMap<String, Value<'a>>) -> HashMap<String, Value
 /// zero for the mask during analysis.
 fn recover_state<'a>(
     session: &mut Session<'a>,
-    names: &RunMethod<'_>,
+    names: &RunFunction<'_>,
     constructed: &Constructed<'a>,
 ) -> Result<()> {
     let fields = &constructed.fields;

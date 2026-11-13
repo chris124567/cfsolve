@@ -7,7 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use oxc::ast::ast::{CallExpression, Expression, MemberExpression, VariableDeclarator};
+use oxc::ast::ast::{
+    CallExpression, Expression, MemberExpression, StringLiteral, VariableDeclarator,
+};
 use oxc::ast_visit::{Visit, walk};
 use oxc::str::Ident;
 use serde::{Deserialize, Serialize};
@@ -166,8 +168,15 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
             });
         }
     }
-    // Programs that decode strings in place also hold the source as a descriptor.
-    let parsed = strings
+    // Programs that decode strings in place also hold the source as a descriptor. Some builds
+    // hide the worker's own strings behind a decoder in its source, which deobfuscation inlines.
+    let sources: Vec<String> = strings
+        .iter()
+        .filter(|text| text.contains("WebAssembly"))
+        .filter_map(|source| crate::deobfuscate(source.clone()).ok())
+        .map(|deobfuscated| deobfuscated.text)
+        .collect();
+    let parsed = sources
         .iter()
         .filter(|text| text.contains("WebAssembly.instantiate"))
         .find_map(|source| ParsedScript::parse("benchmark worker", source).ok())?;
@@ -307,17 +316,29 @@ impl<'a> Worker<'a> {
             plan_fields: Vec::new(),
         }
     }
-}
 
-impl<'a> Visit<'a> for Worker<'a> {
-    fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {
-        if let Some(value) = declaration.init.as_ref().and_then(ast::static_str)
-            && let Ok(bytes) = STANDARD.decode(value)
+    /// Takes `text` as the module if it is a module's base64.
+    fn module_text(&mut self, text: &str) {
+        if let Ok(bytes) = STANDARD.decode(text)
             && bytes.starts_with(b"\0asm")
         {
             self.module = Some(bytes);
         }
+    }
+}
+
+impl<'a> Visit<'a> for Worker<'a> {
+    fn visit_variable_declarator(&mut self, declaration: &VariableDeclarator<'a>) {
+        if let Some(value) = declaration.init.as_ref().and_then(ast::static_str) {
+            self.module_text(value);
+        }
         walk::walk_variable_declarator(self, declaration);
+    }
+    /// Deobfuscation inlines a module used once, as in `instantiate(decode("AGFzbQ..."))`.
+    fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
+        if let Some(text) = literal.value.as_str() {
+            self.module_text(text);
+        }
     }
     fn visit_member_expression(&mut self, member: &MemberExpression<'a>) {
         if let MemberExpression::StaticMemberExpression(field) = member

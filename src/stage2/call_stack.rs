@@ -1,29 +1,28 @@
 //! Reconstructs `new Error()` stacks from the original script: the checkbox click's, the stack
 //! probe's, and the challenge page's render call.
 //!
-//! The chain runs from the listener through the VM's runner and `run` method to the opcode
+//! The chain runs from the listener through the VM's runner and run function to the opcode
 //! handler that constructs the error. Some builds use the runner directly as listener; others
 //! add an arity-specific wrapper. Forwarders, helper-object methods, and selector-based
 //! `Reflect.apply` helpers add their own frames. Recovery decodes only the string table,
 //! preserving original positions and method keys.
 //!
-//! V8 names frames by call form, such as `Class.run` or `HTMLInputElement.<anonymous>`, and
+//! V8 names frames by call form, such as `Class.handler` or `HTMLInputElement.<anonymous>`, and
 //! uses callee positions. JavaScriptCore names them by definition, leaving many methods
 //! anonymous, uses the opening argument parenthesis, and includes native `Reflect.construct`
 //! frames. The script is sloppy code, so JavaScriptCore does not eliminate tail calls.
 
 use std::collections::{HashMap, HashSet};
-use std::mem;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use oxc::ast::AstKind;
 use oxc::ast::ast::{
     Argument, ArrayExpression, ArrayExpressionElement, AssignmentExpression, AssignmentTarget,
-    BindingPattern, CallExpression, Class, ClassElement, Expression, FormalParameter, Function,
-    MemberExpression, MethodDefinition, MethodDefinitionKind, NewExpression, ObjectExpression,
-    ObjectProperty, ObjectPropertyKind, PropertyKind, Statement, SwitchCase, SwitchStatement,
-    ThrowStatement, TryStatement, VariableDeclarator,
+    BindingPattern, CallExpression, Class, Expression, FormalParameter, Function, MemberExpression,
+    MethodDefinition, NewExpression, ObjectExpression, ObjectProperty, ObjectPropertyKind,
+    PropertyKind, Statement, SwitchCase, SwitchStatement, ThrowStatement, TryStatement,
+    VariableDeclarator,
 };
 use oxc::ast_visit::{Visit, walk};
 use oxc::semantic::SymbolId;
@@ -238,12 +237,12 @@ pub fn recover_method_call(
     })
 }
 
-/// Dispatch loop called by `run`, with details used to check stack recovery offline.
+/// Dispatch loop called by the run function, with details used to check stack recovery offline.
 #[derive(Debug, Serialize)]
 pub struct DispatchSummary {
     pub function: String,
     pub guarded: bool,
-    /// V8 frames from the dispatch loop to `run`, innermost first.
+    /// V8 frames from the dispatch loop to the run function, innermost first.
     pub frames: Vec<String>,
     /// Number of opcodes dispatched by the loop.
     pub opcodes: usize,
@@ -251,7 +250,8 @@ pub struct DispatchSummary {
     pub unresolved: Vec<u8>,
 }
 
-/// Summarizes dispatch loops called by `run`, including whether each case resolves to a function.
+/// Summarizes dispatch loops called by the run function, including whether each case resolves to
+/// a function.
 pub fn dispatch_summary(source: &str, cases: &CaseOpcodes) -> Result<Vec<DispatchSummary>> {
     let decoded = deobfuscate::decode(source.to_owned())?;
     let machine = Machine::new(decoded.script(), cases)?;
@@ -277,7 +277,7 @@ pub fn dispatch_summary(source: &str, cases: &CaseOpcodes) -> Result<Vec<Dispatc
                 unresolved.push(opcode);
             }
         }
-        let frames = dispatch_loop.call.frames(Name::same("run".to_owned()));
+        let frames = dispatch_loop.call.frames(machine.run.frame());
         summaries.push(DispatchSummary {
             function: name.to_owned(),
             guarded: dispatch_loop.guarded,
@@ -399,42 +399,48 @@ impl Callee<'_> {
     }
 }
 
-/// The VM dispatch method, its runner, and listeners that wrap the runner for each closure
-/// parameter count.
+/// The VM's run function, the closure runner that calls it, and listeners that wrap the closure
+/// runner for each closure parameter count.
 struct Machine<'a, 'cases> {
     script: Script<'a>,
-    dispatch: DispatchMethod<'a>,
-    /// The dispatch loops `run` calls.
+    run: RunFunction<'a>,
+    /// The dispatch loops the run function calls.
     loops: Vec<DispatchLoop<'a>>,
     cases: &'cases CaseOpcodes,
-    runner: Call,
+    /// Frames from the call to the run function out to the closure runner, innermost first.
+    runner: Vec<Call>,
     listeners: Vec<Invocation<'a>>,
 }
 
 impl<'a, 'cases> Machine<'a, 'cases> {
     fn new(js: ast::Script<'a>, cases: &'cases CaseOpcodes) -> Result<Self> {
-        let mut script = Script::new(js);
-        let classes = mem::take(&mut script.classes);
-        // The runner passes the closure's program counter, key, and arguments to `run`,
-        // copying arguments when required by the VM function.
+        let script = Script::new(js);
+        let run = RunFunction::installed(&script)?;
+        // The closure runner passes the machine and the closure's program counter, key, and
+        // arguments to the run function, copying arguments when required by the VM function.
         let mut runners = Vec::new();
         for (name, function) in &script.functions {
+            let caller = Callee::Binding(*name);
+            let caller_name = script.appliers.name(caller);
+            let scope = Scope::new(caller_name, function, &script.appliers);
             for call in calls_of(js, function) {
-                let calls_run = member(&call.callee)
-                    .is_some_and(|member| ast::member_str(member) == Some("run"));
-                if calls_run
-                    && call.arguments.len() == 3
+                let Ok(target) = scope.target(call) else {
+                    continue;
+                };
+                if target.callee == Some(run.name)
+                    && let Some(handed) = handed(Arguments::of(call), &target)
+                    && let [_, _, _, Operand::Expression(cells)] = handed[..]
                     && matches!(
-                        ast::argument_expression(&call.arguments[2]),
+                        cells.without_parentheses(),
                         Expression::ConditionalExpression(_)
                     )
                 {
-                    runners.push((*name, call));
+                    runners.push((caller, target.frames(Name::same(caller_name.to_owned()))));
                 }
             }
         }
-        let (runner, run_call) = candidates::exactly_one(runners, "closure-to-VM runner call")?;
-        let runner = Callee::Binding(runner);
+        let (runner, runner_frames) =
+            candidates::exactly_one(runners, "closure-to-VM runner call")?;
         let mut listeners = Listeners {
             runner,
             appliers: &script.appliers,
@@ -442,18 +448,14 @@ impl<'a, 'cases> Machine<'a, 'cases> {
         };
         listeners.visit_program(js.program);
         let listeners: Vec<Invocation> = listeners.found.into_iter().collect::<Result<_>>()?;
-        let dispatches = classes.into_iter().filter_map(|dispatch| {
-            let loops = dispatch_loops(&script, &dispatch.run);
-            (!loops.is_empty()).then_some((dispatch, loops))
-        });
-        let (dispatch, loops) = candidates::exactly_one(dispatches, "VM dispatch method")?;
+        let loops = dispatch_loops(&script, &run);
+        if loops.is_empty() {
+            bail!("the run function calls no dispatch loop");
+        }
         Ok(Self {
-            runner: Call {
-                name: Name::same(script.appliers.name(runner).to_owned()),
-                site: Site::new(run_call),
-            },
+            runner: runner_frames,
             listeners,
-            dispatch,
+            run,
             loops,
             script,
             cases,
@@ -482,7 +484,7 @@ impl<'a, 'cases> Machine<'a, 'cases> {
             let name = appliers.name(handler);
             let frame = Name {
                 v8: if dispatch.method {
-                    format!("{}.{name}", self.dispatch.class)
+                    format!("{}.{name}", self.run.class)
                 } else {
                     name.to_owned()
                 },
@@ -498,17 +500,14 @@ impl<'a, 'cases> Machine<'a, 'cases> {
         bail!("no dispatch of opcode {opcode} (guarded: {guarded})")
     }
 
-    /// Appends frames from the call to `handler` through the dispatch loop, `run`, and the runner.
+    /// Appends frames from the call to `handler` through the dispatch loop, the run function, and
+    /// the closure runner.
     fn entered(&self, handler: &Handler<'a, '_>, mut frames: Vec<Call>) -> Vec<Call> {
-        let DispatchMethod { class, key, .. } = &self.dispatch;
         let dispatch_loop = handler.dispatch_loop;
         let name = self.script.appliers.name(dispatch_loop.name);
         frames.extend(handler.dispatch.frames(Name::same(name.to_owned())));
-        frames.extend(dispatch_loop.call.frames(Name {
-            v8: format!("{class}.run"),
-            jsc: key.unwrap_or_default().to_owned(),
-        }));
-        frames.push(self.runner.clone());
+        frames.extend(dispatch_loop.call.frames(self.run.frame()));
+        frames.extend(self.runner.iter().cloned());
         frames
     }
 
@@ -620,7 +619,7 @@ impl<'a, 'cases> Machine<'a, 'cases> {
     }
 }
 
-/// The function `run` calls for an opcode.
+/// The function a dispatch loop calls for an opcode.
 struct Handler<'a, 'machine> {
     /// Call from the dispatch loop to this handler.
     dispatch: Invocation<'a>,
@@ -629,10 +628,10 @@ struct Handler<'a, 'machine> {
     dispatch_loop: &'machine DispatchLoop<'a>,
 }
 
-/// Function called by `run` with the machine to dispatch opcodes.
+/// Function called by the run function with the machine to dispatch opcodes.
 struct DispatchLoop<'a> {
     name: Callee<'a>,
-    /// Call from `run`, either direct or through a helper.
+    /// Call from the run function, either direct or through a helper.
     call: Invocation<'a>,
     /// Whether the call occurs in a `try` block that handles exceptions.
     guarded: bool,
@@ -642,10 +641,11 @@ struct DispatchLoop<'a> {
 /// helper switch.
 const DISPATCH_CASES: usize = 40;
 
-/// Finds functions with dispatch switches that `run` calls with the machine.
-fn dispatch_loops<'a>(script: &Script<'a>, run: &Body<'a>) -> Vec<DispatchLoop<'a>> {
+/// Finds functions with dispatch switches that the run function calls with the machine.
+fn dispatch_loops<'a>(script: &Script<'a>, run: &RunFunction<'a>) -> Vec<DispatchLoop<'a>> {
     struct Calls<'a> {
         js: ast::Script<'a>,
+        machine: SymbolId,
         found: Vec<(&'a CallExpression<'a>, bool)>,
         guarded: bool,
     }
@@ -671,10 +671,8 @@ fn dispatch_loops<'a>(script: &Script<'a>, run: &Body<'a>) -> Vec<DispatchLoop<'
         fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
             if !is_optional_call(call)
                 && call.arguments.iter().any(|argument| {
-                    matches!(
-                        ast::argument_expression(argument),
-                        Expression::ThisExpression(_)
-                    )
+                    self.js
+                        .refers_to(ast::argument_expression(argument), self.machine)
                 })
             {
                 let call = self.js.lend(call, AstKind::as_call_expression);
@@ -685,11 +683,12 @@ fn dispatch_loops<'a>(script: &Script<'a>, run: &Body<'a>) -> Vec<DispatchLoop<'
     }
     let mut calls = Calls {
         js: script.js(),
+        machine: run.machine,
         found: Vec::new(),
         guarded: false,
     };
-    run.visit(&mut calls);
-    let scope = Scope::new("", run, &script.appliers);
+    run.body.visit(&mut calls);
+    let scope = Scope::new(run.frame_name, &run.body, &script.appliers);
     calls
         .found
         .into_iter()
@@ -773,11 +772,10 @@ impl<'a> Body<'a> {
     }
 }
 
-/// The script's declared and assigned functions, VM dispatch methods, and aliases for
-/// `Reflect.construct` and `Reflect.apply`.
+/// The script's declared and assigned functions, and aliases for `Reflect.construct` and
+/// `Reflect.apply`.
 struct Script<'a> {
     functions: Vec<(Binding<'a>, Body<'a>)>,
-    classes: Vec<DispatchMethod<'a>>,
     constructs: Vec<Callee<'a>>,
     /// Array slots containing `Reflect.construct`, indexed by array and slot.
     construct_slots: Vec<(Binding<'a>, usize)>,
@@ -993,12 +991,70 @@ fn number<'a>(expression: &Expression<'a>, constants: &Constants<'a>) -> Option<
     })
 }
 
-/// Finds the VM class method `run` that calls the dispatch loops.
-struct DispatchMethod<'a> {
+/// The VM's run function, which calls the dispatch loops. The program runner installs it as
+/// `<global>.<name> = function(p) { return <run>(new <Class>(p), pc, key, []); }`, possibly
+/// calling it through a helper.
+struct RunFunction<'a> {
+    /// The VM class, which V8 names handlers called as methods of the machine after.
     class: &'a str,
-    run: Body<'a>,
-    /// The method's literal property key, if present.
-    key: Option<&'a str>,
+    name: Callee<'a>,
+    /// The run function's name in the source, which both engines name its frame after.
+    frame_name: &'a str,
+    body: Body<'a>,
+    /// The parameter receiving the machine.
+    machine: SymbolId,
+}
+
+impl<'a> RunFunction<'a> {
+    /// Finds the run function from the one program runner.
+    fn installed(script: &Script<'a>) -> Result<Self> {
+        let js = script.js();
+        let mut found = Vec::new();
+        for function in js.functions() {
+            let body = Body::of(function);
+            let Some(Statement::ReturnStatement(returned)) = body.only_statement() else {
+                continue;
+            };
+            let Some(Expression::CallExpression(call)) = &returned.argument else {
+                continue;
+            };
+            let Ok(target) = Scope::new("", &body, &script.appliers).target(call) else {
+                continue;
+            };
+            if let Some(name) = target.callee
+                && let Some(handed) = handed(Arguments::of(call), &target)
+                && let [
+                    Operand::Expression(machine),
+                    _,
+                    _,
+                    Operand::Expression(cells),
+                ] = handed[..]
+                && let Expression::NewExpression(machine) = machine.without_parentheses()
+                && let Expression::Identifier(class) = &machine.callee
+                && array(cells).is_some_and(|cells| cells.elements.is_empty())
+            {
+                found.push((name, class.name.as_str()));
+            }
+        }
+        let (name, class) = candidates::exactly_one(found, "program runner")?;
+        let body = script.function(name)?;
+        let machine = body
+            .parameters()
+            .and_then(|parameters| parameters.first().copied())
+            .context("the run function takes no machine")?;
+        Ok(Self {
+            class,
+            name,
+            frame_name: script.appliers.name(name),
+            body,
+            machine,
+        })
+    }
+
+    /// The run function's frame.
+    fn frame(&self) -> Name {
+        Name::same(self.frame_name.to_owned())
+    }
 }
 
 impl<'a> Script<'a> {
@@ -1013,7 +1069,6 @@ impl<'a> Script<'a> {
         let appliers = Appliers::new(js, &functions);
         let mut script = Self {
             functions,
-            classes: Vec::new(),
             constructs: Vec::new(),
             construct_slots: Vec::new(),
             applies: Vec::new(),
@@ -1021,10 +1076,8 @@ impl<'a> Script<'a> {
             appliers,
         };
         for node in js.nodes.iter() {
-            match node.kind() {
-                AstKind::AssignmentExpression(assignment) => script.assignment(assignment),
-                AstKind::Class(class) if class.is_declaration() => script.class(class),
-                _ => {}
+            if let AstKind::AssignmentExpression(assignment) = node.kind() {
+                script.assignment(assignment);
             }
         }
         script
@@ -1066,28 +1119,6 @@ impl<'a> Script<'a> {
                 Some("apply") => self.apply_slots.push(slot),
                 _ => {}
             }
-        }
-    }
-
-    /// Records a class declaration's `run` method.
-    fn class(&mut self, class: &'a Class<'a>) {
-        let run = class.body.body.iter().find_map(|element| match element {
-            ClassElement::MethodDefinition(method)
-                if method.kind != MethodDefinitionKind::Constructor
-                    && ast::static_key_str(&method.key, method.computed) == Some("run") =>
-            {
-                Some(method)
-            }
-            _ => None,
-        });
-        if let Some(method) = run
-            && let Some(name) = &class.id
-        {
-            self.classes.push(DispatchMethod {
-                class: name.name.as_str(),
-                run: Body::of(&method.value),
-                key: ast::key_str(&method.key, method.computed),
-            });
         }
     }
 
@@ -1983,8 +2014,9 @@ impl<'a, 's> Scope<'a, 's> {
         }
     }
 
-    /// Records forwarders defined by an object literal assigned to `holder`. Uses property keys as
-    /// function names, including computed keys.
+    /// Records forwarders defined by an object literal assigned to `holder`. V8 names functions
+    /// by their property keys, including computed keys. JavaScriptCore leaves functions under
+    /// computed keys anonymous: obfuscation computes them with string decoder calls.
     fn literal(&mut self, holder: Holder<'a>, object: &'a ObjectExpression<'a>) {
         // Matches `key: function` properties and methods, but not accessors.
         for property in &object.properties {
@@ -1992,7 +2024,14 @@ impl<'a, 's> Scope<'a, 's> {
                 && let Expression::FunctionExpression(function) = &property.value
                 && property.kind == PropertyKind::Init
                 && let Some(key) = ast::static_key_str(&property.key, property.computed)
-                && let Some(frames) = self.forwarder(function, Name::same(key.to_owned()))
+                && let Some(frames) = self.forwarder(
+                    function,
+                    if property.computed {
+                        Name::anonymous(key.to_owned())
+                    } else {
+                        Name::same(key.to_owned())
+                    },
+                )
             {
                 let forwarder = Forwarder {
                     method: frames.clone(),

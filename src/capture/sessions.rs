@@ -8,21 +8,21 @@
 //! Each session directory holds the original and rewritten HTML, the full log `session.json`,
 //! and `capture.json`, which `cargo run --example build_profile` turns into `answers.json`.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::{fs, str};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use num_bigint::BigUint;
 use oxc::ast::ast::Program;
 use oxc::ast_visit::Visit;
 use serde::{Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::task::JoinSet;
 use url::Url;
 
 use super::rsa::{ProxyKey, Rewrapped};
-use crate::challenge::codec::{Codec, KEY_LENGTH};
+use crate::challenge::codec::{Codec, Envelope, KEY_LENGTH, SEED_LENGTH};
 use crate::challenge::program::{self, PreparedSession};
 use crate::deobfuscate::Encoded;
 use crate::js::ast;
@@ -354,4 +354,88 @@ pub(super) fn scan_alphabet(program: &Program<'_>, strings: &[Encoded]) -> Resul
     let mut candidates = ast::string_literals(|literals| literals.visit_program(program));
     candidates.extend(strings.iter().map(|string| string.decoded.clone()));
     program::base64_alphabet(candidates)
+}
+
+/// Reads the payloads of a session the proxy logged without them, as when extraction failed
+/// during capture, using each POST's logged seed and the parameters extraction recovers from
+/// `original.html`. Writes the completed session to `out_dir` and returns how many payloads were
+/// read.
+pub fn reread(session_dir: &Path, out_dir: &Path) -> Result<usize> {
+    let read = |name: &str| {
+        let path = session_dir.join(name);
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+    };
+    let original = read("original.html")?;
+    let mut log: Value = serde_json::from_str(&read("session.json")?)?;
+    let mut capture: Value = serde_json::from_str(&read("capture.json")?)?;
+    let codec = extract_codec(&original)?;
+    let logged_modulus = log["realModulus"]
+        .as_str()
+        .context("the log has no real modulus")?;
+    ensure!(
+        format!("{:x}", codec.modulus) == logged_modulus,
+        "extraction finds another modulus than the one the proxy swapped"
+    );
+    let engine = challenge::codec::engine(&codec.alphabet_text)?;
+    let mut payloads = Vec::new();
+    let mut notes = Vec::new();
+    for post in log["posts"]
+        .as_array_mut()
+        .context("the log has no posts")?
+    {
+        let url = post["url"].as_str().unwrap_or_default().to_owned();
+        let read_post = || -> Result<Value> {
+            let seed = post["seed"]
+                .as_str()
+                .context("the POST has no logged seed")?;
+            let body = post["encryptedBody"]
+                .as_str()
+                .context("the POST has no body")?;
+            Envelope::decode(body, &engine)?.payload(&seed_bytes(seed)?, &codec.secret)
+        };
+        match read_post() {
+            Ok(payload) => {
+                post["payload"] = payload.clone();
+                payloads.push(json!({"url": url, "payload": payload}));
+            }
+            Err(error) => notes.push(format!("POST {url}: {error:#}")),
+        }
+    }
+    let count = payloads.len();
+    log["alphabet"] = Value::from(codec.alphabet_text);
+    log["secret"] = Value::from(String::from_iter(codec.secret.map(char::from)));
+    log["complete"] = Value::from(notes.is_empty());
+    log["notes"] = Value::from(notes);
+    capture["payloads"] = Value::from(payloads);
+    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    for name in ["original.html", "rewritten.html"] {
+        let from = session_dir.join(name);
+        if from.exists() {
+            fs::copy(&from, out_dir.join(name))
+                .with_context(|| format!("copying {}", from.display()))?;
+        }
+    }
+    write_file(
+        &out_dir.join("session.json"),
+        serde_json::to_string_pretty(&log)?,
+    )?;
+    write_file(
+        &out_dir.join("capture.json"),
+        serde_json::to_string_pretty(&capture)?,
+    )?;
+    Ok(count)
+}
+
+/// Parses a seed the log holds as lowercase hex.
+fn seed_bytes(hex: &str) -> Result<[u8; SEED_LENGTH]> {
+    ensure!(
+        hex.len() == 2 * SEED_LENGTH,
+        "a {SEED_LENGTH}-byte value needs {} hex digits",
+        2 * SEED_LENGTH
+    );
+    let mut seed = [0; SEED_LENGTH];
+    for (byte, pair) in seed.iter_mut().zip(hex.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(str::from_utf8(pair)?, 16)?;
+    }
+    Ok(seed)
 }

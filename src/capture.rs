@@ -19,4 +19,5 @@ pub use ca::CertificateAuthority;
 pub use profile::fill as fill_profile;
 pub use proxy::{CA_HOST, CA_PATH, CHALLENGE_HOST, CaptureProxy, Config};
 pub use recorded::{CapturedSession, Recording};
+pub use sessions::reread as reread_session;
 pub use upstream::{Credentials, UpstreamProxy};

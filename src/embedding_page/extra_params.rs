@@ -291,17 +291,17 @@ pub(crate) struct ExtraParams<'page> {
     pub retry_interval: i64,
     /// Both sides check this before reading a message.
     pub source: &'static str,
+    #[serde(flatten)]
+    pub times: ElapsedTimes,
     pub upgrade_attempts: u32,
     pub upgrade_completed_count: u32,
     pub url: &'page str,
     #[serde(rename = "wPr")]
     pub signals: PageSignals,
     pub widget_id: &'page str,
-    #[serde(flatten)]
-    pub times: ElapsedTimes,
 }
 
-/// Elapsed loader times reported at the end of [`ExtraParams`], in milliseconds.
+/// Elapsed loader times reported in [`ExtraParams`], in milliseconds.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ElapsedTimes {

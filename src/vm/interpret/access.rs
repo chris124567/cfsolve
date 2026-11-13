@@ -377,8 +377,6 @@ impl<'ast> Run<'ast, '_> {
     fn register_member(&self, member: Member) -> Value<'ast> {
         let layout = self.session.layout;
         match member {
-            Member::Read => Value::function(Callable::Builtin(Builtin::RegisterRead)),
-            Member::Write => Value::function(Callable::Builtin(Builtin::RegisterWrite)),
             Member::Mask => Value::Number(0.0),
             Member::Integer => Value::Number(1.0),
             Member::Pc => self.register_value(layout.pc),

@@ -300,7 +300,7 @@ mod tests {
                 window.pushTrace(value);
             }
         };
-        window.vlJM8 = function(p) { return new M(p).run(0, 1, []); };
+        window.vlJM8 = function(p) { return run(new M(p), 0, 1, []); };
         function start() { window.vlJM8("initial", window); }
         function ready() { window.replaceTrace("fresh-root"); start(); }
         function response(body) {

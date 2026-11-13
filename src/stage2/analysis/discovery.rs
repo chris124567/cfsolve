@@ -284,10 +284,13 @@ fn collection_strings(
             }
         },
     );
-    (
-        without_inline_descriptors(strings.into_values().flatten()),
-        outputs,
-    )
+    // Text the program decodes with its own decoders stands for the decoded text that follows.
+    let encoded = &index.listing().encoded;
+    let strings = strings
+        .into_values()
+        .flatten()
+        .filter(|text| !encoded.contains(text));
+    (without_inline_descriptors(strings), outputs)
 }
 
 /// Drops string descriptors the program decodes in place, keeping the decoded text that follows

@@ -9,10 +9,10 @@ use ego_tree::{NodeId, NodeRef};
 use html5ever::{Attribute, QualName, ns};
 use scraper::node::Element;
 use scraper::{ElementRef, Html, Node, Selector};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use url::Url;
 
-use crate::js::JsObject;
+use crate::js::{JsObject, JsValue, json};
 
 /// Implicit render collects containers with this class.
 const CONTAINER_CLASS: &str = "cf-turnstile";
@@ -194,88 +194,107 @@ pub(crate) struct RenderedPage {
     parent: ParentInfo,
 }
 
-/// `wPr`: what `api.js` reports about the page around the widget. Fields serialize in the
-/// order `api.js` writes them, which the message keeps.
-#[derive(Clone, Debug, Serialize)]
+/// `wPr`: what `api.js` reports about the page around the widget, sent as the array
+/// [`Self::elements`].
+#[derive(Clone, Debug)]
 pub(crate) struct PageSignals {
-    #[serde(rename = "d.cT")]
     pub custom_element_tags: Vec<String>,
-    #[serde(rename = "ht.atrs")]
     pub root_attributes: Vec<String>,
-    #[serde(rename = "pg.ref")]
     pub referrer: String,
-    #[serde(rename = "pi")]
     pub parent: ParentInfo,
-    #[serde(rename = "w.iW")]
     pub inner_width: u32,
 }
 
-/// `pi`: the widget's place in the page. The parent info probe copies these properties by
-/// their `api.js` names.
-#[derive(Clone, Debug, Serialize)]
+impl PageSignals {
+    /// The array `api.js` sends. Its order is that of the named fields earlier builds sent,
+    /// noted beside each element. `pac` and `pad` are `undefined` when `api.js` leaves them out.
+    #[must_use]
+    pub(crate) fn elements(&self) -> Vec<JsValue> {
+        let parent = &self.parent;
+        let viewport = &parent.viewport;
+        let optional = |value: Option<String>| value.map_or(JsValue::Undefined, JsValue::String);
+        vec![
+            json!(self.custom_element_tags),  // d.cT
+            json!(self.root_attributes),      // ht.atrs
+            json!(self.referrer),             // pg.ref
+            json!(parent.form),               // pi.ffp
+            json!(parent.in_iframe),          // pi.ii
+            json!(parent.location),           // pi.lH
+            json!(parent.meta),               // pi.mL
+            optional(parent.pac.clone()),     // pi.pac
+            optional(parent.pad.clone()),     // pi.pad
+            json!(parent.fingerprint),        // pi.pfp
+            json!(parent.scripts),            // pi.sL
+            json!(parent.same_realm),         // pi.sR
+            json!(parent.stylesheets),        // pi.ssL
+            json!(parent.title),              // pi.t
+            json!(parent.elements),           // pi.tL
+            json!(parent.appearance),         // pi.vDa
+            json!(parent.error_handled),      // pi.vDeh
+            json!(parent.host),               // pi.vDhp
+            json!(parent.hidden_reason),      // pi.vDhr
+            json!(parent.implicit),           // pi.vDie
+            json!(parent.mode),               // pi.vDmd
+            json!(parent.mount),              // pi.vDmt
+            json!(parent.reasons),            // pi.vDrs
+            json!(parent.user_hidden),        // pi.vDuh
+            json!(viewport.height),           // pi.vDvp.height
+            json!(viewport.visibility_state), // pi.vDvp.visibilityState
+            json!(viewport.width),            // pi.vDvp.width
+            json!(parent.widget_position),    // pi.wp
+            json!(parent.xpath),              // pi.xp
+            json!(self.inner_width),          // w.iW
+        ]
+    }
+}
+
+/// Writes [`PageSignals::elements`], with `undefined` as `null`.
+impl Serialize for PageSignals {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        JsValue::Array(self.elements()).serialize(serializer)
+    }
+}
+
+/// `pi`: the widget's place in the page.
+#[derive(Clone, Debug)]
 pub(crate) struct ParentInfo {
     /// The enclosing form's method and controls, or `nf` if there is no form.
-    #[serde(rename = "ffp")]
     pub form: String,
-    #[serde(rename = "ii")]
     pub in_iframe: bool,
-    #[serde(rename = "lH")]
     pub location: String,
-    #[serde(rename = "mL")]
     pub meta: usize,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pac: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub pad: Option<String>,
-    #[serde(rename = "pfp")]
     pub fingerprint: String,
-    #[serde(rename = "sL")]
     pub scripts: usize,
-    #[serde(rename = "sR")]
     pub same_realm: bool,
-    #[serde(rename = "ssL")]
     pub stylesheets: usize,
     /// The title's UTF-16 length and djb2 hash.
-    #[serde(rename = "t")]
     pub title: String,
-    #[serde(rename = "tL")]
     pub elements: usize,
-    #[serde(rename = "vDa")]
     pub appearance: String,
-    #[serde(rename = "vDeh")]
     pub error_handled: bool,
-    #[serde(rename = "vDhp")]
     pub host: &'static str,
     /// Why the widget is hidden; `null` while it shows.
-    #[serde(rename = "vDhr")]
     pub hidden_reason: Option<String>,
     /// Whether the loader rendered the widget from the page's markup.
-    #[serde(rename = "vDie")]
     pub implicit: bool,
     /// The challenge mode the iframe reported.
-    #[serde(rename = "vDmd")]
     pub mode: Option<String>,
-    #[serde(rename = "vDmt")]
     pub mount: &'static str,
     /// Why the widget was re-rendered; empty on a first render.
-    #[serde(rename = "vDrs")]
     pub reasons: Vec<String>,
-    #[serde(rename = "vDuh")]
     pub user_hidden: bool,
-    #[serde(rename = "vDvp")]
     pub viewport: Viewport,
     /// The wrapper's top and right edges.
-    #[serde(rename = "wp")]
     pub widget_position: String,
-    #[serde(rename = "xp")]
     pub xpath: String,
 }
 
 /// `vDvp`: the page's viewport.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Viewport {
     pub height: u32,
-    #[serde(rename = "visibilityState")]
     pub visibility_state: String,
     pub width: u32,
 }
@@ -987,26 +1006,15 @@ mod tests {
             ..Layout::default()
         };
         let signals = embedding_page::tests::page().signals(&layout, Some("managed"));
-        // Recorded from a real browser rendering exactly this page.
-        let expected = json!({
-            "d.cT": [],
-            "ht.atrs": [],
-            "pg.ref": "",
-            "pi": {
-                "ffp": "nf", "ii": false, "lH": "http://127.0.0.1:8000/index.html", "mL": 1,
-                "pac": "n", "pad": "n|n|n|0|0|0|0|",
-                "pfp": "htm>hea>met_ch>tit>-tscr_sr_as_de>-tbod>h1>p>-tdiv_cl_da_da_da>-t",
-                "sL": 1, "sR": true, "ssL": 0, "t": "19|3058264090", "tL": 12,
-                "vDa": "always", "vDeh": false, "vDhp": "wrapper", "vDhr": null,
-                "vDie": true, "vDmd": "managed", "vDmt": "wrapper", "vDrs": [],
-                "vDuh": false,
-                "vDvp": {"height": 813, "visibilityState": "hidden", "width": 1280},
-                "wp": "113.875|1272", "xp": "/div[1]/div[1]"
-            },
-            "w.iW": 1280
-        });
-        // Field order is part of the message, so compare the serialized text.
-        assert_eq!(json!(signals).stringify(), expected.stringify());
+        // Recorded from a real browser rendering exactly this page. Order is part of the message,
+        // so compare the serialized text.
+        let expected = concat!(
+            r#"[[],[],"","nf",false,"http://127.0.0.1:8000/index.html",1,"n","n|n|n|0|0|0|0|","#,
+            r#""htm>hea>met_ch>tit>-tscr_sr_as_de>-tbod>h1>p>-tdiv_cl_da_da_da>-t",1,true,0,"#,
+            r#""19|3058264090",12,"always",false,"wrapper",null,true,"managed","wrapper",[],"#,
+            r#"false,813,"hidden",1280,"113.875|1272","/div[1]/div[1]",1280]"#,
+        );
+        assert_eq!(json!(signals).stringify().as_deref(), Some(expected));
     }
 
     /// Checks `ffp`, `pac`, and `pad` for forms and nearby controls. Without a surrounding
@@ -1044,8 +1052,8 @@ mod tests {
             cases.push((nested(depth), if depth <= 3 { newsletter } else { none }));
         }
         for (html, expected) in cases {
-            let pi = &signals(&html)["pi"];
-            assert_eq!([&pi["ffp"], &pi["pac"], &pi["pad"]], expected, "{html}");
+            let signals = signals(&html);
+            assert_eq!([&signals[3], &signals[7], &signals[8]], expected, "{html}");
         }
     }
 
@@ -1061,9 +1069,12 @@ mod tests {
             json!(page.unwrap().signals(&Layout::default(), None))
         };
         let challenge = rendered("data");
-        assert!(challenge["pi"].get("pac").is_none());
-        assert!(challenge["pi"].get("pad").is_none());
-        assert_eq!(rendered("")["pi"]["pac"], "n");
+        assert_eq!(
+            [&challenge[7], &challenge[8]],
+            [&JsValue::Null; 2],
+            "`undefined` in place"
+        );
+        assert_eq!(rendered("")[7], "n");
     }
 
     #[test]
@@ -1143,7 +1154,7 @@ mod tests {
         let html = format!(
             r#"<html><body><div{attributes}></div><div class="cf-turnstile" data-sitekey="k"></div></body></html>"#
         );
-        let shape = signals(&html)["pi"]["pfp"].as_str().unwrap().to_owned();
+        let shape = signals(&html)[9].as_str().unwrap().to_owned();
         assert_eq!(shape.encode_utf16().count(), FINGERPRINT_LIMIT);
     }
 }

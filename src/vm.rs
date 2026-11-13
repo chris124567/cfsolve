@@ -14,6 +14,7 @@ mod convert;
 pub(crate) mod dataflow;
 mod disassemble;
 mod dispatch;
+mod encoded_strings;
 mod extract;
 mod interpret;
 mod machine;

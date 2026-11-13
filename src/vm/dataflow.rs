@@ -22,6 +22,14 @@ impl<K: Ord + Clone, V: PartialEq + Clone> Facts for BTreeMap<K, V> {
     }
 }
 
+/// Sets `key` to `value`, or forgets it when `value` is unknown.
+pub(crate) fn assign<K: Ord, V>(facts: &mut BTreeMap<K, V>, key: K, value: Option<V>) {
+    match value {
+        Some(value) => facts.insert(key, value),
+        None => facts.remove(&key),
+    };
+}
+
 /// Computes entry facts for instructions reachable from `entries`. `transfer` updates a copy of
 /// facts for one instruction path and reports whether it can run, or stops the analysis. Facts
 /// propagate through the exit only if the path can run.

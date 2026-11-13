@@ -170,12 +170,21 @@ pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
         received: received.clone(),
         opened: opened.clone(),
         round_trips: before(&["JSON", "stringify"])?,
-        elapsed: before(&["String", "Date", "now"]).or_else(|| before(&["String", "now"]))?,
+        // Builds that call `String` through the header's register leave out its name: the
+        // duration then sits between the round trips' `JSON.stringify` and `now`, and the
+        // timeout status before `round`.
+        elapsed: before(&["String", "Date", "now"])
+            .or_else(|| before(&["String", "now"]))
+            .or_else(|| {
+                let elapsed = find(&["JSON", "stringify"])? + 2;
+                (strings.get(elapsed + 1)? == "now").then(|| strings[elapsed].clone())
+            })?,
         statuses: Statuses {
             complete: complete.clone(),
             incomplete: incomplete.clone(),
             timed_out: before(&["String", "Math", "round"])
-                .or_else(|| before(&["String", "round"]))?,
+                .or_else(|| before(&["String", "round"]))
+                .or_else(|| before(&["round"]))?,
             failed_before_open: failed_before_open.clone(),
             failed_after_open: failed_after_open.clone(),
             closed: closed.clone(),

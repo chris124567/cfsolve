@@ -8,14 +8,14 @@ use oxc::semantic::SymbolId;
 
 use super::HashMap;
 use super::dispatch::{Decoded, Dispatch};
-use super::extract::{self, RunMethod};
+use super::extract::{self, RunFunction};
 use super::interpret::{self, Decrypted, Invocation, MAXIMUM_PATHS, NativeDispatch, Way};
 use super::output::{Cause, Failure, Instruction, Position};
 use super::session::Session;
 use super::value::Value;
 use crate::js::ast::Script;
 
-/// The VM class, enclosing function body, `run` method layout, opcode decoder, and statements
+/// The VM class, enclosing function body, run function layout, opcode decoder, and statements
 /// executed before its scope is entered, in the script that defines them.
 pub struct Definition<'a> {
     pub(super) script: Script<'a>,
@@ -24,26 +24,28 @@ pub struct Definition<'a> {
     pub(super) prelude: Vec<&'a Statement<'a>>,
     /// Functions declared beside the class: handlers and their helpers.
     pub(super) functions: HashMap<SymbolId, &'a Function<'a>>,
-    pub(super) run: RunMethod<'a>,
+    pub(super) run: RunFunction<'a>,
+    /// Where the program runner starts a program.
+    pub(super) entry: Position,
     dispatch: Dispatch<'a>,
 }
 
 impl<'a> Definition<'a> {
-    /// Finds the VM in `script`. Fails unless a class has a `run` method whose dispatch loop has
-    /// the expected shape.
+    /// Finds the VM in `script` from its program runner. Fails unless the run function's
+    /// dispatch loop has the expected shape.
     pub(crate) fn from_script(script: Script<'a>) -> Result<Self> {
-        let (body, class) = extract::find(script).context("no VM class in the script")?;
-        let run = extract::method(class, "run").context("the VM class has no run method")?;
-        let functions = extract::functions(&body.statements);
-        let run = extract::run_method(script, &functions, run)?;
+        let found = extract::find(script).context("finding the VM")?;
+        let functions = extract::functions(&found.body.statements);
+        let run = extract::run_function(script, &functions, found.run)?;
         let dispatch = Dispatch::from_loop(script, &run.dispatch)?;
         Ok(Self {
             script,
-            body,
-            class,
-            prelude: extract::prelude(script, body),
+            body: found.body,
+            class: found.class,
+            prelude: extract::prelude(script, found.body),
             functions,
             run,
+            entry: found.entry,
             dispatch,
         })
     }

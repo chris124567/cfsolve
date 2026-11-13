@@ -1,7 +1,7 @@
 //! Disassembly values, effects, and exits for each feasible handler path. Byte-dependent values
 //! are concrete; register-dependent values remain expressions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::iter;
@@ -233,6 +233,9 @@ pub struct Listing {
     pub functions: Vec<Position>,
     pub failures: Vec<Failure>,
     pub hidden: Vec<Hidden>,
+    /// String constants the program passes to its own decoders, whose calls the listing shows
+    /// as loads of the decoded text.
+    pub encoded: BTreeSet<String>,
 }
 
 impl Term {

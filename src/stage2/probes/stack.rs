@@ -141,9 +141,25 @@ fn result_field(features: &[String], header: &BTreeSet<String>) -> Option<String
     None
 }
 
+/// Finds the output field of a build with hex names whose `stack` the listing shows decoded (see
+/// `vm::encoded_strings`): the one hex name besides the header's.
+fn decoded_result_field(features: &[String], header: &BTreeSet<String>) -> Option<String> {
+    if !features.iter().any(|text| text == "stack") {
+        return None;
+    }
+    let names: BTreeSet<&String> = features
+        .iter()
+        .filter(|name| vocabulary::is_hex_name(name) && !header.contains(*name))
+        .collect();
+    candidates::exactly_one(names, "stack result field")
+        .ok()
+        .cloned()
+}
+
 pub(crate) fn recognize(probe: &ProbeView<'_>) -> Option<Fields> {
     result_field(probe.session_features, probe.header)
         .or_else(|| encoded_result_field(probe.session_features, probe.header))
+        .or_else(|| decoded_result_field(probe.session_features, probe.header))
         .map(|result| Fields {
             result,
             calls: calls(probe.index, probe.entry),
@@ -172,6 +188,31 @@ mod tests {
             assert_eq!(result.as_deref(), Some("KtSk9"), "{table}");
         }
         assert!(result_field(&[TABLES[0].to_owned()], &BTreeSet::new()).is_none());
+    }
+
+    /// Decoded `stack` leaves the probe's own hex name as the only one besides the header's.
+    #[test]
+    fn reads_the_one_hex_name_beside_a_decoded_stack() {
+        let [wrapper, result, other] = [
+            "_04618571d62ea5518191ecc1",
+            "_0221887f312736bd3f6fc9f6",
+            "_23ca6c19266245a3e5b8a4c5",
+        ]
+        .map(str::to_owned);
+        let features = [
+            wrapper.clone(),
+            "atob".into(),
+            "stack".into(),
+            result.clone(),
+            other.clone(),
+        ];
+        let header = BTreeSet::from([wrapper.clone(), other.clone()]);
+        assert_eq!(decoded_result_field(&features, &header), Some(result));
+        assert!(decoded_result_field(&features, &BTreeSet::from([wrapper])).is_none());
+        assert!(
+            decoded_result_field(&features[3..], &header).is_none(),
+            "no `stack`"
+        );
     }
 
     /// Names captured from c787ce48cf6b sessions with XOR keys 0x91 0xa2 and 0xff 0x75. The second

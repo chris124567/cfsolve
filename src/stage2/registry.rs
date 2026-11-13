@@ -164,8 +164,6 @@ families! {
         worker_fetch, "worker_fetch", Reference, Computed, [4];
     Image { fields: image::Fields } =>
         image, "image", Reference, Computed, [33];
-    ParentInfo {} =>
-        parent_info, "parent_info", Reference, Computed, [7];
     DateParsingOffsets(dates::Fields) =>
         dates, "date_parsing_offsets", Reference, Computed, [21];
     // The payload publishes the error-message length beside the record.
@@ -189,6 +187,9 @@ families! {
     // Rebuilt from the session's own script. The reference build's stack probe is probe 28.
     Stack { fields: stack::Fields } =>
         stack, "stack", Structural, Computed, [28];
+    // Its outputs carry no reference names: it reads the embedding page's signals by index.
+    ParentInfo { fields: parent_info::Fields } =>
+        parent_info, "parent_info", Structural, Computed, [7];
     HostReachability { fields: host_reachability::Fields } =>
         host_reachability, "host_reachability", Structural, Computed, [];
     WebSocketEcho { fields: websocket_echo::Fields } =>
@@ -366,7 +367,7 @@ impl Operation {
                 observed.benchmark.as_ref(),
                 "benchmark measurements",
             )?)),
-            Self::ParentInfo {} => Ok(parent_info::collect(measured(
+            Self::ParentInfo { fields } => Ok(fields.collect(measured(
                 observed.page_signals.as_ref(),
                 "the embedding page's signals",
             )?)),
