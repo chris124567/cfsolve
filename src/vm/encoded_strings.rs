@@ -182,11 +182,10 @@ impl<'listing> Program<'listing> {
             let Some(fact) = (*constant).and_then(Fact::of) else {
                 continue;
             };
-            #[expect(clippy::eq_op, reason = "NaN is the fact unequal to itself")]
-            if fact == fact {
-                invariant[usize::from(register)] = Some(fact);
-            } else {
+            if matches!(fact, Fact::Number(number) if number.is_nan()) {
                 start.insert(register, fact);
+            } else {
+                invariant[usize::from(register)] = Some(fact);
             }
         }
         let unassigned = |register: &u8| !assigned.contains_key(register);
@@ -412,16 +411,19 @@ impl<'listing> Program<'listing> {
         if let Some(result) = (self.decoded.borrow().get(&pc)).and_then(|texts| texts.get(text)) {
             return result.clone();
         }
-        let result = (|| {
-            let argument = Value::String(text.encode_utf16().collect());
-            match self.call(&*self.decoder(pc)?, argument)? {
-                Value::String(units) => Some(String::from_utf16(&units).ok()?.into()),
-                _ => None,
-            }
-        })();
+        let argument = Value::String(text.encode_utf16().collect());
+        let result = match self
+            .decoder(pc)
+            .and_then(|decoder| self.call(&decoder, argument))
+        {
+            Some(Value::String(units)) => String::from_utf16(&units).ok().map(Rc::from),
+            _ => None,
+        };
         let mut decoded = self.decoded.borrow_mut();
-        let texts = decoded.entry(pc).or_default();
-        texts.insert(text.to_owned(), result.clone());
+        decoded
+            .entry(pc)
+            .or_default()
+            .insert(text.to_owned(), result.clone());
         result
     }
 

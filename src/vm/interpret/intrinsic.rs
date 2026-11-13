@@ -74,7 +74,7 @@ impl Intrinsic {
         run: &mut Run<'ast, '_>,
         arguments: &[Value<'ast>],
     ) -> Option<Value<'ast>> {
-        let register = match self {
+        let (register, returns) = match self {
             Self::Mix32(mixer) => {
                 let Some(Value::Number(number)) = arguments.first() else {
                     return None;
@@ -106,8 +106,8 @@ impl Intrinsic {
                 run.write_register(register, value.clone());
                 return Some(Value::Undefined);
             }
-            Self::Register(Helper::Pc) => run.session.layout.pc,
-            Self::Register(Helper::Key) => run.session.layout.key,
+            Self::Register(Helper::Pc { returns }) => (run.session.layout.pc, returns),
+            Self::Register(Helper::Key { returns }) => (run.session.layout.key, returns),
             Self::Blake3Compress => return None,
         };
         let [Value::Registers, value @ Value::Number(number), ..] = arguments else {
@@ -119,7 +119,11 @@ impl Intrinsic {
             return None;
         }
         run.set_register(register, value.clone());
-        Some(value.clone())
+        Some(if returns {
+            value.clone()
+        } else {
+            Value::Undefined
+        })
     }
 }
 

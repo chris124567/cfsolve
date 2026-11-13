@@ -34,11 +34,11 @@ use oxc::allocator::{Allocator, CloneIn};
 use oxc::ast::AstKind;
 use oxc::ast::ast::{
     Argument, ArrayExpressionElement, AssignmentOperator, AssignmentTarget,
-    AssignmentTargetPropertyIdentifier, BinaryExpression, BindingIdentifier, BindingPattern, Class,
-    Expression, ForStatement, ForStatementInit, Function, IdentifierReference, LogicalExpression,
-    MemberExpression, ObjectPropertyKind, PropertyKey, PropertyKind, SequenceExpression,
-    SimpleAssignmentTarget, Statement, UpdateExpression, VariableDeclaration,
-    VariableDeclarationKind, VariableDeclarator,
+    AssignmentTargetPropertyIdentifier, BinaryExpression, BindingIdentifier, BindingPattern,
+    CallExpression, Class, Expression, ForStatement, ForStatementInit, Function,
+    IdentifierReference, LogicalExpression, MemberExpression, ObjectExpression, ObjectPropertyKind,
+    PropertyKey, PropertyKind, SimpleAssignmentTarget, Statement, UpdateExpression,
+    VariableDeclaration, VariableDeclarationKind, VariableDeclarator,
 };
 use oxc::ast::builder::AstBuilder;
 use oxc::ast_visit::{Visit, VisitMut, walk, walk_mut};
@@ -213,12 +213,13 @@ pub(super) fn matches_routine<'a>(
 ) -> Option<Captures<'a>> {
     let template = template.script();
     let template_function = template_function(template);
+    let actual_locals = locals(routine);
     let matcher = Matcher {
         template,
         script,
         template_locals: locals(Routine::function(template_function)?),
-        actual_locals: locals(routine),
-        dead: dead_statements(script, routine),
+        dead: dead_statements(script, routine, &actual_locals),
+        actual_locals,
         mentions: mentions(script, |visitor| visit_routine(visitor, routine)),
         helpers,
         inlined: RefCell::default(),
@@ -256,8 +257,8 @@ struct Matcher<'t, 'a, 'helpers> {
     script: Script<'a>,
     template_locals: HashSet<SymbolId>,
     actual_locals: HashSet<SymbolId>,
-    /// Statements of the function to skip, by address.
-    dead: HashSet<usize>,
+    /// Statements of the function to skip, and the helper copies they leave.
+    dead: Dead<'a>,
     /// Reads of each binding in the function.
     mentions: HashMap<Binding<'a>, usize>,
     helpers: &'helpers BinaryHelpers<'a>,
@@ -319,23 +320,52 @@ fn address(statement: &Statement<'_>) -> usize {
 }
 
 /// A statement that may only build a helper object.
-struct Candidate<'a> {
-    address: usize,
+struct Candidate<'s, 'a> {
+    statement: &'s Statement<'a>,
     object: Binding<'a>,
-    /// The local `x` of `x = d.k`.
-    copy: Option<Binding<'a>>,
+    built: Built<'s, 'a>,
 }
 
-/// Statements that only build helper objects nothing uses: `d = {}` or `d = { k: function ..
-/// }`, `d.k = function ..`, and `x = d.k`, where `d` and `x` are never otherwise mentioned.
-/// They create objects and functions and read plain data properties, so skipping them changes
-/// nothing observable.
-fn dead_statements<'a>(script: Script<'a>, routine: Routine<'a>) -> HashSet<usize> {
+/// What a [`Candidate`] does to its helper object `d`.
+#[derive(Clone, Copy)]
+enum Built<'s, 'a> {
+    /// `d = { k: function .. }`, with no properties or only function properties.
+    Literal(&'s ObjectExpression<'a>),
+    /// `d.k = function ..`.
+    Property(&'s str, &'s Function<'a>),
+    /// `x = d.k`.
+    Copy(Binding<'a>, &'s str),
+}
+
+/// Statements to skip when matching, and the helpers that copies of their functions stand for.
+#[derive(Default)]
+struct Dead<'a> {
+    statements: HashSet<usize>,
+    /// Locals holding [`BinaryHelper`] copies, which the skipped statements assign.
+    helpers: HashMap<Binding<'a>, BinaryHelper>,
+}
+
+/// Statements that only build helper objects: `d = {}` or `d = { k: function .. }`, `d.k =
+/// function ..`, and `x = d.k`, where `d` is never otherwise mentioned. They create objects and
+/// functions and read plain data properties, so skipping them changes nothing observable if `x`
+/// is never otherwise mentioned either.
+///
+/// A copy `x` may also be a local otherwise mentioned only as the callee of calls with two
+/// arguments, if the function it copies is a [`BinaryHelper`] and the statements building it
+/// lead the routine. Nothing else then runs before `x` holds the helper, and nothing assigns it
+/// again, so each call computes the helper's operator.
+fn dead_statements<'a>(
+    script: Script<'a>,
+    routine: Routine<'a>,
+    locals: &HashSet<SymbolId>,
+) -> Dead<'a> {
     let statements = flattened(script, routine.statements);
-    // `d` of `d.k`.
-    let object = |member: Option<&MemberExpression<'a>>| match member? {
+    // `d` and `k` of `d.k`.
+    let member = |member: Option<&'a MemberExpression<'a>>| match member? {
         MemberExpression::StaticMemberExpression(member) => match &member.object {
-            Expression::Identifier(object) => Some(script.binding(object)),
+            Expression::Identifier(object) => {
+                Some((script.binding(object), member.property.name.as_str()))
+            }
             _ => None,
         },
         _ => None,
@@ -351,33 +381,39 @@ fn dead_statements<'a>(script: Script<'a>, routine: Routine<'a>) -> HashSet<usiz
         if assignment.operator != AssignmentOperator::Assign {
             continue;
         }
-        let (object, copy) = match (&assignment.left, &assignment.right) {
+        let (object, built) = match (&assignment.left, &assignment.right) {
             (
                 AssignmentTarget::AssignmentTargetIdentifier(object),
                 Expression::ObjectExpression(literal),
             ) if literal.properties.iter().all(is_function_property) => {
-                (script.binding(object), None)
+                (script.binding(object), Built::Literal(literal))
             }
             (AssignmentTarget::AssignmentTargetIdentifier(copy), right) => {
-                let Some(object) = object(right.as_member_expression()) else {
+                let Some((object, key)) = member(right.as_member_expression()) else {
                     continue;
                 };
-                (object, Some(script.binding(copy)))
+                (object, Built::Copy(script.binding(copy), key))
             }
-            (left, Expression::FunctionExpression(_)) => {
-                let Some(object) = object(left.as_member_expression()) else {
+            (left, Expression::FunctionExpression(function)) => {
+                let Some((object, key)) = member(left.as_member_expression()) else {
                     continue;
                 };
-                (object, None)
+                (object, Built::Property(key, function))
             }
             _ => continue,
         };
         candidates.push(Candidate {
-            address: address(statement),
+            statement,
             object,
-            copy,
+            built,
         });
     }
+    let copies = leading_copies(script, &statements, &candidates);
+    let mut calls = Calls {
+        script,
+        counts: HashMap::default(),
+    };
+    visit_routine(&mut calls, routine);
     // Drop candidates until every helper object and copy is mentioned only in the remaining
     // candidates, so no kept statement reads a removed object.
     let all_mentions = mentions(script, |visitor| visit_routine(visitor, routine));
@@ -385,24 +421,20 @@ fn dead_statements<'a>(script: Script<'a>, routine: Routine<'a>) -> HashSet<usiz
     loop {
         let objects: HashSet<Binding<'a>> = candidates
             .iter()
-            .filter(|candidate| candidate.copy.is_none())
+            .filter(|candidate| !matches!(candidate.built, Built::Copy(..)))
             .map(|candidate| candidate.object)
             .collect();
         let mut inside_mentions: HashMap<Binding<'a>, usize> = HashMap::default();
         let mut inside_writes: HashMap<Binding<'a>, usize> = HashMap::default();
-        for &statement in &statements {
-            if candidates
-                .iter()
-                .any(|candidate| candidate.address == address(statement))
-            {
-                let read = mentions(script, |visitor| visitor.visit_statement(statement));
-                for (binding, count) in read {
-                    *inside_mentions.entry(binding).or_default() += count;
-                }
-                let written = writes(script, |visitor| visitor.visit_statement(statement));
-                for (binding, count) in written {
-                    *inside_writes.entry(binding).or_default() += count;
-                }
+        for candidate in &candidates {
+            let statement = candidate.statement;
+            let read = mentions(script, |visitor| visitor.visit_statement(statement));
+            for (binding, count) in read {
+                *inside_mentions.entry(binding).or_default() += count;
+            }
+            let written = writes(script, |visitor| visitor.visit_statement(statement));
+            for (binding, count) in written {
+                *inside_writes.entry(binding).or_default() += count;
             }
         }
         let only_inside =
@@ -410,21 +442,139 @@ fn dead_statements<'a>(script: Script<'a>, routine: Routine<'a>) -> HashSet<usiz
         // Helper objects must also hold only the literals these statements assign.
         let only_written_inside =
             |binding: &Binding<'a>| all_writes.get(binding) == inside_writes.get(binding);
+        // A helper copy assigned once, read only by calls.
+        let count = |counts: &HashMap<Binding<'a>, usize>, copy: &Binding<'a>| {
+            counts.get(copy).copied().unwrap_or_default()
+        };
+        let called = |copy: &Binding<'a>| {
+            matches!(copy, Binding::Symbol(symbol) if locals.contains(symbol))
+                && copies.contains_key(copy)
+                && all_writes.get(copy) == Some(&1)
+                && count(&all_mentions, copy)
+                    == count(&inside_mentions, copy) + count(&calls.counts, copy)
+        };
         let before = candidates.len();
         candidates.retain(|candidate| {
             objects.contains(&candidate.object)
                 && only_inside(&candidate.object)
                 && only_written_inside(&candidate.object)
-                && candidate.copy.as_ref().is_none_or(only_inside)
+                && match &candidate.built {
+                    Built::Copy(copy, _) => only_inside(copy) || called(copy),
+                    _ => true,
+                }
         });
         if candidates.len() == before {
             break;
         }
     }
-    candidates
-        .into_iter()
-        .map(|candidate| candidate.address)
-        .collect()
+    let mut dead = Dead::default();
+    for candidate in candidates {
+        dead.statements.insert(address(candidate.statement));
+        if let Built::Copy(copy, _) = candidate.built
+            && let Some(&helper) = copies.get(&copy)
+        {
+            dead.helpers.insert(copy, helper);
+        }
+    }
+    dead
+}
+
+/// The copies `x = d.k` among the candidates leading `statements`, before anything else runs,
+/// of functions that are [`BinaryHelper`]s when copied.
+fn leading_copies<'a>(
+    script: Script<'a>,
+    statements: &[&Statement<'a>],
+    candidates: &[Candidate<'_, 'a>],
+) -> HashMap<Binding<'a>, BinaryHelper> {
+    let mut objects: HashMap<Binding<'a>, HashMap<&str, &Function<'a>>> = HashMap::default();
+    let mut copies = HashMap::default();
+    for &statement in statements {
+        let candidate = candidates
+            .iter()
+            .find(|candidate| ptr::eq(candidate.statement, statement));
+        let Some(candidate) = candidate else {
+            // Declarations without initializers and empty statements do nothing.
+            let inert = match statement {
+                Statement::EmptyStatement(_) => true,
+                Statement::VariableDeclaration(declaration) => {
+                    !declaration.kind.is_using()
+                        && declaration
+                            .declarations
+                            .iter()
+                            .all(|declarator| declarator.init.is_none())
+                }
+                _ => false,
+            };
+            if inert {
+                continue;
+            }
+            break;
+        };
+        match candidate.built {
+            Built::Literal(literal) => {
+                let properties = literal.properties.iter().filter_map(|property| {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        return None;
+                    };
+                    let Expression::FunctionExpression(function) = &property.value else {
+                        return None;
+                    };
+                    Some((property_name(&property.key)?, &**function))
+                });
+                // Later duplicate keys replace earlier ones, as in the literal.
+                objects.insert(candidate.object, properties.collect());
+            }
+            Built::Property(key, function) => {
+                // Assigning to a property of anything but a built object may throw or run code.
+                let Some(properties) = objects.get_mut(&candidate.object) else {
+                    break;
+                };
+                properties.insert(key, function);
+            }
+            Built::Copy(copy, key) => {
+                let Some(properties) = objects.get(&candidate.object) else {
+                    break;
+                };
+                match properties
+                    .get(key)
+                    .and_then(|function| binary_helper(script, function))
+                {
+                    Some(helper) => copies.insert(copy, helper),
+                    None => copies.remove(&copy),
+                };
+            }
+        }
+    }
+    copies
+}
+
+/// The name of a plain property key.
+fn property_name<'s>(key: &'s PropertyKey<'_>) -> Option<&'s str> {
+    match key {
+        PropertyKey::StaticIdentifier(key) => Some(key.name.as_str()),
+        PropertyKey::StringLiteral(key) => key.value.as_str(),
+        _ => None,
+    }
+}
+
+/// Counts calls `f(a, b)` with two plain arguments, by the binding the callee names.
+struct Calls<'s> {
+    script: Script<'s>,
+    counts: HashMap<Binding<'s>, usize>,
+}
+
+impl<'x> Visit<'x> for Calls<'_> {
+    fn visit_call_expression(&mut self, call: &CallExpression<'x>) {
+        if let Expression::Identifier(callee) = &call.callee
+            && !call.optional
+            && let [first, second] = &call.arguments[..]
+            && first.as_expression().is_some()
+            && second.as_expression().is_some()
+        {
+            *self.counts.entry(resolve(self.script, callee)).or_default() += 1;
+        }
+        walk::walk_call_expression(self, call);
+    }
 }
 
 /// A plain property whose value is a function expression.
@@ -636,7 +786,8 @@ impl<'a> Matcher<'_, 'a, '_> {
             return false;
         };
         let template = running(self.template, &body.statements, None).0;
-        let (statements, completes) = running(self.script, actual.statements, Some(&self.dead));
+        let (statements, completes) =
+            running(self.script, actual.statements, Some(&self.dead.statements));
         match actual.returns {
             // The return follows the routine's statements if they can complete.
             Some(returned) if completes => {
@@ -705,8 +856,32 @@ impl<'a> Matcher<'_, 'a, '_> {
         state: &mut State<'a>,
     ) -> bool {
         let template = running(self.template, template, None).0;
-        let actual = running(self.script, actual, Some(&self.dead)).0;
-        template.len() == actual.len() && self.pairs(&template, &actual, state)
+        let actual = running(self.script, actual, Some(&self.dead.statements)).0;
+        if template.len() == actual.len() {
+            return self.pairs(&template, &actual, state);
+        }
+        // Extra assignments before the final `return` run as `return (t = a, .., e);` does.
+        if let Some((Statement::ReturnStatement(returns), template)) = template.split_last()
+            && let Some((Statement::ReturnStatement(returned), actual)) = actual.split_last()
+            && let (Some(returns), Some(returned)) = (&returns.argument, &returned.argument)
+            && template.len() < actual.len()
+        {
+            let (kept, temporaries) = actual.split_at(template.len());
+            let temporaries: Option<Vec<&Expression<'_>>> = temporaries
+                .iter()
+                .map(|statement| match statement {
+                    Statement::ExpressionStatement(statement) => Some(&statement.expression),
+                    _ => None,
+                })
+                .collect();
+            return temporaries.is_some_and(|temporaries| {
+                self.pairs(template, kept, state)
+                    && self
+                        .substituted(temporaries, returned)
+                        .is_some_and(|returned| self.expression(returns, returned, state))
+            });
+        }
+        false
     }
 
     /// Matches statements pairwise, in order.
@@ -1204,17 +1379,26 @@ impl<'a> Matcher<'_, 'a, '_> {
     fn normalized<'m>(&'m self, expression: &Expression<'_>) -> Option<&'m Expression<'m>> {
         let expression = expression.without_parentheses();
         if let Expression::SequenceExpression(sequence) = expression {
-            return self.substituted(sequence);
+            let (last, temporaries) = sequence.expressions.split_last()?;
+            return self.substituted(temporaries, last);
         }
         if let Expression::CallExpression(call) = expression
             && let Expression::Identifier(callee) = &call.callee
             && let callee = resolve(self.script, callee)
-            && !matches!(callee, Binding::Symbol(symbol) if self.actual_locals.contains(&symbol))
-            && let Some(helper) = self.helpers.get(&callee)
+            && let local = matches!(callee,
+                Binding::Symbol(symbol) if self.actual_locals.contains(&symbol))
+            && let Some(helper) = if local {
+                self.dead.helpers.get(&callee)
+            } else {
+                self.helpers.get(&callee)
+            }
             && let [first, second] = &call.arguments[..]
             && let (Some(first), Some(second)) = (first.as_expression(), second.as_expression())
         {
-            self.inlined.borrow_mut().insert(callee);
+            // Local copies are created by the function itself, so nothing else need resolve.
+            if !local {
+                self.inlined.borrow_mut().insert(callee);
+            }
             let (left, right) = if helper.swapped {
                 (second, first)
             } else {
@@ -1272,10 +1456,15 @@ impl<'a> Matcher<'_, 'a, '_> {
         }
     }
 
-    /// `(t = a, u = b, e)` with the temporaries substituted (see [`Self::normalized`]).
-    fn substituted<'m>(&'m self, sequence: &SequenceExpression<'_>) -> Option<&'m Expression<'m>> {
-        let (last, temporaries) = sequence.expressions.split_last()?;
+    /// `last`, after the assignments `temporaries` to temporaries only it and later temporaries'
+    /// values read, with their values substituted (see [`Self::normalized`]).
+    fn substituted<'m, 'e, 'x: 'e>(
+        &'m self,
+        temporaries: impl IntoIterator<Item = &'e Expression<'x>>,
+        last: &Expression<'_>,
+    ) -> Option<&'m Expression<'m>> {
         let mut values: HashMap<SymbolId, &'m Expression<'m>> = HashMap::default();
+        let mut assigned = Vec::new();
         for temporary in temporaries {
             let Expression::AssignmentExpression(assignment) = temporary else {
                 return None;
@@ -1294,16 +1483,28 @@ impl<'a> Matcher<'_, 'a, '_> {
             }
             let value = self.substitute(&assignment.right, &values);
             values.insert(name, value);
+            assigned.push((name, &assignment.right));
         }
-        // Every read of each temporary is in the final expression, which does not write it.
-        let reads = mentions(self.script, |visitor| visitor.visit_expression(last));
-        let written = writes(self.script, |visitor| visitor.visit_expression(last));
-        let all_read_here = values.keys().all(|&name| {
+        // Every read of each temporary is in a later value or the final expression, and nothing
+        // there writes it. Each is read, so the match covers its value.
+        let mut reads = mentions(self.script, |visitor| visitor.visit_expression(last));
+        let mut written = writes(self.script, |visitor| visitor.visit_expression(last));
+        for &(name, value) in assigned.iter().rev() {
             let name = Binding::Symbol(name);
-            self.mentions.get(&name) == reads.get(&name) && !written.contains_key(&name)
-        });
-        if !all_read_here {
-            return None;
+            if !reads.contains_key(&name)
+                || self.mentions.get(&name) != reads.get(&name)
+                || written.contains_key(&name)
+            {
+                return None;
+            }
+            // Earlier temporaries may read this one's value.
+            for (binding, count) in mentions(self.script, |visitor| visitor.visit_expression(value))
+            {
+                *reads.entry(binding).or_default() += count;
+            }
+            for (binding, count) in writes(self.script, |visitor| visitor.visit_expression(value)) {
+                *written.entry(binding).or_default() += count;
+            }
         }
         Some(self.substitute(last, &values))
     }

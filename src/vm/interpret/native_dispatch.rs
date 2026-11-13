@@ -25,24 +25,29 @@ use crate::vm::value::Value;
 /// them. `PARAMETERS` stands for the loop's parameter names (see [`template_parameters`]).
 /// `ACCUMULATE` stands for `key += position;` in builds that add the opcode to the key before
 /// computing the next key, and for nothing in builds that compute it from the key directly.
+/// `DECLARE` stands for `var position, key;` and `READ` for `key =` in builds that assign the
+/// key to a loop local, and for `var position;` and `let key =` in builds that declare it in the
+/// block. Register members are named as [`crate::vm::registers::Member`] names them.
 const DECODER: &str = "
 function decoder(PARAMETERS) {
-    var position, key;
-    position = 1 === registers.i ? registers.h ^ registers.state : registers.v;
+    DECLARE
+    position = 1 === registers.j ? registers.h ^ registers.i : registers.A;
     if (position !== position) return true;
     if (position < 0 || position >= program.length) throw Error();
     $setpc(registers, position + 1);
-    key = 1 === registers.l ? registers.j ^ registers.state : registers.u;
+    READ 1 === registers.m ? registers.h ^ registers.l : registers.v;
     position = $unmask(key ^ program[position] - $c_offset & 255, key, position);
     ACCUMULATE
     $setkey(registers, $e_next);
     return position;
 }";
 
-/// `unmask(value, key, position)`: undoes the position hash and key rotation.
+/// `unmask(value, key, position)`: undoes the position hash and key rotation. `ROTATE` stands
+/// for `return (value >>> key | value << 8 - key) & 255;`, or for storing the rotation in
+/// `rotated` before masking it in builds that do so.
 const UNMASK: &str = "
 function unmask(value, key, position) {
-    var cached;
+    var cached, rotated;
     cached = $cache[position];
     if (!cached) {
         cached = ($mix(position) & 255) + 1;
@@ -50,7 +55,7 @@ function unmask(value, key, position) {
     }
     value ^= 255 & (cached - 1 ^ $c_factor * key);
     key &= 7;
-    return (value >>> key | value << 8 - key) & 255;
+    ROTATE
 }";
 
 /// A recognized opcode decoder and its constants.
@@ -97,17 +102,26 @@ impl<'ast> NativeDispatch<'ast> {
         let script = session.script;
         let helpers = pattern::binary_helpers(session);
         let matched = |accumulate: &str| {
-            let source = DECODER
-                .replace("PARAMETERS", &parameters)
-                .replace("ACCUMULATE", accumulate);
-            let template = pattern::template(&source);
-            pattern::matches_routine(
-                &template,
-                script,
-                decoder.function,
-                decoder.routine(),
-                &helpers,
-            )
+            [
+                ("var position, key;", "key ="),
+                ("var position;", "let key ="),
+            ]
+            .into_iter()
+            .find_map(|(declare, read)| {
+                let source = DECODER
+                    .replace("PARAMETERS", &parameters)
+                    .replace("DECLARE", declare)
+                    .replace("READ", read)
+                    .replace("ACCUMULATE", accumulate);
+                let template = pattern::template(&source);
+                pattern::matches_routine(
+                    &template,
+                    script,
+                    decoder.function,
+                    decoder.routine(),
+                    &helpers,
+                )
+            })
         };
         let (accumulates, captures) = match matched("key += position;") {
             Some(captures) => (true, captures),
@@ -126,15 +140,22 @@ impl<'ast> NativeDispatch<'ast> {
             let address = intrinsic::address(function(binding)?);
             session.intrinsics.get(&address).copied()
         };
-        let Intrinsic::Register(Helper::Pc) = intrinsic(captures.name("$setpc")?)? else {
+        let Intrinsic::Register(Helper::Pc { .. }) = intrinsic(captures.name("$setpc")?)? else {
             return None;
         };
-        let Intrinsic::Register(Helper::Key) = intrinsic(captures.name("$setkey")?)? else {
+        let Intrinsic::Register(Helper::Key { .. }) = intrinsic(captures.name("$setkey")?)? else {
             return None;
         };
         let unmask = function(captures.name("$unmask")?)?;
-        let unmask_captures =
-            pattern::matches(&pattern::template(UNMASK), script, unmask, &helpers)?;
+        let unmask_captures = [
+            "return (value >>> key | value << 8 - key) & 255;",
+            "rotated = value >>> key | value << 8 - key; return rotated & 255;",
+        ]
+        .into_iter()
+        .find_map(|rotate| {
+            let template = pattern::template(&UNMASK.replace("ROTATE", rotate));
+            pattern::matches(&template, script, unmask, &helpers)
+        })?;
         // Inlined helpers also resolve as recognized, unless setup left them unavailable.
         let mut inlined = captures.helpers.iter().chain(&unmask_captures.helpers);
         if inlined.any(|binding| session.unavailable.contains_key(binding)) {

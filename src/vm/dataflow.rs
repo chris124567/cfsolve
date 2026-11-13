@@ -3,13 +3,13 @@
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, VecDeque};
-use std::mem;
+use std::iter;
 use std::ops::ControlFlow;
 
 use super::{Listing, Path};
 
 /// Facts known on entry to an instruction.
-pub(crate) trait Facts: Clone + Default {
+pub(crate) trait Facts: Clone {
     /// Intersects with `other` and returns whether facts were lost. Facts only shrink, which
     /// ensures termination.
     fn meet(&mut self, other: &Self) -> bool;
@@ -51,14 +51,9 @@ pub(crate) fn forward<'listing, F: Facts, B>(
         let Some(instruction) = listing.instructions.get(&pc) else {
             continue;
         };
-        let mut entry = incoming[&pc].clone();
-        for (index, path) in instruction.paths.iter().enumerate() {
-            // The last path takes the entry facts rather than a copy.
-            let mut facts = if index + 1 < instruction.paths.len() {
-                entry.clone()
-            } else {
-                mem::take(&mut entry)
-            };
+        // The last path takes the entry facts rather than a copy.
+        let entries = iter::repeat_n(incoming[&pc].clone(), instruction.paths.len());
+        for (path, mut facts) in iter::zip(&instruction.paths, entries) {
             match transfer(pc, path, &mut facts) {
                 ControlFlow::Break(stop) => return ControlFlow::Break(stop),
                 ControlFlow::Continue(false) => continue,

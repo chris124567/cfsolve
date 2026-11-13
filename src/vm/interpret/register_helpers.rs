@@ -22,8 +22,14 @@ use crate::vm::registers::Member;
 #[derive(Clone, Copy)]
 pub(crate) enum Helper {
     Mask,
-    Pc,
-    Key,
+    /// Stores the program counter, returning the value if `returns` and nothing otherwise.
+    Pc {
+        returns: bool,
+    },
+    /// Stores the dispatch key, returning the value if `returns` and nothing otherwise.
+    Key {
+        returns: bool,
+    },
     Number,
     /// `read(registers, index)`: the register's value.
     Read,
@@ -101,11 +107,18 @@ pub(super) fn recognize(
     if object == value {
         return None;
     }
-    if let [
-        Statement::IfStatement(branch),
-        Statement::ReturnStatement(returned),
-    ] = &body[..]
-        && recognizer.returns(returned.argument.as_ref(), value)
+    // A setter returns the value it stores, or nothing.
+    let setter = match &body[..] {
+        [
+            Statement::IfStatement(branch),
+            Statement::ReturnStatement(returned),
+        ] => recognizer
+            .returns(returned.argument.as_ref(), value)
+            .then_some((branch, true)),
+        [Statement::IfStatement(branch)] => Some((branch, false)),
+        _ => None,
+    };
+    if let Some((branch, returns)) = setter
         && recognizer.guard(&branch.test, &HashSet::from_iter([value]))
         && let Some(other) = &branch.alternate
         && let Some(first) = recognizer.setter(&branch.consequent, object, value)
@@ -113,8 +126,8 @@ pub(super) fn recognize(
         && first == second
     {
         return Some(match first {
-            Member::Pc => Helper::Pc,
-            _ => Helper::Key,
+            Member::Pc => Helper::Pc { returns },
+            _ => Helper::Key { returns },
         });
     }
     let mut locals = HashSet::from_iter([value]);
