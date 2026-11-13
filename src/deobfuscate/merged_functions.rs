@@ -126,10 +126,12 @@ fn selection<'a>(function: &'a Function<'a>, analysis: &Analysis<'a>) -> Option<
         .collect::<Option<_>>()?;
     let mut declarations = vec![];
     for case in &switch.cases {
-        if !matches!(
-            case.consequent.last(),
-            Some(Statement::ReturnStatement(_) | Statement::ThrowStatement(_))
-        ) || ast::escapes(&case.consequent, LabeledContinue::Any)
+        // Dead branch removal drops a trailing `return;` after an `if` whose branches return.
+        if !case
+            .consequent
+            .last()
+            .is_some_and(|last| ast::abrupt(last, false))
+            || ast::escapes(&case.consequent, LabeledContinue::Any)
         {
             return None;
         }
@@ -394,5 +396,23 @@ mod tests {
             let output = transform(&kept);
             assert!(output.contains("switch"), "{output}");
         }
+    }
+
+    #[test]
+    fn splits_cases_ending_in_branches_that_return() {
+        // Dead branch removal leaves no `return;` after the `if`.
+        let transform = |source: &str| testing::rewrite(source, super::run);
+        let output = transform(
+            "function m(s, a) { switch (s) { case 1: if (a) { return 1; } else { return 2; } \
+             case 2: throw a; } } h(m(1, p), m(2, q));",
+        );
+        testing::assert_contains(&output, &["function m_0(a) {", "h(m_0(p), m_1(q));"]);
+        testing::assert_lacks(&output, &["switch"]);
+        // A branch that breaks out of the switch falls out of the case.
+        let output = transform(
+            "function m(s, a) { switch (s) { case 1: if (a) { return 1; } else { break; } \
+             case 2: return; } } h(m(1, p), m(2, q));",
+        );
+        testing::assert_contains(&output, &["switch"]);
     }
 }

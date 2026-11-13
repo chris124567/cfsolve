@@ -136,7 +136,7 @@ fn flatten<'a>(
             Some(Statement::ContinueStatement(jump)) if jump.label.is_none() => {
                 body.pop();
             }
-            Some(Statement::ReturnStatement(_) | Statement::ThrowStatement(_)) => {}
+            Some(last) if ast::abrupt(last, false) => {}
             _ => return None,
         }
         if ast::escapes(&body, LabeledContinue::Inner) || cases.insert(label, body).is_some() {

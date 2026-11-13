@@ -266,6 +266,22 @@ pub(super) enum LabeledContinue {
     Inner,
 }
 
+/// Checks whether `statement` always ends with `return` or `throw`, or, with `jumps`, also with
+/// `break` or `continue`. A labeled statement may be the target of its own `break`, so it never
+/// counts.
+pub(super) fn abrupt(statement: &Statement<'_>, jumps: bool) -> bool {
+    match statement {
+        Statement::ReturnStatement(_) | Statement::ThrowStatement(_) => true,
+        Statement::BreakStatement(_) | Statement::ContinueStatement(_) => jumps,
+        Statement::BlockStatement(block) => block.body.iter().any(|inner| abrupt(inner, jumps)),
+        Statement::IfStatement(branch) => {
+            abrupt(&branch.consequent, jumps)
+                && (branch.alternate.as_ref()).is_some_and(|alternate| abrupt(alternate, jumps))
+        }
+        _ => false,
+    }
+}
+
 /// Detects jumps whose loop or switch target would be removed when `statements` are copied out
 /// of a case. Labeled breaks keep their explicit target, which still encloses the copy.
 pub(super) fn escapes(statements: &[Statement<'_>], labeled_continue: LabeledContinue) -> bool {

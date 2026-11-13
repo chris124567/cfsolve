@@ -58,6 +58,18 @@ impl<'a> VisitMut<'a> for Dead<'_, 'a> {
     fn visit_statements(&mut self, statements: &mut Vec<'a, Statement<'a>>) {
         walk_mut::walk_statements(self, statements);
         let before = statements.len();
+        // Statements after one that always completes abruptly never run. Declarations stay:
+        // `var` and functions hoist, and `let`, `const`, and classes shadow outer bindings.
+        if let Some(end) = statements
+            .iter()
+            .position(|statement| ast::abrupt(statement, true))
+        {
+            let mut index = 0;
+            statements.retain(|statement| {
+                index += 1;
+                index <= end + 1 || statement.is_declaration() || declares(statement)
+            });
+        }
         statements.retain(|statement| match statement {
             Statement::EmptyStatement(_) => false,
             Statement::ExpressionStatement(statement) => match &statement.expression {
@@ -113,5 +125,26 @@ mod tests {
             "function f() { if (false) { var x; } if (false) { function g() {} } return x; }",
         );
         testing::assert_contains(&output, &["var x", "function g"]);
+    }
+
+    #[test]
+    fn removes_statements_after_abrupt_completions() {
+        let transform = |source: &str| testing::rewrite(source, super::run);
+        // A split merged function keeps its case's trailing `return;`.
+        let output = transform(
+            "function f(r, i) { if (r.J[i] === -4) { return r.H[i]; } else { return g(r, i); } return; }",
+        );
+        testing::assert_contains(&output, &["return r.H[i]", "return g(r, i)"]);
+        testing::assert_lacks(&output, &["return;"]);
+        let output = transform(
+            "function f() { { throw e; } a(); var x = b(); function g() {} let y; return x + y; }",
+        );
+        testing::assert_lacks(&output, &["a()", "return x"]);
+        testing::assert_contains(&output, &["var x = b()", "function g", "let y"]);
+        // Code after a one-armed `if` or a labeled block that breaks itself still runs.
+        let output = transform("function f() { if (c) return; a(); l: { break l; } b(); }");
+        testing::assert_contains(&output, &["a()", "b()"]);
+        let output = transform("function f() { while (c) { if (d) break; else continue; a(); } }");
+        testing::assert_lacks(&output, &["a()"]);
     }
 }
