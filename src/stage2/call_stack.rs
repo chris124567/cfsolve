@@ -1015,7 +1015,20 @@ impl<'a> RunFunction<'a> {
             let Some(Statement::ReturnStatement(returned)) = body.only_statement() else {
                 continue;
             };
-            let Some(Expression::CallExpression(call)) = &returned.argument else {
+            let Some(argument) = returned.argument.as_ref() else {
+                continue;
+            };
+            // Some builds assign the initial pc/key in a sequence before the call, as
+            // `return Nu = 0, helper(selector, run, new Class(p), Nu, Nu, []);`. The call is
+            // the sequence's last expression; the leading assignments only set pc/key.
+            let mut value = argument.without_parentheses();
+            if let Expression::SequenceExpression(sequence) = value {
+                let Some(last) = sequence.expressions.last() else {
+                    continue;
+                };
+                value = last.without_parentheses();
+            }
+            let Expression::CallExpression(call) = value else {
                 continue;
             };
             let Ok(target) = Scope::new("", &body, &script.appliers).target(call) else {
@@ -2394,6 +2407,27 @@ mod tests {
             assert_eq!(target.helpers.len(), 1);
             assert_eq!(target.helpers[0].name.v8, "F.o.k");
         });
+    }
+
+    /// The runner calls the run function directly, or assigns pc/key in a sequence before
+    /// calling it through a selector helper, as `return k = 0, j(3, run, new M(p), k, k, []);`.
+    #[test]
+    fn finds_the_runner_directly_or_through_a_sequence_and_helper() {
+        for install in [
+            "return run(new M(p),0,67,[]);",
+            "var k;return k=0,j(3,run,new M(p),k,k,[]);",
+        ] {
+            let source = format!(
+                "function j(s,f,a,b,c,d){{switch(5^s){{case 6:return f(a,b,c,d)}}}}\
+                 function run(m,pc,key,cells){{}}\
+                 function outer(O){{class M{{}} O.entry=function(p){{{install}}}}}"
+            );
+            with_script(&source, |script| {
+                let found = RunFunction::installed(script).unwrap();
+                assert_eq!(found.class, "M", "{source}");
+                assert_eq!(script.appliers.name(found.name), "run", "{source}");
+            });
+        }
     }
 
     /// Decodes `source` and analyzes it.
