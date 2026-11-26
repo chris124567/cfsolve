@@ -151,12 +151,11 @@ impl Geometry {
     }
 }
 
-/// A VM function's method call: its opcode, its argument count, and the caller's arity.
+/// A VM function's method call: its opcode and its argument count.
 #[derive(Clone, Copy, Debug)]
 pub struct MethodCall {
     pub opcode: u8,
     pub passed: usize,
-    pub arity: usize,
 }
 
 /// Call path to `new Error()` in the stack probe. The probe function calls a closure that
@@ -217,19 +216,24 @@ pub fn recover_probe(
     })
 }
 
-/// Recovers the stack outside a native method called by a VM function, from the method call to
-/// the listener. Closure-factory listeners are anonymous. Uses the guarded dispatch loop when
-/// an exception handler is registered, including calls made by the program itself under a
-/// handler.
-pub fn recover_method_call(
+/// Recovers the stack outside a native method that a returned program calls while it starts,
+/// from the method call out to the page script's response handler that started the program
+/// (see [`ProgramCalls`]): the program's listener, any forwarder, and the handler.
+pub fn recover_program_call(
     source: &str,
     cases: &CaseOpcodes,
     call: MethodCall,
-    guarded: bool,
 ) -> Result<Geometry> {
     geometry(source, cases, |machine| {
-        let mut frames = machine.method_call(call.opcode, call.passed, guarded)?;
-        frames.extend(machine.listener(call.arity, "")?);
+        let mut frames = machine.method_call(call.opcode, call.passed)?;
+        let mut calls = ProgramCalls {
+            script: &machine.script,
+            found: Vec::new(),
+        };
+        calls.visit_program(machine.script.js().program);
+        let (arity, caller) = candidates::exactly_one(calls.found, "call of a returned program")?;
+        frames.extend(machine.listener(arity, "")?);
+        frames.extend(caller);
         Ok(Chain {
             frames,
             reflected: false,
@@ -581,9 +585,11 @@ impl<'a, 'cases> Machine<'a, 'cases> {
     }
 
     /// Recovers frames from a method call in `opcode`'s handler through the runner: the handler
-    /// passes the method, receiver, and `passed` arguments to a native apply forwarder.
-    fn method_call(&self, opcode: u8, passed: usize, guarded: bool) -> Result<Vec<Call>> {
-        let handler = self.handler(opcode, guarded)?;
+    /// passes the method, receiver, and `passed` arguments to a native apply forwarder. The
+    /// calling program runs under its own exception handler, so it dispatches from the guarded
+    /// loop.
+    fn method_call(&self, opcode: u8, passed: usize) -> Result<Vec<Call>> {
+        let handler = self.handler(opcode, true)?;
         let appliers = &self.script.appliers;
         let function = self.script.function(handler.name)?;
         let scope = Scope::new(appliers.name(handler.name), &function, appliers);
@@ -617,6 +623,111 @@ impl<'a, 'cases> Machine<'a, 'cases> {
             })?;
         Ok(listener.frames(Name::anonymous(name.to_owned())))
     }
+}
+
+/// V8's name for the anonymous response handler that starts a compiled program. The handler is
+/// assigned to a computed `XMLHttpRequest` event property. Chrome stacks stop before reaching
+/// it, at V8's frame limit.
+const PROGRAM_CALLER: &str = "XMLHttpRequest.<anonymous>";
+
+/// Finds calls of a returned program in every function. The response handler runs a returned
+/// script as `new Function(code)(a, b)` and a returned program, which it compiles first, with
+/// the same arguments: directly as `program(a, b)`, or through a function forwarding its first
+/// parameter, as `forward(program, a, b)`, possibly through call helpers. Records the arguments
+/// passed to the program and the frames from the forwarder, if any, to the handler.
+struct ProgramCalls<'a, 's> {
+    script: &'s Script<'a>,
+    found: Vec<(usize, Vec<Call>)>,
+}
+
+impl<'a> ProgramCalls<'a, '_> {
+    /// The argument count and frames of `call` if it starts a program, given the argument lists
+    /// `scripts` that returned scripts receive in the same function.
+    fn program_call(
+        &self,
+        scope: &Scope<'a, '_>,
+        call: &'a CallExpression<'a>,
+        scripts: &[Vec<Binding<'a>>],
+    ) -> Option<(usize, Vec<Call>)> {
+        let script = self.script;
+        let appliers = &script.appliers;
+        let target = scope.target(call).ok()?;
+        let callee = target.callee?;
+        let handed: Vec<Binding<'a>> = handed(Arguments::of(call), &target)?
+            .into_iter()
+            .map(|operand| match operand.callee(&appliers.constants)? {
+                Callee::Binding(binding) => Some(binding),
+                Callee::Original(_) => None,
+            })
+            .collect::<Option<_>>()?;
+        let receives = |arguments: &[Binding<'a>]| scripts.iter().any(|list| list == arguments);
+        let caller = Name::anonymous(PROGRAM_CALLER.to_owned());
+        // The program is a value the handler holds, not a function the script defines.
+        let Ok(function) = script.function(callee) else {
+            return receives(&handed).then(|| (handed.len(), target.frames(caller)));
+        };
+        let (&program, arguments) = handed.split_first()?;
+        if script.function(Callee::Binding(program)).is_ok() || !receives(arguments) {
+            return None;
+        }
+        let name = appliers.name(callee);
+        let mut frames = Scope::new(name, &function, appliers)
+            .forwarder(function, Name::same(name.to_owned()))?;
+        frames.extend(target.frames(caller));
+        Some((arguments.len(), frames))
+    }
+}
+
+impl<'a> Visit<'a> for ProgramCalls<'a, '_> {
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let appliers = &self.script.appliers;
+        let js = appliers.js();
+        let function = js.lend(function, AstKind::as_function);
+        let body = Body::of(function);
+        let calls = calls_of(js, &body);
+        let scripts = script_arguments(&calls, &appliers.constants);
+        if !scripts.is_empty() {
+            let scope = Scope::new("", &body, appliers);
+            for call in calls {
+                if let Some(found) = self.program_call(&scope, call, &scripts) {
+                    self.found.push(found);
+                }
+            }
+        }
+        walk::walk_function(self, function, flags);
+    }
+
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        walk_property(self, property);
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        walk_method(self, method);
+    }
+}
+
+/// The argument lists of calls of constructed functions, `new Function(code)(a, b)`, among
+/// `calls`, when every argument is a name.
+fn script_arguments<'a>(
+    calls: &[&'a CallExpression<'a>],
+    constants: &Constants<'a>,
+) -> Vec<Vec<Binding<'a>>> {
+    calls
+        .iter()
+        .filter(|call| {
+            matches!(
+                call.callee.without_parentheses(),
+                Expression::NewExpression(_)
+            )
+        })
+        .filter_map(|call| {
+            call.arguments
+                .iter()
+                .map(|argument| constants.binding(argument.as_expression()?))
+                .collect::<Option<Vec<_>>>()
+        })
+        .filter(|arguments| !arguments.is_empty())
+        .collect()
 }
 
 /// The function a dispatch loop calls for an opcode.
@@ -2038,7 +2149,7 @@ impl<'a, 's> Scope<'a, 's> {
                 && property.kind == PropertyKind::Init
                 && let Some(key) = ast::static_key_str(&property.key, property.computed)
                 && let Some(frames) = self.forwarder(
-                    function,
+                    Body::of(function),
                     if property.computed {
                         Name::anonymous(key.to_owned())
                     } else {
@@ -2059,9 +2170,8 @@ impl<'a, 's> Scope<'a, 's> {
     /// later parameters. Accepts direct calls, array copies such as `(g = [f, b], (0, g[0])(a,
     /// g[1]))`, and call helpers. Extra parameters can act as locals. Allows local declarations
     /// before the call.
-    fn forwarder(&self, function: &'a Function<'a>, frame: Name) -> Option<Vec<Call>> {
+    fn forwarder(&self, function: Body<'a>, frame: Name) -> Option<Vec<Call>> {
         let constants = &self.appliers.constants;
-        let function = Body::of(function);
         let parameters = function.parameters()?;
         let (first, rest) = parameters.split_first()?;
         let first = Binding::Symbol(*first);
@@ -2140,15 +2250,21 @@ fn is_inert<'a>(expression: &Expression<'a>, constants: &Constants<'a>) -> bool 
 }
 
 /// Resolves the function produced by `callee` and checks whether a side-effect-free first operand
-/// detaches its receiver. For example, `(0, f)(a)` calls `f` without a receiver.
+/// detaches its receiver. For example, `(0, f)(a)` calls `f` without a receiver. Some builds
+/// discard a read of a declared variable instead, as in `(local, f)(a)`.
 fn undetached<'b, 'a>(
     callee: &'b Expression<'a>,
     constants: &Constants<'a>,
 ) -> (&'b Expression<'a>, bool) {
     let callee = callee.without_parentheses();
+    let discardable = |discarded: &Expression<'a>| {
+        is_inert(discarded, constants)
+            || matches!(discarded.without_parentheses(), Expression::Identifier(name)
+                if constants.js.symbol(name).is_some())
+    };
     if let Expression::SequenceExpression(sequence) = callee
         && let [discarded, last] = &sequence.expressions[..]
-        && is_inert(discarded, constants)
+        && discardable(discarded)
     {
         return (last.without_parentheses(), true);
     }
@@ -2188,7 +2304,8 @@ impl<'a> Visit<'a> for Scope<'a, '_> {
                             let inferred = format!("{path}.{name}");
                             (inferred.clone(), inferred)
                         };
-                    let frames = |name: String| self.forwarder(function, Name::anonymous(name));
+                    let frames =
+                        |name: String| self.forwarder(Body::of(function), Name::anonymous(name));
                     if let (Some(method), Some(plain)) = (frames(method), frames(inferred)) {
                         self.forwarders
                             .on_objects
@@ -2428,6 +2545,39 @@ mod tests {
                 assert_eq!(script.appliers.name(found.name), "run", "{source}");
             });
         }
+    }
+
+    /// A response handler runs a returned script as `new Function(code)(x, y)` and calls a
+    /// returned program with the same arguments, here through a forwarder that copies them,
+    /// directly, or through a forwarder detached by discarding a local. Calls passing other
+    /// arguments, or a defined function, are not program calls, nor is a call in a function
+    /// that runs no returned script.
+    #[test]
+    fn finds_the_handlers_call_of_a_returned_program() {
+        let source = "var k=function(f,a,b){var c;return c=[a],f(c[0],b)};function g(){}\
+            function s(){var r;r=M.c(`AAAA`,M),k(r,x,y)}\
+            function h(){var p;if(z)new F(t)(x,y);else{p=M.c(t,M);(0,k)(p,x,y)}k(p,x,w);k(g,x,y)}\
+            function d(){var p;if(z)new F(t)(x,y);else p(x,y)}\
+            function l(){var p,q=[];if(z)new F(t)(x,y);else(q,k)(p,x,y)}";
+        with_script(source, |script| {
+            let mut calls = ProgramCalls {
+                script,
+                found: Vec::new(),
+            };
+            calls.visit_program(script.js().program);
+            let [(forwarded, through), (direct, called), (detached, local)] = &calls.found[..]
+            else {
+                panic!("expected three program calls, found {}", calls.found.len());
+            };
+            assert_eq!((*forwarded, *direct, *detached), (2, 2, 2));
+            assert_eq!(v8_names(through), ["k", PROGRAM_CALLER]);
+            assert_eq!(v8_names(called), [PROGRAM_CALLER]);
+            assert_eq!(v8_names(local), ["k", PROGRAM_CALLER]);
+            let at = |position: u32| &source[position as usize..][..3];
+            assert_eq!(at(through[0].site.jsc), "(c[");
+            assert_eq!(at(through[1].site.jsc), "(p,");
+            assert_eq!(at(called[0].site.jsc), "(x,");
+        });
     }
 
     /// Decodes `source` and analyzes it.

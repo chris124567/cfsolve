@@ -3,8 +3,9 @@
 //!
 //! Fingerprint files use JSON and ignore unknown keys. The engine, transport, request headers,
 //! page and orchestrator timelines, resource timing, interaction, probe timings, and navigator
-//! are required. Errors identify missing fields. The `browser` page layout section uses
-//! defaults when absent, but rejects invalid values, including `null`.
+//! are required. The challenge-page timeline is optional. Errors identify missing fields. The
+//! `browser` page layout section uses defaults when absent, but rejects invalid values,
+//! including `null`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use crate::error::Error;
 use crate::fingerprint::{self, Transport, TransportSection};
 use crate::js::{JsObject, JsValue, Window};
 use crate::resource_timing::Reporting;
+use crate::session::Embedding;
 use crate::stage2::interaction::native::Viewport;
 use crate::stage2::payload::Document;
 use crate::stage2::registry::Facts;
@@ -39,10 +41,24 @@ pub struct Browser {
 pub(crate) struct Page {
     pub layout: Layout,
     pub timeline: Timeline,
+    /// Loader timestamps for widgets a challenge page's orchestrator renders, if the fingerprint
+    /// has them. The orchestrator renders once its first response arrives, later than sites do.
+    pub challenge_page_timeline: Option<Timeline>,
     pub intervals: Intervals,
     pub orchestrator_pacing: OrchestratorPacing,
     /// Resource timing for fetches whose total duration is the only measurement available.
     pub resource_timing: Reporting,
+}
+
+impl Page {
+    /// The loader timestamps for a widget embedded as `embedding`. Challenge-page widgets use
+    /// the challenge-page timeline when the fingerprint has one, else the site timeline.
+    pub(crate) fn loader_timeline(&self, embedding: Embedding) -> &Timeline {
+        match (embedding, &self.challenge_page_timeline) {
+            (Embedding::ChallengePage, Some(timeline)) => timeline,
+            _ => &self.timeline,
+        }
+    }
 }
 
 /// Timing settings from the fingerprint's `orchestrator` section. Required even for ordinary
@@ -108,6 +124,7 @@ struct Fingerprint {
     #[serde(default)]
     browser: Layout,
     timeline: Timeline,
+    challenge_page_timeline: Option<Timeline>,
     intervals: Intervals,
     orchestrator: OrchestratorPacing,
     resource_timing: Reporting,
@@ -160,6 +177,7 @@ impl Browser {
         let page = Page {
             layout: fingerprint.browser,
             timeline: fingerprint.timeline,
+            challenge_page_timeline: fingerprint.challenge_page_timeline,
             intervals: fingerprint.intervals,
             orchestrator_pacing: fingerprint.orchestrator,
             resource_timing: fingerprint.resource_timing,

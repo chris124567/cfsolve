@@ -20,7 +20,7 @@ use crate::challenge::reduced_timing::{Entry, ResourceTiming};
 use crate::challenge::source::InitialRequest;
 use crate::challenge::state::{Intervals, ScriptState};
 use crate::embedding_page::challenge_page::WIDGET_HOST;
-use crate::embedding_page::extra_params::{self, ApiScript};
+use crate::embedding_page::extra_params;
 use crate::embedding_page::page::{Params, RenderedPage};
 use crate::embedding_page::render_sample::RenderSample;
 use crate::engine::{self, Engine, Lines};
@@ -90,14 +90,17 @@ pub(crate) fn first_payload(
 }
 
 /// Rebuilds the stack sampled by the loader during the orchestrator's `turnstile.render` call.
-/// Includes loader frames and session-script frames from the VM call to the listener running
-/// the widget program's `onload` callback.
+/// Includes loader frames and session-script frames from the VM's method call out to the
+/// orchestrator's response handler, which starts the widget program.
 ///
-/// In Chrome captures, the program calls the callback inside its own exception handler. In iOS
-/// Safari captures, the loader finishes later and its timer calls the callback without a
-/// registered handler.
+/// The orchestrator requests the loader before its first POST, so the loader is ready when the
+/// widget program arrives. The program then renders as it starts, under its own exception
+/// handler, as Chrome and iOS Safari captures both show. Chrome's stack ends inside the VM, at
+/// V8's frame limit; Safari's continues through the program's listener and the forwarder the
+/// response handler calls it through.
 pub(super) fn render_sample(
-    api: &ApiScript,
+    loader: &str,
+    loader_url: &Url,
     challenge: &ChallengePage,
     javascript: &str,
     cases: &CaseOpcodes,
@@ -106,8 +109,7 @@ pub(super) fn render_sample(
 ) -> Result<RenderSample> {
     // The session script puts the page's inline script before the orchestrator.
     let (inline_lines, _) = engine::line_and_column(&challenge.javascript(""), Lines::Script);
-    let guarded = engine == Engine::Chromium;
-    let geometry = call_stack::recover_method_call(javascript, cases, widget.render_call, guarded)?
+    let geometry = call_stack::recover_program_call(javascript, cases, widget.render_call)?
         .rebased(inline_lines);
     let origin = ScriptPosition {
         url: challenge.orchestrator.to_string(),
@@ -115,7 +117,7 @@ pub(super) fn render_sample(
         column: 0,
     };
     let frames = geometry.placed(&origin, engine);
-    RenderSample::explicit(&api.source, api.stack_url(engine), frames, engine)
+    RenderSample::explicit(loader, loader_url, frames, engine)
 }
 
 /// Runs the orchestrator through widget creation and reconstructs the page around the widget.
@@ -202,15 +204,18 @@ pub(crate) async fn begin(
         &challenge.url,
         referrer_policy,
         page,
+        Embedding::ChallengePage,
     )
     .await?;
+    let engine = client.engine();
     match render_sample(
-        &api,
+        &api.source,
+        api.stack_url(engine),
         &challenge,
         &javascript,
         &cases,
         &widget,
-        client.engine(),
+        engine,
     ) {
         Ok(sample) => api.render_sample = sample,
         Err(error) => sink.progress(&format!(

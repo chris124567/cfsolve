@@ -215,6 +215,7 @@ pub(crate) async fn render_page(
         &document.url,
         document.referrer_policy,
         page,
+        Embedding::Site,
     )
     .await?;
     Ok(EmbeddingPage::new(
@@ -237,6 +238,7 @@ pub(crate) async fn fetch_loader(
     page: &Url,
     policy: ReferrerPolicy,
     facts: &Page,
+    embedding: Embedding,
 ) -> Result<(ApiScript, LoadTiming)> {
     let referer = policy.referrer(page, &url);
     let timer = Timer::start();
@@ -263,7 +265,8 @@ pub(crate) async fn fetch_loader(
         sizes_exposed: timing_exposed && facts.resource_timing.sizes_exposed,
         phases: facts.resource_timing.phases,
     };
-    let script = ApiScript::from_source(url, &source, response, &facts.timeline, client.engine())?;
+    let timeline = facts.loader_timeline(embedding);
+    let script = ApiScript::from_source(url, &source, response, timeline, client.engine())?;
     Ok((script, timing))
 }
 
@@ -338,10 +341,18 @@ pub(crate) fn merge(
             embedding_page.script.build
         ));
     }
+    if embedding_page.embedding == Embedding::ChallengePage
+        && page.challenge_page_timeline.is_none()
+    {
+        sink.progress(
+            "Warning: the fingerprint has no `challenge_page_timeline`, so this challenge-page \
+             widget reports a site's loader timestamps",
+        );
+    }
     let message = extra_params::collect(
         &embedding_page.page,
         &embedding_page.layout,
-        &page.timeline,
+        page.loader_timeline(embedding_page.embedding),
         &embedding_page.script,
         source::mode(&program.request.options),
     );

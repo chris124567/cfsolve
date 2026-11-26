@@ -31,114 +31,114 @@ pub(crate) static REFERENCE: LazyLock<Reference> = LazyLock::new(|| {
 });
 
 /// The challenge option (`_cf_chl_opt`) naming the platform segment of a probe's request path.
-pub(crate) const PLATFORM_OPTION: &str = "_e30715545c342d2c7172508f";
+pub(crate) const PLATFORM_OPTION: &str = "_bf13c229f4183e5bc0863f59";
 /// The option holding the session's ray, which the worker fetch requests.
-pub(crate) const RAY_OPTION: &str = "_b57b772c6cbf614381ea1c9b";
+pub(crate) const RAY_OPTION: &str = "_eed828ce4503e7f7475d133c";
 /// The option holding the nonce the worker fetch requests.
-pub(crate) const NONCE_OPTION: &str = "_5f03e51a908e7c7f4a90a1ca";
+pub(crate) const NONCE_OPTION: &str = "_b05ae5510fcfc51f5ef65860";
 
 /// Shared result field used by clock and private-token probes.
-pub(crate) const SHARED_RESULT: &str = "_62845f21bd76642fe7607006";
+pub(crate) const SHARED_RESULT: &str = "_4f8eb26a0f0e8f1cde83205b";
 
 /// What the clock probe reports when its worker fails.
-pub(crate) const CLOCK_FALLBACK: &str = "_7de8bfec8afbfc6c0a7f7228";
+pub(crate) const CLOCK_FALLBACK: &str = "_c69152d69f01e1841d56d1f8";
 
-pub(crate) const DATES_TODAY: &str = "_8462a594ae41b7c8900438ca";
-pub(crate) const DATES_OFFSET: &str = "_daa71e2bf5d4de20599870b8";
-pub(crate) const DATES_ZONE: &str = "_606c6ae129decf99cc72f7bd";
+pub(crate) const DATES_TODAY: &str = "_02fc3d87fc5fb56d0eff03c7";
+pub(crate) const DATES_OFFSET: &str = "_faf306f9f99ed3dce219494d";
+pub(crate) const DATES_ZONE: &str = "_00b5777cf2b60a45d1d0b872";
 
-pub(crate) const DOM_MUTATION_RESULT: &str = "_ab16b242260d08ce77aaf2d7";
+pub(crate) const DOM_MUTATION_RESULT: &str = "_b6fdb2d1104e34bd19027e67";
 
 // Environment and environment-audit names with session-specific replay patches.
 
 /// The environment probe's `document.referrer`.
-pub(crate) const ENVIRONMENT_REFERRER: &str = "_6adf411141c3ede7490c3a87";
+pub(crate) const ENVIRONMENT_REFERRER: &str = "_d92c36c516f3960a1720f1a3";
 /// The audit's groups of readers, by the value they read.
-pub(crate) const ENVIRONMENT_AUDIT_GROUPS: &str = "_498acb3af906a5f1ad524b55";
+pub(crate) const ENVIRONMENT_AUDIT_GROUPS: &str = "_97b56437f4f055c018023578";
 /// The audit's measured values.
-pub(crate) const ENVIRONMENT_AUDIT_VALUES: &str = "_58775d9322eb1c51ea1c9de3";
+pub(crate) const ENVIRONMENT_AUDIT_VALUES: &str = "_2d1e29e89715c35b8d8e1927";
 /// Navigation decoded size minus a Server-Timing duration.
-pub(crate) const ENVIRONMENT_AUDIT_REDUCTION: &str = "_fc47349735427db7e5f565e1";
+pub(crate) const ENVIRONMENT_AUDIT_REDUCTION: &str = "_205e69c5e2dbe2ee9c21fe98";
 /// Navigation decoded size.
-pub(crate) const ENVIRONMENT_AUDIT_DECODED: &str = "_d1e50e6ff9e2ba34399058f3";
+pub(crate) const ENVIRONMENT_AUDIT_DECODED: &str = "_8469255e1c5cb0d4752b6929";
 /// Navigation encoded size.
-pub(crate) const ENVIRONMENT_AUDIT_ENCODED: &str = "_ea7ac764fd2860c697cbf813";
+pub(crate) const ENVIRONMENT_AUDIT_ENCODED: &str = "_85ebe15fe783c98fe7e4bed3";
 /// Whether the probe's frame supports touch events.
-pub(crate) const ENVIRONMENT_AUDIT_TOUCH: &str = "_9cd866a3511f517879f4516b";
+pub(crate) const ENVIRONMENT_AUDIT_TOUCH: &str = "_c1ec04fca99016a50b19dc3b";
 /// The probe frame's `isSecureContext` value.
-pub(crate) const ENVIRONMENT_AUDIT_SECURE: &str = "_05547ddcb67150366764f887";
+pub(crate) const ENVIRONMENT_AUDIT_SECURE: &str = "_830ebee3a538ccca14314ae3";
 /// The value of `Notification.permission`.
-pub(crate) const ENVIRONMENT_AUDIT_PERMISSION: &str = "_ae82ebb109ab253d3f05a980";
+pub(crate) const ENVIRONMENT_AUDIT_PERMISSION: &str = "_5db7449633ee9844a05cd4d1";
 
 /// The isolation probe's results for blocked evaluation and cross-origin history writes.
 pub(crate) const ISOLATION_FAILURE_FIELDS: [&str; 2] =
-    ["_0d933758da8afefe31570be9", "_f25bb13aa3dd8a386af7c1dc"];
-pub(crate) const STYLESHEETS_TEXT: &str = "_fc71c1abadf551a615b367db";
-pub(crate) const STYLESHEETS_HASH: &str = "_137a63be904787b00109cacd";
+    ["_cbea69cc75848034ce0989bf", "_574ffb5982e23ad01867497c"];
+pub(crate) const STYLESHEETS_TEXT: &str = "_cba4128a59ca994d6b27ce03";
+pub(crate) const STYLESHEETS_HASH: &str = "_834fbaa6a8bf091fdca82035";
 
-pub(crate) const ERROR_MESSAGE_LENGTH_RESULT: &str = "_81fab77ed2f23f790181a6f7";
+pub(crate) const ERROR_MESSAGE_LENGTH_RESULT: &str = "_9965ce2e48f2fcde9b48a5ed";
 
-pub(crate) const IMAGE_WIDTH: &str = "_78a72dd3637eb6fb0b4f86d4";
-pub(crate) const IMAGE_HEIGHT: &str = "_5daa91bb069e46e542190bad";
-pub(crate) const IMAGE_EFFECTIVE_TYPE: &str = "_2d11906e809fc8fd8574d281";
-pub(crate) const IMAGE_ONLINE: &str = "_c744ece5552965265043fa60";
-pub(crate) const IMAGE_COMPLETE: &str = "_8d310517c48e7b458e12ef89";
-pub(crate) const IMAGE_NATURAL_WIDTH: &str = "_8cd60bdd4935672b05587476";
-pub(crate) const IMAGE_TIMESTAMP: &str = "_12b0e3e0814b017bd235bc6e";
+pub(crate) const IMAGE_WIDTH: &str = "_649c29b5a891b13039f9a0ba";
+pub(crate) const IMAGE_HEIGHT: &str = "_1b8a6e7c70da2950e81f0f54";
+pub(crate) const IMAGE_EFFECTIVE_TYPE: &str = "_5930e40e97b074bf625978b2";
+pub(crate) const IMAGE_ONLINE: &str = "_bceebfedb12b49ea0e29ea48";
+pub(crate) const IMAGE_COMPLETE: &str = "_aa9305b32ef2858c5c1250cd";
+pub(crate) const IMAGE_NATURAL_WIDTH: &str = "_fced4ca944afed284f7499e1";
+pub(crate) const IMAGE_TIMESTAMP: &str = "_2062942b21d57db68286e7c0";
 /// What the probe reports as both dimensions when the image fails to load.
-pub(crate) const IMAGE_LOAD_ERROR: &str = "_df3d3a69189f46fae9de3d46";
+pub(crate) const IMAGE_LOAD_ERROR: &str = "_7f2f9bbc902256aec1b764cd";
 /// Dimension values reported before the image load finishes.
-pub(crate) const IMAGE_PENDING: &str = "_951054c8356dc7089dd99299";
+pub(crate) const IMAGE_PENDING: &str = "_df4785fdfca109a9f0592a9f";
 /// The key the probe's worker replies with when its deadline passes.
-pub(crate) const IMAGE_WORKER_TIMEOUT: &str = "_f91aefe3a5aa9c6bd7b610d8";
+pub(crate) const IMAGE_WORKER_TIMEOUT: &str = "_b2467a5a08275e8d86927c48";
 /// A name the probe shares with the other probes that await a promise.
-pub(crate) const IMAGE_AWAITING: &str = "_68b6422aa18fedc6d9fa7dc3";
+pub(crate) const IMAGE_AWAITING: &str = "_0a73a3a4a92c73005733d26a";
 
-pub(crate) const MEDIA_STATE: &str = "_f7da15e7ffdacb47a0cdfdf0";
-pub(crate) const MEDIA_CODECS: &str = "_138e30bf2198594f2ded2588";
-pub(crate) const MEDIA_CANDIDATES: &str = "_47d0c4f028335a349928a882";
-pub(crate) const MEDIA_SDP: &str = "_c07cc41874125a9add025bfd";
-pub(crate) const MEDIA_SUPPORT: &str = "_3354f14d23df4b2a88c3fa44";
-pub(crate) const MEDIA_ICE_STATE: &str = "_f6d472be910ab1d7322bbadf";
-pub(crate) const MEDIA_UNAVAILABLE: &str = "_53a4bc8e7faec89e93d6b000";
-pub(crate) const MEDIA_CANDIDATE: &str = "_f6e0345d8c29ab2055f72609";
-pub(crate) const MEDIA_CANDIDATE_TIME: &str = "_b77ac88bc96e1b8f478fee4a";
-pub(crate) const MEDIA_DATA_CHANNEL: &str = "_538af0a1cfc635f286a37a76";
-pub(crate) const MEDIA_REUSED: &str = "_c72defce69f0c94b1c40b17a";
-pub(crate) const MEDIA_PRIOR_COUNT: &str = "_ba31acd3ba1c651c58268d2c";
-pub(crate) const MEDIA_FIRST_CANDIDATE: &str = "_cd80a8ef68163ad6ce4c080e";
-pub(crate) const MEDIA_ELAPSED: &str = "_fa5971a527a24b1a95854b8c";
-pub(crate) const MEDIA_CHANNEL_ERROR: &str = "_5074ccd3d62b20984013a86b";
-pub(crate) const MEDIA_SEED_OFFER_ERROR: &str = "_53089dcf29654deafd766592";
-pub(crate) const MEDIA_SEED_GATHER_ERROR: &str = "_c781a8c6e10f1962d6344856";
+pub(crate) const MEDIA_STATE: &str = "_56e7c363edf4482d2a652039";
+pub(crate) const MEDIA_CODECS: &str = "_da6b6baf45bcd89bee78c361";
+pub(crate) const MEDIA_CANDIDATES: &str = "_3876a4914983c02ab62380d7";
+pub(crate) const MEDIA_SDP: &str = "_bf827711f1af5e3877b04536";
+pub(crate) const MEDIA_SUPPORT: &str = "_9f106978463140319e091736";
+pub(crate) const MEDIA_ICE_STATE: &str = "_0551c794bd86a1c60abe95a0";
+pub(crate) const MEDIA_UNAVAILABLE: &str = "_c658c1c6899af57ec6c39c2e";
+pub(crate) const MEDIA_CANDIDATE: &str = "_e79bddbb1ba20cdb230fff3d";
+pub(crate) const MEDIA_CANDIDATE_TIME: &str = "_c1ebce96d91a7cff088c8f77";
+pub(crate) const MEDIA_DATA_CHANNEL: &str = "_b784bcb4bd9d5da3adc79aa0";
+pub(crate) const MEDIA_REUSED: &str = "_b6b9dbcd14fe11f6c765ca3c";
+pub(crate) const MEDIA_PRIOR_COUNT: &str = "_f6579beb0695ae421f105a89";
+pub(crate) const MEDIA_FIRST_CANDIDATE: &str = "_2cbbff49f6edc186c6692e8e";
+pub(crate) const MEDIA_ELAPSED: &str = "_03c985885a4a85a179027a60";
+pub(crate) const MEDIA_CHANNEL_ERROR: &str = "_200177ecf732d1c3cd29cb5c";
+pub(crate) const MEDIA_SEED_OFFER_ERROR: &str = "_3cf67a623238585caf0b8128";
+pub(crate) const MEDIA_SEED_GATHER_ERROR: &str = "_c0c335f78959467ef4c758c6";
 
 /// Recognition recovers the network information probe's output names from the probe itself.
 #[cfg(test)]
 pub(crate) const NETWORK_INFORMATION_OUTPUTS: [&str; 6] = [
-    "_916465939c983b0e34932f10",
-    "_ee17ddb325bc2672e4632345",
-    "_089f27b0144047a027148655",
-    "_120472427ce39965f7989ab9",
-    "_7fa3fbe4ce55c442d8ce5ffb",
-    "_a19915adb31d352013e44e49",
+    "_fbc335568884e8039f111ddc",
+    "_7fb7983b147a359ae1605761",
+    "_8916475b09ac849d4b33b4eb",
+    "_5ad8840411cfcba6a07a8f90",
+    "_f53bae0a78ed600a46b3a07a",
+    "_43f08fae15abd0265e7f71e9",
 ];
 
-pub(crate) const PRIVATE_TOKEN_ELAPSED: &str = "_c2752bbd593e00cd0a557236";
-pub(crate) const PRIVATE_TOKEN_ERROR: &str = "_788b80e93e6f07f8df3a191f";
-pub(crate) const PRIVATE_TOKEN_TOKEN: &str = "_ce8d4c2947640b9eeab9edf5";
-pub(crate) const PRIVATE_TOKEN_TIMESTAMP: &str = "_b9520771bad17798d15b6a4d";
+pub(crate) const PRIVATE_TOKEN_ELAPSED: &str = "_8db99c6a16533752bb1bbed2";
+pub(crate) const PRIVATE_TOKEN_ERROR: &str = "_28023293e58744bd41fbf35c";
+pub(crate) const PRIVATE_TOKEN_TOKEN: &str = "_07fa7e9ab60f9de64248e36c";
+pub(crate) const PRIVATE_TOKEN_TIMESTAMP: &str = "_95f5893bd1c7feb85a3c2768";
 /// The error the probe reports when its worker reaches its deadline.
-pub(crate) const PRIVATE_TOKEN_TIMEOUT_ERROR: &str = "_5f147af36bc5c883dfb4a8f0";
+pub(crate) const PRIVATE_TOKEN_TIMEOUT_ERROR: &str = "_b4788c77fdc4276b724c5cfe";
 /// The flag every reply of the probe's worker sets.
-pub(crate) const PRIVATE_TOKEN_WORKER_REPLIED: &str = "_bd7744733cde9138e62e7c05";
+pub(crate) const PRIVATE_TOKEN_WORKER_REPLIED: &str = "_9050e5ce306b2a8a9468aa2f";
 /// The reply field holding the worker fetch error.
-pub(crate) const PRIVATE_TOKEN_WORKER_ERROR: &str = "_755032ac06c14e942209534c";
+pub(crate) const PRIVATE_TOKEN_WORKER_ERROR: &str = "_3749b38b2e2d5390d14e6e8b";
 
-pub(crate) const WORKER_FETCH_STATUS: &str = "_34ede69a56e30699295d3fe7";
-pub(crate) const WORKER_FETCH_TOKEN: &str = "_04b7567131213446f02e16b1";
+pub(crate) const WORKER_FETCH_STATUS: &str = "_c6ca4de2162f12143f06c7e0";
+pub(crate) const WORKER_FETCH_TOKEN: &str = "_c8171b29101f2dfc039b3e28";
 
-pub(crate) const WORKER_NAVIGATOR_INDICATOR: &str = "_4151217be1606ceeefdfdccb";
-pub(crate) const WORKER_NAVIGATOR_RESULT: &str = "_bc44d64454a4d30a2e2a50ea";
+pub(crate) const WORKER_NAVIGATOR_INDICATOR: &str = "_6221c83a1c236170f75c7a93";
+pub(crate) const WORKER_NAVIGATOR_RESULT: &str = "_b882c66155596222560e6f1b";
 
 #[cfg(test)]
 mod tests {

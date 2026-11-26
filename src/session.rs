@@ -19,7 +19,7 @@ pub use channel::Stage;
 pub use sink::Sink;
 pub(crate) use sink::{Discard, SinkFailed};
 pub use widget::{Clearance, Outcome};
-pub(crate) use widget::{Expect, native, navigate, prepare, send_first_payload};
+pub(crate) use widget::{Embedding, Expect, native, navigate, prepare, send_first_payload};
 
 #[cfg(test)]
 mod tests {

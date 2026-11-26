@@ -309,16 +309,9 @@ impl Reader<'_> {
             }
         }
         let (pc, passed) = candidates::exactly_one(calls, "turnstile.render call")?;
-        let function = index
-            .entry_at_or_before(pc)
-            .context("the render call is in no function")?;
-        let arity = index
-            .arity(function)
-            .context("the function calling render is no closure")?;
         Ok(MethodCall {
             opcode: index.listing().instructions[&pc].opcode,
             passed,
-            arity,
         })
     }
 

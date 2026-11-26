@@ -2,9 +2,9 @@
 //!
 //! `traffic.json` provides the user agent, client hints, and header order for each request type.
 //! Session payloads provide probe durations, startup and pending times, benchmark speeds, media
-//! observations, first-payload intervals, and loader timestamps. Most values use the median across
-//! sessions. Loader timestamps come from a single session chosen by median send time, so they
-//! remain consistent.
+//! observations, first-payload intervals, and loader timestamps, kept apart for sites and
+//! challenge pages. Most values use the median across sessions. Loader timestamps come from a
+//! single session chosen by median send time, so they remain consistent.
 //!
 //! Values that captures cannot provide stay unchanged: engine, TLS and HTTP/2 settings, request
 //! priorities, page layout, interaction, resource timing phases, orchestrator pacing, and navigator
@@ -131,9 +131,11 @@ struct Reported {
     /// The first session's media observations.
     media: Option<Measurement>,
     intervals: Vec<Intervals>,
-    /// Loader timestamps from ordinary sites. Challenge pages load the loader late, so the solver
-    /// uses the timestamps from ordinary sites.
+    /// Loader timestamps from ordinary sites.
     timelines: Vec<Timeline>,
+    /// Loader timestamps from challenge pages, whose orchestrator renders once its first
+    /// response arrives.
+    challenge_page_timelines: Vec<Timeline>,
 }
 
 impl Reported {
@@ -191,15 +193,17 @@ impl Reported {
             }
         }
         // The orchestrator passes its page data only to widgets on challenge pages.
-        if message.get("chlPageData").is_some_and(js::truthy) {
-            return Ok(());
-        }
+        let challenge_page = message.get("chlPageData").is_some_and(js::truthy);
         let times: ElapsedTimes = js::from_value(JsValue::Object(message))
             .context("the first payload lacks the loader's elapsed times")?;
         let implicit_render =
             implicit_render.context("the first payload lacks the loader's stack sample")?;
         let timeline = Timeline::from_times(&times, implicit_render, self.script_fetch);
-        self.timelines.push(timeline);
+        if challenge_page {
+            self.challenge_page_timelines.push(timeline);
+        } else {
+            self.timelines.push(timeline);
+        }
         Ok(())
     }
 
@@ -273,7 +277,16 @@ impl Reported {
         Ok(())
     }
 
-    fn fill(mut self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+    fn fill(self, profile: &mut Value, notes: &mut Vec<String>) -> Result<()> {
+        // The challenge-page timeline is optional, so a profile may not have one to replace.
+        if !self.challenge_page_timelines.is_empty() {
+            let profile = profile
+                .as_object_mut()
+                .context("the profile is not an object")?;
+            profile
+                .entry("challenge_page_timeline")
+                .or_insert(Value::Null);
+        }
         let mut filled = |pointer: &str, value: Option<Value>, source: &str| -> Result<()> {
             let name = pointer.trim_start_matches('/').replace('/', ".");
             match value {
@@ -334,13 +347,23 @@ impl Reported {
 
         // Use one session to keep timestamps consistent. Choose the session with the median loader
         // send time.
-        let count = self.timelines.len();
-        self.timelines.sort_by_key(|timeline| timeline.sent);
-        let source = format!(
-            "the median of {count} site widget sessions by send time; script_fetch kept, as no \
-             payload reports it"
-        );
-        filled("/timeline", json(self.timelines.get(count / 2))?, &source)
+        for (pointer, mut timelines, kind) in [
+            ("/timeline", self.timelines, "site"),
+            (
+                "/challenge_page_timeline",
+                self.challenge_page_timelines,
+                "challenge-page",
+            ),
+        ] {
+            let count = timelines.len();
+            timelines.sort_by_key(|timeline| timeline.sent);
+            let source = format!(
+                "the median of {count} {kind} widget sessions by send time; script_fetch kept, as \
+                 no payload reports it"
+            );
+            filled(pointer, json(timelines.get(count / 2))?, &source)?;
+        }
+        Ok(())
     }
 }
 

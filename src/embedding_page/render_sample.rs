@@ -16,14 +16,12 @@ use std::mem;
 
 use anyhow::{Context, Result};
 use oxc::ast::ast::{
-    Argument, BindingPattern, CallExpression, ConditionalExpression, Expression, Function,
-    MemberExpression, ObjectPropertyKind, PropertyKey, ReturnStatement, TryStatement,
-    VariableDeclarator,
+    Argument, BindingPattern, CallExpression, Expression, Function, MemberExpression,
+    ObjectPropertyKind, PropertyKey, ReturnStatement, TryStatement, VariableDeclarator,
 };
 use oxc::ast_visit::{Visit, walk};
 use oxc::semantic::{ScopeFlags, SymbolId};
 use oxc::span::GetSpan;
-use oxc::syntax::operator::{BinaryOperator, UnaryOperator};
 use url::Url;
 
 use crate::candidates;
@@ -71,9 +69,8 @@ impl RenderSample {
     }
 
     /// Rebuilds the stack for a page script calling `turnstile.render` in the loader fetched
-    /// from `url`. `caller` supplies script frames from innermost to outermost, ending at the
-    /// callback invoked by the loader's `onload` timer. V8's ten-frame limit ends the stack
-    /// inside the script; JavaScriptCore also includes the timer.
+    /// from `url`. `caller` supplies the script's frames from innermost to outermost, through
+    /// its outermost one. V8's ten-frame limit ends the stack inside the script.
     pub(crate) fn explicit<'caller>(
         source: &str,
         url: &Url,
@@ -84,21 +81,14 @@ impl RenderSample {
         let script = parsed.script();
         let loader = Loader::read(script);
         let (method, frames) = loader.sampled(EXPLICIT_RENDER, engine)?;
+        // Shorten the caller frames' lifetime to the loader frames'.
         let caller = caller.into_iter().map(|frame| StackFrame { ..frame });
         let frames = placed(script, url, &frames, engine)
             .into_iter()
             .chain(caller);
         let stack = match engine {
             Engine::Chromium => engine.error_stack(frames.take(V8_STACK_LIMIT)),
-            Engine::WebKit => {
-                let onload = candidates::at_most_one_distinct(
-                    &loader.onload_calls,
-                    "onload callback calls",
-                )?
-                .context("loader never calls an onload callback")?;
-                let timer = [(String::new(), onload)];
-                engine.error_stack(frames.chain(placed(script, url, &timer, engine)))
-            }
+            Engine::WebKit => engine.error_stack(frames),
         };
         Ok(Self { method, stack })
     }
@@ -180,11 +170,6 @@ struct Loader<'a> {
     numbers: HashMap<SymbolId, f64>,
     /// The functions handed to `addEventListener("DOMContentLoaded", ...)`.
     ready: Vec<Binding<'a>>,
-    /// Delay of the timer whose callback is currently being visited.
-    timer_delay: Option<f64>,
-    /// Calls to the page's defined `onload` callback from a timer with no delay. Another timer
-    /// retries after one second if the callback is not yet defined.
-    onload_calls: Vec<Site>,
 }
 
 impl<'a> Loader<'a> {
@@ -200,8 +185,6 @@ impl<'a> Loader<'a> {
             properties: HashMap::new(),
             numbers: HashMap::new(),
             ready: Vec::new(),
-            timer_delay: None,
-            onload_calls: Vec::new(),
         };
         loader.visit_program(script.program);
         loader
@@ -324,39 +307,9 @@ impl<'a> Visit<'a> for Loader<'a> {
         walk::walk_member_expression(self, member);
     }
 
-    /// `found === void 0 ? report() : found()`: the call of a callback once it is defined.
-    fn visit_conditional_expression(&mut self, conditional: &ConditionalExpression<'a>) {
-        if self.timer_delay == Some(0.0)
-            && let Expression::BinaryExpression(test) = &conditional.test
-            && test.operator == BinaryOperator::StrictEquality
-            && let Expression::Identifier(tested) = &test.left
-            && matches!(&test.right, Expression::UnaryExpression(unary)
-                if unary.operator == UnaryOperator::Void)
-            && let Expression::CallExpression(call) = &conditional.alternate
-            && call.arguments.is_empty()
-            && let Expression::Identifier(callee) = &call.callee
-            && self.script.binding(callee) == self.script.binding(tested)
-        {
-            let site = self.site(call, callee.span.start, callee.span.end);
-            self.onload_calls.push(site);
-        }
-        walk::walk_conditional_expression(self, conditional);
-    }
-
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        let outer_delay = self.timer_delay;
         match &call.callee {
             Expression::Identifier(callee) => {
-                // `setTimeout(function () { ... }, delay)`: the callback runs from a timer.
-                if self.script.is_global(&call.callee, "setTimeout")
-                    && let [callback, delay] = &call.arguments[..]
-                    && matches!(
-                        callback.as_expression(),
-                        Some(Expression::FunctionExpression(_))
-                    )
-                {
-                    self.timer_delay = delay.as_expression().and_then(ast::number);
-                }
                 self.calls.push(Call {
                     scope: self.scope,
                     callee: self.script.binding(callee),
@@ -388,7 +341,6 @@ impl<'a> Visit<'a> for Loader<'a> {
             }
         }
         walk::walk_call_expression(self, call);
-        self.timer_delay = outer_delay;
     }
 
     /// A directly returned call is in tail position unless an enclosing `try` requires work
